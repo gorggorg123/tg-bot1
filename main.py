@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from app.tg import router as tg_router
+from botapp.tg import router as tg_router  # <--- тут новое имя пакета
 
 app = FastAPI()
 
