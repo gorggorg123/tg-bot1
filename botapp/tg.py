@@ -1,181 +1,243 @@
 import os
-import requests
+import logging
+from typing import Any, Dict, Optional
+
+import httpx
 from fastapi import APIRouter, Request
 
-from .finance import build_fin_today_message
+from .finance import get_finance_today_text
+
+
+logger = logging.getLogger("botapp.tg")
+logger.setLevel(logging.INFO)
 
 router = APIRouter()
 
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
+if not TG_BOT_TOKEN:
+    raise RuntimeError("Не задана переменная окружения TG_BOT_TOKEN")
+
 TG_API_URL = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 
-def _check_tg():
-    if not TG_BOT_TOKEN:
-        raise RuntimeError("Не задан TG_BOT_TOKEN в переменных окружения")
+# ====================== Вспомогательные функции Telegram ======================
 
+async def tg_call(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Универсальный вызов Telegram Bot API.
+    Игнорируем специфическую ошибку 'message is not modified'
+    для editMessage* методов, чтобы не падать с 500.
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(f"{TG_API_URL}/{method}", json=payload)
 
-def tg_call(method: str, payload: dict) -> dict:
-    """
-    Простая синхронная обёртка над Telegram Bot API.
-    """
-    _check_tg()
-    url = f"{TG_API_URL}/{method}"
-    resp = requests.post(url, json=payload, timeout=10)
     data = resp.json()
     if not data.get("ok", False):
+        desc = data.get("description", "")
+        error_code = data.get("error_code")
+
+        # Игнорируем "message is not modified" для editMessage*
+        if (
+            method in ("editMessageText", "editMessageCaption", "editMessageReplyMarkup")
+            and error_code == 400
+            and "message is not modified" in desc
+        ):
+            logger.info("Telegram: игнорируем 'message is not modified'")
+            return data
+
+        logger.error("Telegram %s error: %s", method, data)
         raise RuntimeError(f"Telegram {method} -> {data}")
+
     return data
 
 
-# ====== Клавиатуры (дизайн как в JS) ======
-
-kb_root = {
-    "inline_keyboard": [
-        [{"text": "📊 Полная аналитика", "callback_data": "menu_full"}],
-        [{"text": "📦 FBO", "callback_data": "menu_fbo"}],
-        [{"text": "🏦 Финансы", "callback_data": "menu_fin"}],
-        [{"text": "⭐ Отзывы", "callback_data": "menu_rev"}],
-        [{"text": "🧠 ИИ", "callback_data": "menu_ai"}],
-    ]
-}
-
-kb_fin = {
-    "inline_keyboard": [
-        [{"text": "🏦 Финансы за сегодня", "callback_data": "fin_today"}],
-        # дальше будем добавлять "месяц", "период", графики и т.д.
-        [{"text": "🏠 В меню", "callback_data": "back_root"}],
-    ]
-}
-
-
-# ====== Обработчики ======
-
-def handle_start(chat_id: int):
-    tg_call(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": "Выберите раздел 👇",
-            "reply_markup": kb_root,
-        },
-    )
-
-
-def handle_fin_today(chat_id: int):
-    try:
-        msg = build_fin_today_message()
-        tg_call(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": msg,
-                "parse_mode": "HTML",
-            },
-        )
-    except Exception as e:
-        tg_call(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": f"⚠️ Не удалось получить финансы за сегодня.\n{e}",
-            },
-        )
-
-
-def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: dict | None = None):
-    payload = {
+async def send_message(
+    chat_id: int,
+    text: str,
+    reply_markup: Optional[Dict[str, Any]] = None,
+    parse_mode: str = "HTML",
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
         "chat_id": chat_id,
-        "message_id": message_id,
         "text": text,
-        "parse_mode": "HTML",
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    tg_call("editMessageText", payload)
 
+    return await tg_call("sendMessage", payload)
+
+
+async def edit_message_text(
+    chat_id: int,
+    message_id: int,
+    text: str,
+    reply_markup: Optional[Dict[str, Any]] = None,
+    parse_mode: str = "HTML",
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    return await tg_call("editMessageText", payload)
+
+
+async def answer_callback_query(callback_query_id: str) -> None:
+    await tg_call("answerCallbackQuery", {"callback_query_id": callback_query_id})
+
+
+# ====================== Клавиатуры ======================
+
+def kb_root() -> Dict[str, Any]:
+    """
+    Главное меню.
+    """
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🏦 Финансы", "callback_data": "sec:fin"},
+            ],
+            [
+                {"text": "ℹ️ Что ты умеешь", "callback_data": "sec:help"},
+            ],
+        ]
+    }
+
+
+def kb_fin() -> Dict[str, Any]:
+    """
+    Меню раздела Финансы.
+    """
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📅 Финансы за сегодня", "callback_data": "fin:today"},
+            ],
+            [
+                {"text": "⬅️ В главное меню", "callback_data": "sec:root"},
+            ],
+        ]
+    }
+
+
+# ====================== Тексты ======================
+
+def start_text() -> str:
+    return (
+        "Привет! 😊 Я бот на FastAPI + Render.\n\n"
+        "⚙️ Сейчас умею:\n"
+        "• <b>/fin_today</b> — сводка по финансам за сегодня (по API Ozon).\n\n"
+        "Нажми «🏦 Финансы» ниже, чтобы получить сводку."
+    )
+
+
+def help_text() -> str:
+    return (
+        "ℹ️ <b>Что я умею сейчас</b>\n\n"
+        "• <b>/fin_today</b> — финансы за сегодня по данным Ozon Seller API.\n"
+        "• Кнопка «🏦 Финансы» — то же самое, но через меню.\n\n"
+        "Дальше можно расширять: аналитика FBO, реклама, отчёты и т.д. 🚀"
+    )
+
+
+# ====================== Обработчики логики ======================
+
+async def handle_start(chat_id: int) -> None:
+    await send_message(chat_id, start_text(), reply_markup=kb_root())
+
+
+async def handle_fin_today(
+    chat_id: int,
+    message_id: Optional[int] = None,
+    from_callback: bool = False,
+) -> None:
+    text = await get_finance_today_text()
+    full_text = f"📅 <b>Финансы за сегодня</b>\n\n{text}"
+
+    if from_callback and message_id is not None:
+        await edit_message_text(chat_id, message_id, full_text, reply_markup=kb_fin())
+    else:
+        await send_message(chat_id, full_text, reply_markup=kb_fin())
+
+
+# ====================== Webhook ======================
 
 @router.post("/tg")
-async def telegram_webhook(request: Request):
+async def telegram_webhook(request: Request) -> Dict[str, Any]:
     """
-    Единая точка входа для Telegram-вебхука.
-    Обрабатываем:
-      - /start
-      - /fin_today
-      - нажатия на кнопки меню (пока только финансы)
+    Основной webhook-обработчик Telegram.
     """
     update = await request.json()
+    logger.info("Telegram update: %s", update)
 
-    message = update.get("message")
-    callback = update.get("callback_query")
+    # Обычные сообщения
+    if "message" in update:
+        msg = update["message"]
+        chat = msg["chat"]
+        chat_id = chat["id"]
+        text = msg.get("text", "") or ""
 
-    # ====== Обычное сообщение ======
-    if message:
-        chat_id = message["chat"]["id"]
-        text = (message.get("text") or "").strip()
+        if text.startswith("/start"):
+            await handle_start(chat_id)
+        elif text.startswith("/fin_today"):
+            await handle_fin_today(chat_id)
+        else:
+            await send_message(
+                chat_id,
+                "Не знаю такой команды 😅\n"
+                "Попробуй /start",
+                reply_markup=kb_root(),
+            )
 
-        if text == "/start":
-            handle_start(chat_id)
-            return {"ok": True}
-
-        if text == "/fin_today":
-            handle_fin_today(chat_id)
-            return {"ok": True}
-
-        # Эхо + подсказка по командам (временная)
-        tg_call(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": "Команды:\n/start\n/fin_today",
-            },
-        )
         return {"ok": True}
 
-    # ====== Callback-кнопки ======
-    if callback:
-        chat_id = callback["message"]["chat"]["id"]
-        message_id = callback["message"]["message_id"]
-        data = callback.get("data", "")
+    # Callback-кнопки
+    if "callback_query" in update:
+        cq = update["callback_query"]
+        data = cq.get("data") or ""
+        message = cq.get("message") or {}
+        chat_id = message["chat"]["id"]
+        message_id = message["message_id"]
+        callback_id = cq["id"]
 
-        # нужно ответить на callback, чтобы "часики" исчезли
-        try:
-            tg_call("answerCallbackQuery", {"callback_query_id": callback["id"]})
-        except Exception:
-            pass
+        # убираем "часики" у кнопки
+        await answer_callback_query(callback_id)
 
-        if data == "back_root":
-            edit_message_text(chat_id, message_id, "Выберите раздел 👇", kb_root)
-            return {"ok": True}
-
-        # раздел Финансы
-        if data == "menu_fin":
-            edit_message_text(chat_id, message_id, "Раздел «🏦 Финансы»", kb_fin)
-            return {"ok": True}
-
-        # остальные разделы пока-заглушки, но дизайн уже есть
-        if data in {"menu_full", "menu_fbo", "menu_rev", "menu_ai"}:
-            edit_message_text(
+        if data == "sec:root":
+            await edit_message_text(
                 chat_id,
                 message_id,
-                "Раздел пока не реализован. Начинаем с «🏦 Финансы за сегодня».",
-                kb_root,
+                "Выбери раздел 👇",
+                reply_markup=kb_root(),
             )
-            return {"ok": True}
+        elif data == "sec:fin":
+            await edit_message_text(
+                chat_id,
+                message_id,
+                "Раздел «Финансы» 💰",
+                reply_markup=kb_fin(),
+            )
+        elif data == "sec:help":
+            await edit_message_text(
+                chat_id,
+                message_id,
+                help_text(),
+                reply_markup=kb_root(),
+            )
+        elif data == "fin:today":
+            await handle_fin_today(chat_id, message_id=message_id, from_callback=True)
+        else:
+            # На всякий случай — неизвестные кнопки
+            await send_message(chat_id, "Пока не понимаю эту кнопку 🤔")
 
-        if data == "fin_today":
-            # вместо отправки нового сообщения просто редактируем старое
-            try:
-                msg = build_fin_today_message()
-                edit_message_text(chat_id, message_id, msg, kb_fin)
-            except Exception as e:
-                edit_message_text(
-                    chat_id,
-                    message_id,
-                    f"⚠️ Не удалось получить финансы за сегодня.\n{e}",
-                    kb_fin,
-                )
-            return {"ok": True}
+        return {"ok": True}
 
-    # Если Telegram прислал что-то ещё (например, service message)
+    # На всякий случай — другие типы апдейтов игнорируем
     return {"ok": True}

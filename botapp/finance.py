@@ -1,70 +1,105 @@
-from .ozon_client import ozon_post, msk_today_range_iso, parse_num, rub0
+import os
+import json
+import datetime as dt
+from typing import Any, Dict
+
+import httpx
 
 
-def build_fin_today_message() -> str:
-    """
-    Возвращает HTML-текст для сообщения в Telegram
-    по финансам за сегодня.
-    """
+OZON_API_URL = "https://api-seller.ozon.ru"
 
-    date = msk_today_range_iso()
-    body = {
-        "date": {
-            "from": date["from"],
-            "to": date["to"],
-        },
-        "transaction_type": "all",
+
+def _get_ozon_headers() -> Dict[str, str]:
+    client_id = os.getenv("OZON_CLIENT_ID")
+    api_key = os.getenv("OZON_API_KEY")
+
+    if not client_id or not api_key:
+        raise RuntimeError(
+            "Не заданы переменные окружения OZON_CLIENT_ID / OZON_API_KEY"
+        )
+
+    return {
+        "Client-Id": client_id,
+        "Api-Key": api_key,
+        "Content-Type": "application/json",
     }
 
-    data = ozon_post("/v3/finance/transaction/totals", body)
-    result = data.get("result") or {}
 
-    accruals_for_sale = parse_num(result.get("accruals_for_sale"))
-    sale_commission = parse_num(result.get("sale_commission"))
-    processing_and_delivery = parse_num(result.get("processing_and_delivery"))
-    refunds_and_cancellations = parse_num(result.get("refunds_and_cancellations"))
-    services_amount = parse_num(result.get("services_amount"))
-    others_amount = parse_num(result.get("others_amount"))
-    compensation_amount = parse_num(result.get("compensation_amount"))
+def _today_msk_range_utc() -> tuple[str, str]:
+    """
+    Возвращает (from_iso, to_iso) для сегодняшних суток по МСК, но в UTC ISO 8601.
+    """
+    msk_tz = dt.timezone(dt.timedelta(hours=3))
+    now_msk = dt.datetime.now(msk_tz)
 
-    # Продажи без отмен
-    sales = accruals_for_sale - refunds_and_cancellations
+    start_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_msk = start_msk + dt.timedelta(days=1)
 
-    # Расходы (как в JS-версии)
-    returns_exp = -refunds_and_cancellations if refunds_and_cancellations < 0 else 0
-    expenses = (
-        abs(sale_commission)
-        + abs(processing_and_delivery)
-        + returns_exp
-        + abs(services_amount)
-        + abs(others_amount)
-    )
+    start_utc = start_msk.astimezone(dt.timezone.utc)
+    end_utc = end_msk.astimezone(dt.timezone.utc)
 
-    # Итого начислено
-    total_accrued = (
-        accruals_for_sale
-        + sale_commission
-        + processing_and_delivery
-        + refunds_and_cancellations
-        + services_amount
-        + others_amount
-        + compensation_amount
-    )
+    def iso_z(d: dt.datetime) -> str:
+        return d.replace(tzinfo=dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
-    msg = (
-        f"<b>🏦 Финансы за сегодня (МСК)</b>\n"
-        f"{date['pretty']}\n\n"
-        f"<b>Начислено всего:</b> {rub0(total_accrued)}\n"
-        f"Выручка (продажи без отмен): {rub0(sales)}\n"
-        f"Расходы: {rub0(expenses)}\n\n"
-        f"<b>Детализация:</b>\n"
-        f"• Начисления за продажи: {rub0(accruals_for_sale)}\n"
-        f"• Комиссии: {rub0(sale_commission)}\n"
-        f"• Обработка и доставка: {rub0(processing_and_delivery)}\n"
-        f"• Возвраты и отмены: {rub0(refunds_and_cancellations)}\n"
-        f"• Услуги: {rub0(services_amount)}\n"
-        f"• Прочее: {rub0(others_amount)}\n"
-        f"• Компенсации: {rub0(compensation_amount)}"
-    )
+    return iso_z(start_utc), iso_z(end_utc)
 
-    return msg
+
+async def fetch_finance_today_raw() -> Dict[str, Any]:
+    """
+    Сырой запрос в Ozon /v3/finance/transaction/totals за сегодня (по МСК).
+    Возвращает dict (json).
+    """
+    headers = _get_ozon_headers()
+    date_from, date_to = _today_msk_range_utc()
+
+    payload = {
+        "filter": {
+            "date": {
+                "from": date_from,
+                "to": date_to,
+            },
+            "transaction_type": ["all"],
+            "posting_type": ["all"],
+        }
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{OZON_API_URL}/v3/finance/transaction/totals",
+            headers=headers,
+            json=payload,
+        )
+
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Ozon /v3/finance/transaction/totals -> HTTP {resp.status_code}: "
+            f"{resp.text[:400]}"
+        )
+
+    return resp.json()
+
+
+async def get_finance_today_text() -> str:
+    """
+    Готовый текст для отправки в Telegram (HTML, <pre>…</pre>).
+    Пока без хитрой агрегации: аккуратно выводим result как JSON.
+    """
+    try:
+        data = await fetch_finance_today_raw()
+    except Exception as e:
+        return (
+            "⚠️ Не удалось получить финансы за сегодня.\n"
+            f"{e}"
+        )
+
+    result = data.get("result")
+    if not result:
+        return "⚠️ Ozon вернул пустой результат по финансам за сегодня."
+
+    pretty = json.dumps(result, ensure_ascii=False, indent=2)
+
+    # Ограничиваем длину, чтобы влезло в лимит Telegram (4096 символов)
+    if len(pretty) > 3500:
+        pretty = pretty[:3500] + "\n… (обрезано)"
+
+    return f"<pre>{pretty}</pre>"
