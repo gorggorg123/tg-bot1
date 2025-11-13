@@ -95,7 +95,7 @@ def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: di
     tg_call("editMessageText", payload)
 
 
-@router.post("/telegram")
+@router.post("/tg")
 async def telegram_webhook(request: Request):
     """
     Единая точка входа для Telegram-вебхука.
