@@ -1,173 +1,272 @@
 import json
 import os
-from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from typing import Any, Dict, List, Tuple
 
 import httpx
-from dotenv import load_dotenv
+import datetime as dt
 
-# Пытаемся подключить библиотеку Ульянова
-try:
-    from ozonapi import SellerAPI  # type: ignore
-except ImportError:  # ozonapi-async не установлен
-    SellerAPI = None  # type: ignore[assignment]
+# Сдвиг Москвы относительно UTC
+MSK_SHIFT_H = 3
+OZON_API_URL = "https://api-seller.ozon.ru"
 
-# Локальная разработка: подхватить .env
-load_dotenv()
+OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
+OZON_API_KEY = os.getenv("OZON_API_KEY")
 
-OZON_API_URL = os.getenv("OZON_API_URL", "https://api-seller.ozon.ru")
-
-MSK_TZ = timezone(timedelta(hours=3))
+if not OZON_CLIENT_ID or not OZON_API_KEY:
+    print("⚠️ OZON_CLIENT_ID или OZON_API_KEY не заданы. Ozon-запросы работать не будут.")
 
 
-@lru_cache()
-def get_credentials() -> tuple[str, str]:
+def _to_iso_no_ms(d: dt.datetime) -> str:
+    """ISO без миллисекунд, с Z на конце."""
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.timezone.utc)
+    s = d.astimezone(dt.timezone.utc).isoformat()
+    # 2025-11-15T00:00:00+00:00 -> 2025-11-15T00:00:00Z
+    return s.replace("+00:00", "Z").split(".")[0] + "Z"
+
+
+def today_range_utc() -> Tuple[str, str]:
     """
-    Берём Client-Id и Api-Key из переменных окружения.
-    Используются и для прямых запросов, и для SellerAPI.
+    Диапазон «сегодня по МСК» в UTC ISO.
+
+    from_utc — это 00:00:00 сегодняшнего дня по МСК, переведённое в UTC.
+    to_utc   — текущий момент в UTC.
     """
-    client_id = os.getenv("OZON_CLIENT_ID")
-    api_key = os.getenv("OZON_API_KEY")
+    now_utc = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+    now_msk = now_utc + dt.timedelta(hours=MSK_SHIFT_H)
+    start_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = start_msk - dt.timedelta(hours=MSK_SHIFT_H)
 
-    if not client_id or not api_key:
-        raise RuntimeError(
-            "Не заданы переменные окружения OZON_CLIENT_ID и OZON_API_KEY."
-        )
-
-    return client_id, api_key
+    return _to_iso_no_ms(start_utc), _to_iso_no_ms(now_utc)
 
 
-def _auth_headers() -> dict:
-    client_id, api_key = get_credentials()
-    return {
-        "Client-Id": client_id,
-        "Api-Key": api_key,
+async def ozon_call(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Универсальный вызов Ozon API (POST).
+    Бросает RuntimeError, если:
+      - нет ключей
+      - ответ не JSON
+      - HTTP-код 4xx/5xx
+    """
+    if not OZON_CLIENT_ID or not OZON_API_KEY:
+        raise RuntimeError("OZON_CLIENT_ID/OZON_API_KEY не заданы.")
+
+    headers = {
+        "Client-Id": OZON_CLIENT_ID,
+        "Api-Key": OZON_API_KEY,
         "Content-Type": "application/json",
     }
 
+    url = OZON_API_URL + path
+    async with httpx.AsyncClient(timeout=40) as client:
+        resp = await client.post(url, headers=headers, json=payload)
 
-async def ozon_post(path: str, payload: dict) -> dict:
+    try:
+        data = resp.json()
+    except json.JSONDecodeError:
+        raise RuntimeError(f"Ozon {path}: не JSON, статус {resp.status_code}")
+
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Ozon {path}: HTTP {resp.status_code}: {data}")
+
+    return data
+
+
+def _fmt_rub(amount: float) -> str:
+    return f"{amount:,.0f} ₽".replace(",", " ")
+
+
+# ---------------- Финансы за сегодня ---------------- #
+
+
+async def build_fin_today_message() -> str:
     """
-    Универсальный POST к Seller API.
+    Строит текстовую сводку по финансам за сегодня.
+    Использует /v3/finance/transaction/totals.
     """
-    url = OZON_API_URL.rstrip("/") + path
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, json=payload, headers=_auth_headers())
-
-    resp.raise_for_status()
-    return resp.json()
-
-
-def today_msk_range_utc() -> tuple[str, str]:
-    """
-    Границы текущего дня по МСК, переведённые в UTC и отформатированные
-    как 2025-11-13T00:00:00Z (без миллисекунд).
-    """
-    now_msk = datetime.now(MSK_TZ)
-    start_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_msk = start_msk + timedelta(days=1)
-
-    start_utc = start_msk.astimezone(timezone.utc)
-    end_utc = end_msk.astimezone(timezone.utc)
-
-    fmt = "%Y-%m-%dT%H:%M:%SZ"
-    return start_utc.strftime(fmt), end_utc.strftime(fmt)
-
-
-# --- Пример: прямой вызов /v3/finance/transaction/totals через HTTP ---
-
-async def api_finance_totals_today() -> dict:
-    """
-    Прямой запрос к /v3/finance/transaction/totals на сегодня (по МСК).
-    Сейчас не используется в боте, но может пригодиться дальше.
-    """
-    date_from, date_to = today_msk_range_utc()
+    date_from, date_to = today_range_utc()
 
     payload = {
-        "date_time_from": date_from,
-        "date_time_to": date_to,
-        "transaction_type": "all",
+        "filter": {
+            "date": {
+                "from": date_from,
+                "to": date_to,
+            }
+        }
     }
 
-    return await ozon_post("/v3/finance/transaction/totals", payload)
+    data = await ozon_call("/v3/finance/transaction/totals", payload)
+    res = data.get("result") or {}
+
+    def grab(path: List[str], default: float = 0.0) -> float:
+        cur: Any = res
+        for key in path:
+            if not isinstance(cur, dict) or key not in cur:
+                return default
+            cur = cur[key]
+        try:
+            return float(cur)
+        except Exception:
+            return default
+
+    # Попытка вытащить знакомые поля
+    revenue = grab(["accruals_for_sale", "sale", "total"])
+    commission = grab(["accruals_for_sale", "sale_commission", "total"])
+    logistics = grab(["accruals_for_sale", "delivery", "total"])
+    ads = grab(["accruals_for_services", "advertising", "total"])
+
+    profit_before_cogs = revenue - commission - logistics - ads
+
+    lines = [
+        "📊 Финансы за сегодня",
+        "",
+        f"Выручка: {_fmt_rub(revenue)}",
+        f"Комиссии: {_fmt_rub(commission)}",
+        f"Логистика: {_fmt_rub(logistics)}",
+        f"Реклама: {_fmt_rub(ads)}",
+        "",
+        f"Прибыль до себестоимости: {_fmt_rub(profit_before_cogs)}",
+    ]
+
+    # Если всё по нулям — покажем сырой JSON для дебага
+    if revenue == commission == logistics == ads == 0:
+        lines.append("")
+        lines.append("⚠️ Ozon вернул неожиданные данные, сырой ответ:")
+        lines.append(json.dumps(res, ensure_ascii=False, indent=2))
+
+    return "\n".join(lines)
 
 
-# --- SellerAPI Ульянова: информация о продавце ---
+# ---------------- Заказы за сегодня ---------------- #
 
 
-@lru_cache()
-def _seller_api_kwargs() -> dict:
+async def build_orders_today_message() -> str:
     """
-    Параметры для инициализации SellerAPI.
-    Если потом перейдём на конфиг-класс — поменяется только здесь.
+    Строит текстовую сводку по заказам за сегодня.
+    Пытается получить:
+      - FBO (через /v2/posting/fbo/list)
+      - FBS (через /v3/posting/fbs/list)
+    Ошибки по каждому направлению не роняют бот, а попадают вниз сообщения.
     """
-    client_id, api_key = get_credentials()
-    return {
-        "client_id": client_id,
-        "api_key": api_key,
+    date_from, date_to = today_range_utc()
+
+    payload = {
+        "dir": "ASC",
+        "filter": {
+            "since": date_from,
+            "to": date_to,
+            "status": "all",
+        },
+        "limit": 1000,
+        "offset": 0,
+        "with": {
+            "analytics_data": True,
+            "financial_data": True,
+        },
     }
 
+    total_orders = 0
+    revenue = 0.0
+    by_status: Dict[str, int] = {}
+    errors: List[str] = []
 
-async def api_seller_info() -> object:
-    """
-    Получить seller_info через ozonapi-async.
-    """
-    if SellerAPI is None:
-        raise RuntimeError(
-            "Библиотека ozonapi-async не установлена. "
-            "Добавь её в requirements.txt и сделай redeploy."
-        )
+    # --- FBO ---
+    try:
+        data_fbo = await ozon_call("/v2/posting/fbo/list", payload)
+        result_fbo = data_fbo.get("result") or {}
+        postings_fbo = result_fbo.get("postings") or []
 
-    kwargs = _seller_api_kwargs()
-    async with SellerAPI(**kwargs) as api:  # type: ignore[call-arg]
-        return await api.seller_info()
+        for p in postings_fbo:
+            total_orders += 1
+            st = p.get("status") or "unknown"
+            by_status[st] = by_status.get(st, 0) + 1
+
+            fin = p.get("financial_data") or {}
+            products = fin.get("products") or []
+            for prod in products:
+                price = prod.get("price") or 0
+                try:
+                    revenue += float(price)
+                except Exception:
+                    pass
+    except Exception as e:
+        errors.append(f"FBO: {e!s}")
+
+    # --- FBS ---
+    try:
+        data_fbs = await ozon_call("/v3/posting/fbs/list", payload)
+        result_fbs = data_fbs.get("result") or {}
+        postings_fbs = result_fbs.get("postings") or []
+
+        for p in postings_fbs:
+            total_orders += 1
+            st = p.get("status") or "unknown"
+            by_status[st] = by_status.get(st, 0) + 1
+
+            fin = p.get("financial_data") or {}
+            products = fin.get("products") or []
+            for prod in products:
+                price = prod.get("price") or 0
+                try:
+                    revenue += float(price)
+                except Exception:
+                    pass
+    except Exception as e:
+        errors.append(f"FBS: {e!s}")
+
+    # Если вообще ничего не достали – пробрасываем вверх
+    if total_orders == 0 and errors:
+        raise RuntimeError("; ".join(errors))
+
+    lines = [
+        "📦 Заказы за сегодня",
+        "",
+        f"Всего заказов: {total_orders}",
+        f"Оборот по товарам: {_fmt_rub(revenue)}",
+    ]
+
+    if by_status:
+        lines.append("")
+        lines.append("По статусам:")
+        for st, cnt in sorted(by_status.items(), key=lambda x: x[0]):
+            lines.append(f"• {st}: {cnt}")
+
+    if errors:
+        lines.append("")
+        lines.append("⚠️ Часть данных недоступна:")
+        for err in errors:
+            lines.append(f"– {err}")
+
+    return "\n".join(lines)
+
+
+# ---------------- Информация об аккаунте продавца ---------------- #
 
 
 async def build_seller_info_message() -> str:
     """
-    Собираем красивое текстовое сообщение для Телеграма
-    по результату seller_info().
+    Простая информация об аккаунте продавца.
+    Использует /v1/seller/info (если структура другая – покажем сырой JSON).
     """
-    try:
-        info = await api_seller_info()
-    except Exception as e:
-        return f"⚠️ Не удалось получить информацию о продавце.\nОшибка: {e!s}"
+    data = await ozon_call("/v1/seller/info", {})
+    res = data.get("result") or data
 
-    # Пытаемся аккуратно вытащить основные поля.
-    try:
-        lines: list[str] = ["🧾 Аккаунт Ozon", ""]
+    name = res.get("name") or "—"
+    legal_address = res.get("legal_address") or res.get("juridical_address") or "—"
+    rating = res.get("customer_rating") or res.get("rating") or "—"
 
-        company = getattr(info, "company", None)
+    lines = [
+        "🧾 Аккаунт Ozon",
+        "",
+        f"Название: {name}",
+        f"Юр. адрес: {legal_address}",
+        f"Рейтинг: {rating}",
+    ]
 
-        if company is not None:
-            name = getattr(company, "name", None)
-            inn = getattr(company, "inn", None)
-            ogrn = getattr(company, "ogrn", None)
-            address = getattr(company, "address", None)
+    # Если ключей нет — выводим сырой JSON
+    if name == "—" and legal_address == "—" and rating == "—":
+        lines.append("")
+        lines.append("Сырой ответ Ozon:")
+        lines.append(json.dumps(res, ensure_ascii=False, indent=2))
 
-            if name:
-                lines.append(f"🏢 Компания: {name}")
-            if inn:
-                lines.append(f"ИНН: {inn}")
-            if ogrn:
-                lines.append(f"ОГРН: {ogrn}")
-            if address:
-                lines.append(f"📍 Юр. адрес: {address}")
-        else:
-            # Если структура вдруг другая — просто выводим JSON
-            data = info
-            if hasattr(info, "model_dump"):
-                data = info.model_dump()  # type: ignore[attr-defined]
-            elif hasattr(info, "dict"):
-                data = info.dict()  # type: ignore[call-arg]
-
-            lines.append("```json")
-            lines.append(json.dumps(data, ensure_ascii=False, indent=2))
-            lines.append("```")
-
-        return "\n".join(lines)
-
-    except Exception:
-        # На всякий случай совсем универсальный fallback
-        return f"🧾 Аккаунт Ozon:\n{info!r}"
+    return "\n".join(lines)
