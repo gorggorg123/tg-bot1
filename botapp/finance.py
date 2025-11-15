@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from typing import Dict, Any
+from typing import Any, Dict
 
-from .ozon_client import ozon_raw_post, msk_day_range
+from .ozon_client import ozon_post, msk_day_range
 
 
-def _s_num(x: Any) -> float:
+def _snum(x: Any) -> float:
     try:
-        return float(str(x).replace(" ", "").replace("\u00a0", ""))
+        return float(str(x).replace(" ", "").replace("\u00a0", "").replace(",", "."))
     except Exception:
         return 0.0
 
@@ -21,15 +21,15 @@ def _rub0(n: float | int) -> str:
 
 
 def _sales_from_totals(t: Dict[str, Any]) -> float:
-    return _s_num(t.get("accruals_for_sale")) - _s_num(t.get("refunds_and_cancellations"))
+    return _snum(t.get("accruals_for_sale")) - _snum(t.get("refunds_and_cancellations"))
 
 
 def _build_expenses(t: Dict[str, Any]) -> float:
-    sc = _s_num(t.get("sale_commission"))
-    pad = _s_num(t.get("processing_and_delivery"))
-    rfc = _s_num(t.get("refunds_and_cancellations"))
-    sa = _s_num(t.get("services_amount"))
-    oa = _s_num(t.get("others_amount"))
+    sc = _snum(t.get("sale_commission"))
+    pad = _snum(t.get("processing_and_delivery"))
+    rfc = _snum(t.get("refunds_and_cancellations"))
+    sa = _snum(t.get("services_amount"))
+    oa = _snum(t.get("others_amount"))
 
     commission = abs(sc)
     delivery = abs(pad)
@@ -40,19 +40,19 @@ def _build_expenses(t: Dict[str, Any]) -> float:
 
 def _accrued_from_totals(t: Dict[str, Any]) -> float:
     return (
-        _s_num(t.get("accruals_for_sale"))
-        + _s_num(t.get("sale_commission"))
-        + _s_num(t.get("processing_and_delivery"))
-        + _s_num(t.get("refunds_and_cancellations"))
-        + _s_num(t.get("services_amount"))
-        + _s_num(t.get("others_amount"))
-        + _s_num(t.get("compensation_amount"))
+        _snum(t.get("accruals_for_sale"))
+        + _snum(t.get("sale_commission"))
+        + _snum(t.get("processing_and_delivery"))
+        + _snum(t.get("refunds_and_cancellations"))
+        + _snum(t.get("services_amount"))
+        + _snum(t.get("others_amount"))
+        + _snum(t.get("compensation_amount"))
     )
 
 
 async def get_finance_today_text() -> str:
     """
-    Возвращает готовый текст для Telegram по финансам за текущий день (МСК).
+    Готовый текст для Telegram: финансы за текущие сутки (по МСК).
     """
     rng = msk_day_range()
 
@@ -64,21 +64,21 @@ async def get_finance_today_text() -> str:
         "transaction_type": "all",
     }
 
-    data = await ozon_raw_post("/v3/finance/transaction/totals", payload)
+    data = await ozon_post("/v3/finance/transaction/totals", payload)
     totals = data.get("result") or {}
 
     accrued = _accrued_from_totals(totals)
     sales = _sales_from_totals(totals)
     expenses = _build_expenses(totals)
-    profit = accrued - expenses
+    profit_before_cost = sales - expenses
 
     text = (
-        f"🏦 Финансы за сегодня\n"
+        "<b>🏦 Финансы за сегодня</b>\n"
         f"{rng['pretty']}\n\n"
-        f"Начислено: {_rub0(accrued)}\n"
-        f"Продажи:  {_rub0(sales)}\n"
-        f"Расходы:  {_rub0(expenses)}\n"
-        f"Прибыль (грубо, до себестоимости): {_rub0(profit)}"
+        f"💰 Начислено: {_rub0(accrued)}\n"
+        f"🛒 Продажи:   {_rub0(sales)}\n"
+        f"💸 Расходы:   {_rub0(expenses)}\n"
+        f"📈 Прибыль до себестоимости: {_rub0(profit_before_cost)}"
     )
 
     return text
