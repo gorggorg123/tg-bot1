@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
+from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
 from botapp.finance import get_finance_today_text
@@ -27,7 +28,10 @@ if not TG_BOT_TOKEN:
     raise RuntimeError("Не задан TG_BOT_TOKEN в переменных окружения")
 
 # ---------- Aiogram ----------
-bot = Bot(token=TG_BOT_TOKEN, parse_mode="HTML")
+bot = Bot(
+    token=TG_BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode="HTML"),
+)
 dp = Dispatcher()
 
 # ---------- FastAPI ----------
@@ -113,7 +117,7 @@ async def on_startup() -> None:
     logger.info("Startup completed: bot task created.")
 
 
-# Локальный запуск (не нужен на Render, но удобно для отладки):
+# Локальный запуск (для отладки на компе)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=10000, reload=True)
