@@ -5,10 +5,11 @@ from typing import Dict, Any
 
 from .ozon_client import (
     OzonClient,
-    msk_today_range,
-    msk_current_month_range,
-    fmt_rub0,
     fmt_int,
+    fmt_rub0,
+    get_client,
+    msk_current_month_range,
+    msk_today_range,
     s_num,
 )
 
@@ -46,7 +47,8 @@ def _accrued_from_totals(t: Dict[str, Any]) -> float:
     )
 
 
-async def get_finance_today_text(client: OzonClient) -> str:
+async def get_finance_today_text(client: OzonClient | None = None) -> str:
+    client = client or get_client()
     since, to, pretty = msk_today_range()
     totals = await client.get_finance_totals(since, to)
 
@@ -65,7 +67,8 @@ async def get_finance_today_text(client: OzonClient) -> str:
     )
 
 
-async def get_finance_month_summary_text(client: OzonClient) -> str:
+async def get_finance_month_summary_text(client: OzonClient | None = None) -> str:
+    client = client or get_client()
     since, to, pretty = msk_current_month_range()
     totals = await client.get_finance_totals(since, to)
 

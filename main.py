@@ -2,23 +2,45 @@
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
-from aiogram.types import Message, CallbackQuery
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command, CommandStart
+from aiogram.types import CallbackQuery, Message
 
 from botapp.tg import main_menu_kb
 from botapp.finance import get_finance_today_text
 from botapp.orders import get_orders_today_text
 from botapp.account import get_account_info_text
-from botapp.reviews import get_reviews_menu_text  # как у тебя сейчас
+from botapp.reviews import (
+    get_reviews_menu_text,
+    get_reviews_today_text,
+    get_reviews_week_text,
+    get_reviews_month_text,
+)
 
 router = Router()
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    text = (
-        "Этот раздел ещё в разработке.\n\n"
-        "Сейчас доступны:"
-    )
+    text = "Добро пожаловать! Выберите раздел в меню или используйте команды."
     await message.answer(text, reply_markup=main_menu_kb())
+
+
+@router.message(Command("reviews_today"))
+async def cmd_reviews_today(message: Message) -> None:
+    text = await get_reviews_today_text()
+    await message.answer(text)
+
+
+@router.message(Command("reviews_week"))
+async def cmd_reviews_week(message: Message) -> None:
+    text = await get_reviews_week_text()
+    await message.answer(text)
+
+
+@router.message(Command("reviews_month"))
+async def cmd_reviews_month(message: Message) -> None:
+    text = await get_reviews_month_text()
+    await message.answer(text)
 
 
 # --- callbacks ---
