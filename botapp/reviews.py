@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from .ozon_client import (
     OzonClient,
@@ -26,7 +26,7 @@ def _parse_date(v: Any) -> datetime | None:
         return None
 
 
-def _format_review_item(r: Dict[str, Any]) -> str:
+def _format_review_item(r: Dict[str, Any]) -> Tuple[datetime | None, str]:
     rating = int(r.get("rating") or r.get("grade") or 0)
 
     dt = (
@@ -52,7 +52,8 @@ def _format_review_item(r: Dict[str, Any]) -> str:
     if product:
         meta.append(str(product))
     meta_str = " • ".join(meta)
-    return f"• {prefix}{meta_str}\n{text}".strip()
+    item_text = f"• {prefix}{meta_str}\n{text}".strip()
+    return dt, item_text
 
 
 async def _get_reviews_text(
@@ -68,7 +69,7 @@ async def _get_reviews_text(
     total = 0
     sum_rating = 0
 
-    last_items: List[str] = []
+    last_items: List[Tuple[datetime | None, str]] = []
 
     for r in reviews:
         rating = int(r.get("rating") or r.get("grade") or 0)
@@ -98,8 +99,9 @@ async def _get_reviews_text(
     )
 
     if last_items:
+        last_items.sort(key=lambda x: x[0] or datetime.min, reverse=True)
         header += "\n<b>Последние отзывы (до 10 шт)</b>\n" + "\n\n".join(
-            last_items[:10]
+            text for _, text in last_items[:10]
         )
     else:
         header += "\nОтзывы за период не найдены."

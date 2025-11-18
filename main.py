@@ -48,6 +48,24 @@ async def cmd_start(message: Message) -> None:
     await message.answer(text, reply_markup=main_menu_kb())
 
 
+@router.message(Command("fin_today"))
+async def cmd_fin_today(message: Message) -> None:
+    text = await get_finance_today_text()
+    await message.answer(text)
+
+
+@router.message(Command("orders_today"))
+async def cmd_orders_today(message: Message) -> None:
+    text = await get_orders_today_text()
+    await message.answer(text)
+
+
+@router.message(Command("account"))
+async def cmd_account(message: Message) -> None:
+    text = await get_account_info_text()
+    await message.answer(text)
+
+
 @router.message(Command("reviews_today"))
 async def cmd_reviews_today(message: Message) -> None:
     text = await get_reviews_today_text()
