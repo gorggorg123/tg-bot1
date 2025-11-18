@@ -9,10 +9,6 @@ from typing import Any, Dict, List, Tuple
 
 import httpx
 from dotenv import load_dotenv
-from ozonapi import SellerAPI, SellerAPIConfig
-from ozonapi.seller.schemas.entities.postings.filter import PostingFilter
-from ozonapi.seller.schemas.entities.postings.filter_with import PostingFilterWith
-from ozonapi.seller.schemas.fbo.v2__posting_fbo_list import PostingFBOListRequest
 
 logger = logging.getLogger(__name__)
 
@@ -122,11 +118,6 @@ class OzonClient:
     api_key: str
 
     def __post_init__(self) -> None:
-        self._api = SellerAPI(
-            client_id=self.client_id,
-            api_key=self.api_key,
-            config=SellerAPIConfig(client_id=self.client_id, api_key=self.api_key),
-        )
         self._http_client = httpx.AsyncClient(
             base_url=BASE_URL,
             timeout=30.0,
@@ -140,7 +131,6 @@ class OzonClient:
 
     async def aclose(self) -> None:
         await self._http_client.aclose()
-        await self._api.close()
 
     async def post(self, path: str, json: Dict[str, Any]) -> Dict[str, Any]:
         url = path if path.startswith("/") else f"/{path}"
@@ -174,26 +164,24 @@ class OzonClient:
     async def get_fbo_postings(
         self, date_from_iso: str, date_to_iso: str
     ) -> List[Dict[str, Any]]:
-        """Полная выборка FBO-заказов за период через SellerAPI с пагинацией."""
+        """Полная выборка FBO-заказов за период через прямой REST с пагинацией."""
         postings: List[Dict[str, Any]] = []
         limit = 1000
         offset = 0
 
         for _ in range(60):
-            request = PostingFBOListRequest(
-                dir="DESC",
-                limit=limit,
-                offset=offset,
-                filter=PostingFilter(since=date_from_iso, to_=date_to_iso),
-                with_=PostingFilterWith(
-                    analytics_data=True, financial_data=False, legal_info=False
-                ),
-            )
-            page = await self._api.posting_fbo_list(request)
-            items = page.result.postings if getattr(page, "result", None) else []
+            body = {
+                "dir": "DESC",
+                "limit": limit,
+                "offset": offset,
+                "filter": {"since": date_from_iso, "to": date_to_iso},
+                "with": {"analytics_data": True, "financial_data": False, "legal_info": False},
+            }
+            page = await self.post("/v2/posting/fbo/list", body)
+            items = (page.get("result") or {}).get("postings") or []
             if not items:
                 break
-            postings.extend([p.model_dump() for p in items])
+            postings.extend(items)
             if len(items) < limit:
                 break
             offset += limit
