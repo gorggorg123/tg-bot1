@@ -220,32 +220,52 @@ class OzonClient:
         self, date_from_iso: str, date_to_iso: str, limit: int = 100
     ) -> List[Dict[str, Any]]:
         """
-        /v1/review/list — одна страница (до 100 отзывов) за период.
-        Используем прямой запрос, т.к. метод пока отсутствует в ozonapi-async.
+        /v1/review/list с пагинацией.
+
+        Метод поддерживает фильтр по дате только на уровне дней, поэтому
+        используем YYYY-MM-DD и листаем страницы, пока не закончится выдача.
         """
-        body = {
-            "page": 1,
-            "limit": limit,
-            "filter": {
-                "date": {
-                    "from": date_from_iso[:10],
-                    "to": date_to_iso[:10],
-                }
-            },
+
+        date_filter = {
+            "from": date_from_iso[:10],
+            "to": date_to_iso[:10],
         }
-        data = await self.post("/v1/review/list", body)
-        if not isinstance(data, dict):
-            logger.error("Unexpected reviews response: %r", data)
-            return []
 
-        res = data.get("result") or data
-        arr = []
-        if isinstance(res, dict):
-            arr = res.get("reviews") or res.get("feedbacks") or res.get("items") or []
-        elif isinstance(res, list):
-            arr = res
+        page = 1
+        reviews: List[Dict[str, Any]] = []
 
-        return [r for r in arr if isinstance(r, dict)]
+        while page <= 50:  # защитимся от бесконечной пагинации
+            body = {
+                "page": page,
+                "limit": limit,
+                "filter": {"date": date_filter},
+            }
+            data = await self.post("/v1/review/list", body)
+            if not isinstance(data, dict):
+                logger.error("Unexpected reviews response: %r", data)
+                break
+
+            res = data.get("result") or data
+            arr: List[Dict[str, Any]] = []
+            if isinstance(res, dict):
+                arr = (
+                    res.get("reviews")
+                    or res.get("feedbacks")
+                    or res.get("items")
+                    or []
+                )
+            elif isinstance(res, list):
+                arr = res
+
+            page_items = [r for r in arr if isinstance(r, dict)]
+            reviews.extend(page_items)
+
+            # прекращаем, если меньше лимита или пусто
+            if len(page_items) < limit:
+                break
+            page += 1
+
+        return reviews
 
 
 _client: OzonClient | None = None
