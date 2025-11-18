@@ -118,8 +118,9 @@ class OzonClient:
     api_key: str
 
     def __post_init__(self) -> None:
+        # Используем явные абсолютные URL вместо base_url, чтобы исключить
+        # ошибки склейки (в логах на проде виден вызов на корень `/`).
         self._http_client = httpx.AsyncClient(
-            base_url=BASE_URL,
             timeout=30.0,
             headers={
                 "Client-Id": self.client_id,
@@ -133,7 +134,10 @@ class OzonClient:
         await self._http_client.aclose()
 
     async def post(self, path: str, json: Dict[str, Any]) -> Dict[str, Any]:
-        url = path if path.startswith("/") else f"/{path}"
+        # Формируем абсолютный URL вручную, чтобы в логах всегда была явная точка входа
+        # (на Render фиксировали 404 на https://api-seller.ozon.ru/ без пути).
+        suffix = path if path.startswith("/") else f"/{path}"
+        url = f"{BASE_URL}{suffix}"
         r = await self._http_client.post(url, json=json)
         try:
             data = r.json()
@@ -157,7 +161,8 @@ class OzonClient:
             "transaction_type": "all",
         }
         data = await self.post("/v3/finance/transaction/totals", body)
-        return data.get("result") or {}
+        res = data.get("result") if isinstance(data, dict) else {}
+        return res or {}
 
     # ---------- FBO заказы ----------
 
@@ -178,10 +183,22 @@ class OzonClient:
                 "with": {"analytics_data": True, "financial_data": False, "legal_info": False},
             }
             page = await self.post("/v2/posting/fbo/list", body)
-            items = (page.get("result") or {}).get("postings") or []
+            if not isinstance(page, dict):
+                logger.error("Unexpected FBO response: %r", page)
+                break
+
+            result = page.get("result")
+            if isinstance(result, list):
+                # Некоторые ответы приходят списком — явно приводим к словарю
+                items = result
+            elif isinstance(result, dict):
+                items = result.get("postings") or result.get("items") or []
+            else:
+                items = []
+
             if not items:
                 break
-            postings.extend(items)
+            postings.extend(i for i in items if isinstance(i, dict))
             if len(items) < limit:
                 break
             offset += limit
@@ -192,7 +209,10 @@ class OzonClient:
 
     async def get_company_info(self) -> Dict[str, Any]:
         data = await self.post("/v1/company/info", {})
-        return data.get("result") or data
+        if isinstance(data, dict):
+            return data.get("result") or data
+        logger.error("Unexpected company info response: %r", data)
+        return {}
 
     # ---------- Отзывы ----------
 
@@ -214,14 +234,18 @@ class OzonClient:
             },
         }
         data = await self.post("/v1/review/list", body)
+        if not isinstance(data, dict):
+            logger.error("Unexpected reviews response: %r", data)
+            return []
+
         res = data.get("result") or data
-        arr = (
-            res.get("reviews")
-            or res.get("feedbacks")
-            or res.get("items")
-            or []
-        )
-        return arr if isinstance(arr, list) else []
+        arr = []
+        if isinstance(res, dict):
+            arr = res.get("reviews") or res.get("feedbacks") or res.get("items") or []
+        elif isinstance(res, list):
+            arr = res
+
+        return [r for r in arr if isinstance(r, dict)]
 
 
 _client: OzonClient | None = None

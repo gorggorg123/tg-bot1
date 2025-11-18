@@ -23,14 +23,14 @@ async def get_account_info_text(client: OzonClient | None = None) -> str:
     region = info.get("region")
     email = info.get("email")
 
-    lines = ["👤 *Аккаунт Ozon*:", ""]
+    lines = ["👤 <b>Аккаунт Ozon</b>", ""]
 
     if company_name:
-        lines.append(f"🏢 Компания: *{company_name}*")
+        lines.append(f"🏢 Компания: <b>{company_name}</b>")
     if inn:
-        lines.append(f"🧾 ИНН: `{inn}`")
+        lines.append(f"🧾 ИНН: <code>{inn}</code>")
     if ogrn:
-        lines.append(f"📄 ОГРН: `{ogrn}`")
+        lines.append(f"📄 ОГРН: <code>{ogrn}</code>")
     if region:
         lines.append(f"📍 Регион: {region}")
     if email:
@@ -38,6 +38,6 @@ async def get_account_info_text(client: OzonClient | None = None) -> str:
 
     # На всякий случай приложим сырой JSON снизу
     lines.append("")
-    lines.append("`" + json.dumps(info, ensure_ascii=False) + "`")
+    lines.append("<code>" + json.dumps(info, ensure_ascii=False) + "</code>")
 
     return "\n".join(lines)

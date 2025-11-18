@@ -24,9 +24,11 @@ async def get_orders_today_text(client: OzonClient | None = None) -> str:
     if not postings:
         return f"📦 За {datetime.now().strftime('%d.%m.%Y')} заказов нет."
 
-    total = len(postings)
-    delivered = sum(1 for p in postings if p.get("status") == "delivered")
-    cancelled = sum(1 for p in postings if p.get("status") == "cancelled")
+    safe_postings = [p for p in postings if isinstance(p, dict)]
+
+    total = len(safe_postings)
+    delivered = sum(1 for p in safe_postings if p.get("status") == "delivered")
+    cancelled = sum(1 for p in safe_postings if p.get("status") == "cancelled")
     in_work = total - delivered - cancelled
 
     lines = [
