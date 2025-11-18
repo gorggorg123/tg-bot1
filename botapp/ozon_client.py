@@ -1,12 +1,18 @@
 # botapp/ozon_client.py
-import os
+from __future__ import annotations
+
 import logging
+import os
+from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Tuple
 
 import httpx
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
+
+load_dotenv()
 
 BASE_URL = "https://api-seller.ozon.ru"
 MSK_SHIFT = timedelta(hours=3)
@@ -66,6 +72,23 @@ def msk_current_month_range() -> Tuple[str, str, str]:
     return _iso_z(start_utc), _iso_z(end_utc), pretty
 
 
+def msk_week_range() -> Tuple[str, str, str]:
+    """Возвращает диапазон за последние 7 дней с учётом МСК."""
+    now_utc = datetime.utcnow()
+    now_msk = now_utc + MSK_SHIFT
+    today = now_msk.date()
+    week_ago = today - timedelta(days=6)
+
+    start_utc = datetime(week_ago.year, week_ago.month, week_ago.day) - MSK_SHIFT
+    end_utc = datetime(today.year, today.month, today.day, 23, 59, 59) - MSK_SHIFT
+
+    pretty = (
+        f"{week_ago.strftime('%d.%m.%Y')} — "
+        f"{today.strftime('%d.%m.%Y')} (МСК)"
+    )
+    return _iso_z(start_utc), _iso_z(end_utc), pretty
+
+
 def fmt_int(n: float | int) -> str:
     return f"{int(round(n)):,.0f}".replace(",", " ")
 
@@ -81,11 +104,21 @@ def s_num(x: Any) -> float:
         return 0.0
 
 
+def _env_credentials() -> tuple[str, str]:
+    client_id = (os.getenv("OZON_CLIENT_ID") or "").strip()
+    api_key = (os.getenv("OZON_API_KEY") or "").strip()
+    if not client_id or not api_key:
+        raise RuntimeError("Не заданы OZON_CLIENT_ID / OZON_API_KEY")
+    return client_id, api_key
+
+
+@dataclass
 class OzonClient:
-    def __init__(self, client_id: str, api_key: str) -> None:
-        self.client_id = client_id.strip()
-        self.api_key = api_key.strip()
-        self._client = httpx.AsyncClient(
+    client_id: str
+    api_key: str
+
+    def __post_init__(self) -> None:
+        self._http_client = httpx.AsyncClient(
             base_url=BASE_URL,
             timeout=30.0,
             headers={
@@ -97,11 +130,11 @@ class OzonClient:
         )
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        await self._http_client.aclose()
 
     async def post(self, path: str, json: Dict[str, Any]) -> Dict[str, Any]:
         url = path if path.startswith("/") else f"/{path}"
-        r = await self._client.post(url, json=json)
+        r = await self._http_client.post(url, json=json)
         try:
             data = r.json()
         except Exception:
@@ -131,9 +164,7 @@ class OzonClient:
     async def get_fbo_postings(
         self, date_from_iso: str, date_to_iso: str
     ) -> List[Dict[str, Any]]:
-        """
-        Полная выборка FBO-заказов за период (как в Ульянове: /v2/posting/fbo/list с пагинацией).
-        """
+        """Полная выборка FBO-заказов за период через прямой REST с пагинацией."""
         postings: List[Dict[str, Any]] = []
         limit = 1000
         offset = 0
@@ -141,26 +172,17 @@ class OzonClient:
         for _ in range(60):
             body = {
                 "dir": "DESC",
-                "filter": {"since": date_from_iso, "to": date_to_iso},
                 "limit": limit,
                 "offset": offset,
-                "with": {
-                    "products": True,
-                    "financial_data": False,
-                    "analytics_data": True,
-                },
+                "filter": {"since": date_from_iso, "to": date_to_iso},
+                "with": {"analytics_data": True, "financial_data": False, "legal_info": False},
             }
-            data = await self.post("/v2/posting/fbo/list", body)
-            page = (
-                data.get("result", {}).get("postings")
-                or data.get("postings")
-                or data.get("result")
-                or []
-            )
-            if not isinstance(page, list) or not page:
+            page = await self.post("/v2/posting/fbo/list", body)
+            items = (page.get("result") or {}).get("postings") or []
+            if not items:
                 break
-            postings.extend(page)
-            if len(page) < limit:
+            postings.extend(items)
+            if len(items) < limit:
                 break
             offset += limit
 
@@ -178,8 +200,8 @@ class OzonClient:
         self, date_from_iso: str, date_to_iso: str, limit: int = 100
     ) -> List[Dict[str, Any]]:
         """
-        /v1/review/list — как в JS-коде.
-        Берём одну страницу (до 100 отзывов) за период.
+        /v1/review/list — одна страница (до 100 отзывов) за период.
+        Используем прямой запрос, т.к. метод пока отсутствует в ozonapi-async.
         """
         body = {
             "page": 1,
@@ -200,3 +222,16 @@ class OzonClient:
             or []
         )
         return arr if isinstance(arr, list) else []
+
+
+_client: OzonClient | None = None
+
+
+def get_client() -> OzonClient:
+    """Ленивая инициализация клиента с учётом .env."""
+    global _client
+    if _client is None:
+        client_id, api_key = _env_credentials()
+        _client = OzonClient(client_id=client_id, api_key=api_key)
+    return _client
+
