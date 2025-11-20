@@ -29,6 +29,7 @@ from botapp.reviews import (
     get_current_review,
     get_review_view,
     get_reviews_menu_text,
+    trim_for_telegram,
 )
 
 load_dotenv()
@@ -100,10 +101,10 @@ async def _send_review_card(
     view = await get_review_view(user_id, period_key, index)
 
     if view.total == 0:
-        text = view.text
+        text = trim_for_telegram(view.text)
         markup = reviews_periods_keyboard()
     else:
-        text = view.text
+        text = trim_for_telegram(view.text)
         markup = reviews_navigation_keyboard(period_key, view.index, view.total)
 
     target = callback.message if callback else message

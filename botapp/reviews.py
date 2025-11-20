@@ -15,6 +15,7 @@ DEFAULT_RECENT_DAYS = 30
 MAX_REVIEW_LEN = 450
 MAX_REVIEWS_LOAD = 200
 MSK_SHIFT = timedelta(hours=3)
+TELEGRAM_SOFT_LIMIT = 3500
 
 
 @dataclass
@@ -26,6 +27,7 @@ class ReviewCard:
     offer_id: str | None
     product_id: str | None
     created_at: datetime | None
+    answered: bool = False
 
 
 @dataclass
@@ -69,6 +71,9 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
     if len(text) > MAX_REVIEW_LEN:
         text = text[: MAX_REVIEW_LEN - 1] + "…"
 
+    answer_payload = raw.get("answer") or raw.get("reply") or raw.get("response")
+    answered = bool(answer_payload or raw.get("answered"))
+
     return ReviewCard(
         id=str(raw.get("id") or raw.get("review_id") or "") or None,
         rating=rating,
@@ -81,6 +86,7 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
             or _parse_date(raw.get("created_at"))
             or _parse_date(raw.get("createdAt"))
         ),
+        answered=answered,
     )
 
 
@@ -97,16 +103,45 @@ def _calc_stats(cards: List[ReviewCard]) -> Tuple[int, float, Dict[int, int]]:
     return total, avg, dist
 
 
-def _format_review_block(card: ReviewCard, index: int) -> List[str]:
-    product = card.product_name or card.offer_id or card.product_id
-    lines = [f"{index}. {card.rating}★ {product or ''}".rstrip()]
+def _format_review_card_text(card: ReviewCard, index: int, total: int, period_title: str) -> str:
+    """Сформировать карточку одного отзыва.
+
+    Требования пользователя: один отзыв = одно сообщение, с датой, рейтингом,
+    названием товара, текстом и статусом ответа.
+    """
+
+    product = card.product_name or card.offer_id or card.product_id or "—"
+    date_line = _fmt_dt_msk(card.created_at)
+    stars = f"{card.rating}★" if card.rating else "—"
+    lines = [
+        f"⭐ Отзыв {index + 1} из {total} • период: {period_title}",
+        "",
+        f"Рейтинг: {stars}",
+        f"Товар: {product}",
+    ]
+
     if card.id:
         lines.append(f"ID отзыва: {card.id}")
-    if card.created_at:
-        lines.append(f"Дата: {_fmt_dt_msk(card.created_at)} (МСК)")
-    lines.append("")
-    lines.append(card.text or "(пустой отзыв)")
-    return lines
+    if date_line:
+        lines.append(f"Дата: {date_line} (МСК)")
+
+    lines.extend([
+        "",
+        "Текст отзыва:",
+        card.text or "(пустой отзыв)",
+        "",
+        f"Статус ответа: {'есть' if card.answered else 'нет'}",
+    ])
+
+    return "\n".join(lines).strip()
+
+
+def trim_for_telegram(text: str, max_len: int = TELEGRAM_SOFT_LIMIT) -> str:
+    """Обрезать текст до безопасной длины для Telegram, оставляя пометку."""
+
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
 
 
 async def fetch_recent_reviews(
@@ -140,32 +175,19 @@ async def fetch_recent_reviews(
     return cards, pretty
 
 
-def format_reviews_text(cards: List[ReviewCard], pretty: str, *, max_show: int = 50) -> str:
-    """Сформировать текст с заголовком и плоским списком отзывов."""
-
-    shown = min(len(cards), max_show)
-    header = [f"⭐ Отзывы (последние {shown} шт.)", pretty, ""]
-
+def _build_review_view(cards: List[ReviewCard], index: int, pretty: str) -> ReviewView:
     if not cards:
-        return "\n".join(header + ["Отзывы за указанный период не найдены."])
+        return ReviewView(
+            text="Отзывы за указанный период не найдены.",
+            index=0,
+            total=0,
+            period=pretty,
+        )
 
-    total, avg, dist = _calc_stats(cards)
-    header.extend(
-        [
-            f"Всего: {fmt_int(total)} • Средний рейтинг: {avg:.2f}",
-            f"Распределение: "
-            f"1★ {fmt_int(dist[1])} / 2★ {fmt_int(dist[2])} / "
-            f"3★ {fmt_int(dist[3])} / 4★ {fmt_int(dist[4])} / 5★ {fmt_int(dist[5])}",
-            "",
-        ]
-    )
-
-    blocks: List[str] = []
-    for idx, card in enumerate(cards[:max_show], start=1):
-        blocks.extend(_format_review_block(card, idx))
-        blocks.append("")
-
-    return "\n".join(header + blocks).rstrip()
+    safe_index = max(0, min(index, len(cards) - 1))
+    text = _format_review_card_text(cards[safe_index], safe_index, len(cards), pretty)
+    text = trim_for_telegram(text)
+    return ReviewView(text=text, index=safe_index, total=len(cards), period=pretty)
 
 
 async def get_review_view(
@@ -174,11 +196,10 @@ async def get_review_view(
     index: int = 0,
     client: OzonClient | None = None,
 ) -> ReviewView:
-    """Совместимая обёртка: возвращает плоский список отзывов одним сообщением."""
+    """Вернуть представление отдельной карточки отзыва."""
 
     cards, pretty = await fetch_recent_reviews(client)
-    text = format_reviews_text(cards, pretty)
-    return ReviewView(text=text, index=0, total=len(cards), period="recent")
+    return _build_review_view(cards, index, pretty)
 
 
 async def shift_review_view(
@@ -234,7 +255,7 @@ __all__ = [
     "ReviewCard",
     "ReviewView",
     "fetch_recent_reviews",
-    "format_reviews_text",
+    "trim_for_telegram",
     "get_review_view",
     "shift_review_view",
     "get_current_review",
