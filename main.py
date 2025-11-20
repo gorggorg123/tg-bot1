@@ -134,6 +134,43 @@ async def cb_to_menu(callback: CallbackQuery) -> None:
     await callback.message.answer("Главное меню", reply_markup=main_menu_kb())
 
 
+@router.callback_query(F.data == "fbo_menu")
+async def cb_fbo_menu(callback: CallbackQuery) -> None:
+    await callback.answer()
+    text = await get_orders_today_text()
+    await callback.message.answer(text, reply_markup=fbo_keyboard())
+
+
+@router.callback_query(F.data == "fbo_summary")
+async def cb_fbo_summary(callback: CallbackQuery) -> None:
+    await callback.answer()
+    text = await get_orders_today_text()
+    try:
+        await callback.message.edit_text(text, reply_markup=fbo_keyboard())
+    except TelegramBadRequest:
+        await callback.message.answer(text, reply_markup=fbo_keyboard())
+
+
+@router.callback_query(F.data == "fbo_month")
+async def cb_fbo_month(callback: CallbackQuery) -> None:
+    await callback.answer("Сводка за месяц скоро")
+    await callback.message.answer(
+        "Месячная сводка пока в разработке, покажем как только будет готово.",
+        reply_markup=fbo_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "fbo_filter")
+async def cb_fbo_filter(callback: CallbackQuery) -> None:
+    await callback.answer("Фильтр скоро")
+
+
+@router.callback_query(F.data == "to_menu")
+async def cb_to_menu(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await callback.message.answer("Главное меню", reply_markup=main_menu_kb())
+
+
 @router.callback_query(F.data == "account_info")
 async def cb_account_info(callback: CallbackQuery) -> None:
     await callback.answer()
