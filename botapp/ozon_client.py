@@ -22,6 +22,9 @@ load_dotenv()
 BASE_URL = "https://api-seller.ozon.ru"
 MSK_SHIFT = timedelta(hours=3)
 
+_product_name_cache: dict[str, str | None] = {}
+_product_not_found_warned: set[str] = set()
+
 
 def _iso_z(dt: datetime) -> str:
     """Вернуть ISO-строку в UTC с Z без миллисекунд."""
@@ -138,6 +141,10 @@ class OzonAPIError(RuntimeError):
     """Ошибка вызова Ozon API."""
 
 
+class OzonProductNotFound(OzonAPIError):
+    """Товар не найден (404)."""
+
+
 @dataclass
 class OzonClient:
     client_id: str
@@ -178,17 +185,20 @@ class OzonClient:
         suffix = path if path.startswith("/") else f"/{path}"
         url = f"{BASE_URL}{suffix}"
         r = await self._http_client.post(url, json=json)
+
+        # Сначала проверяем статус, чтобы не пытаться парсить HTML/текст 404 как JSON
         try:
-            data = r.json()
+            r.raise_for_status()
+        except httpx.HTTPStatusError:
+            logger.warning("Ozon %s -> HTTP %s", url, r.status_code)
+            raise
+
+        try:
+            return r.json()
         except Exception:
             text = await r.aread()
-            logger.error("Ozon %s -> HTTP %s: %r", url, r.status_code, text[:500])
-            r.raise_for_status()
-            return {}
-        if r.status_code >= 400:
-            logger.error("Ozon %s -> HTTP %s: %r", url, r.status_code, data)
-            r.raise_for_status()
-        return data
+            logger.error("Ozon %s -> JSON decode failed: %r", url, text[:500])
+            raise
 
     async def get(self, path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
         suffix = path if path.startswith("/") else f"/{path}"
@@ -374,16 +384,20 @@ class OzonClient:
         return reviews[:max_reviews]
 
     async def get_product_name(self, product_id: str) -> str | None:
-        """Получить название товара по ``product_id`` через /v2/product/info.
+        """Получить название товара по ``product_id`` через product/info.
 
-        В логах была серия 404 ``page not found``. Пробуем строго задокументированный
-        payload (product_id в теле, без лишних полей) и резервно обращаемся к v1
-        эндпоинту. Любые ошибки логируем и возвращаем None, чтобы карточка могла
-        отобразить fallback без падения.
+        Требования:
+        - 404 не валит приложение и логируется один раз за product_id;
+        - JSON ошибки не выбрасывают stack trace в логах отзывов;
+        - название кэшируется, чтобы повторные карточки не спамили API.
         """
 
         if not product_id:
             return None
+
+        # Быстрый возврат из кэша (включая отрицательные результаты)
+        if product_id in _product_name_cache:
+            return _product_name_cache[product_id]
 
         numeric_id: int | None = None
         if str(product_id).isdigit():
@@ -393,10 +407,7 @@ class OzonClient:
                 numeric_id = None
 
         payload: dict[str, int | str] = {}
-        if numeric_id is not None:
-            payload["product_id"] = numeric_id
-        else:
-            payload["product_id"] = product_id
+        payload["product_id"] = numeric_id if numeric_id is not None else product_id
 
         paths = ("/v2/product/info", "/v1/product/info")
         for path in paths:
@@ -404,25 +415,42 @@ class OzonClient:
                 data = await self.post(path, payload)
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 404:
-                    logger.warning("Product %s not found on Ozon (%s): %s", product_id, path, exc)
-                    continue
-                logger.exception("Product info failed for %s on %s", product_id, path)
+                    if product_id not in _product_not_found_warned:
+                        logger.warning(
+                            "Product %s not found on Ozon (%s): status 404", product_id, path
+                        )
+                        _product_not_found_warned.add(product_id)
+                    _product_name_cache[product_id] = None
+                    return None
+                logger.warning(
+                    "Product info failed for %s on %s: HTTP %s",
+                    product_id,
+                    path,
+                    exc.response.status_code,
+                )
                 continue
-            except Exception:
-                logger.exception("Product info failed for %s on %s", product_id, path)
+            except Exception as exc:
+                logger.warning("Product info failed for %s on %s: %s", product_id, path, exc)
                 continue
 
             if not isinstance(data, dict):
-                logger.error("Unexpected product info response for %s at %s: %r", product_id, path, data)
+                logger.warning(
+                    "Unexpected product info response for %s at %s: %r",
+                    product_id,
+                    path,
+                    data,
+                )
                 continue
 
             res = data.get("result") if isinstance(data.get("result"), dict) else data
             if isinstance(res, dict):
                 name = res.get("name") or res.get("title") or res.get("offer_id")
                 if name:
+                    _product_name_cache[product_id] = str(name)
                     return str(name)
-            logger.warning("Product name missing for %s at %s: %r", product_id, path, res)
+            logger.warning("Product name missing for %s at %s", product_id, path)
 
+        _product_name_cache[product_id] = None
         return None
 
     # back-compat

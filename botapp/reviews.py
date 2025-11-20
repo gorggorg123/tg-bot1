@@ -17,7 +17,7 @@ MAX_REVIEWS_LOAD = 200
 MSK_SHIFT = timedelta(hours=3)
 TELEGRAM_SOFT_LIMIT = 4000
 
-_product_name_cache: dict[str, str] = {}
+_product_name_cache: dict[str, str | None] = {}
 _review_answered_cache: dict[int, set[str]] = {}
 _sessions: dict[int, "ReviewSession"] = {}
 
@@ -162,7 +162,7 @@ def _pick_product_label(card: ReviewCard) -> str:
     if product:
         return f"{product} (ID: {product_id})" if product_id else product
     if product_id:
-        return f"{product_id} (название недоступно)"
+        return f"ID {product_id} (название не найдено)"
     return "— (название недоступно)"
 
 
@@ -220,13 +220,10 @@ async def _resolve_product_names(cards: List[ReviewCard], client: OzonClient) ->
             continue
         try:
             title = await client.get_product_name(pid)
-        except Exception:
-            logger.exception("Failed to fetch product name for %s", pid)
+        except Exception as exc:
+            logger.warning("Failed to fetch product name for %s: %s", pid, exc)
             title = None
-        if title:
-            _product_name_cache[pid] = title
-        else:
-            logger.warning("Product name not resolved for %s", pid)
+        _product_name_cache[pid] = title
 
     for card in cards:
         if card.product_id and not card.product_name:
