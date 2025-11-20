@@ -147,6 +147,7 @@ async def cb_home(callback: CallbackQuery, callback_data: MenuCallbackData) -> N
     await callback.answer()
     await callback.message.answer("Главное меню", reply_markup=main_menu_keyboard())
 
+    view = await get_review_view(user_id, period_key, index)
 
 @router.callback_query(MenuCallbackData.filter(F.section == "fbo"))
 async def cb_fbo(callback: CallbackQuery, callback_data: MenuCallbackData) -> None:

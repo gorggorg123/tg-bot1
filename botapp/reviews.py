@@ -215,6 +215,52 @@ def _format_reviews_page(
         mode=mode,
         pretty_period=pretty,
     )
+    cards = [_normalize_review(r) for r in raw if isinstance(r, dict)]
+    cards.sort(key=lambda c: c.created_at or datetime.min, reverse=True)
+    logger.info(
+        "Reviews fetched (flat): %s items, period=%s",
+        len(cards),
+        pretty,
+    )
+    return cards, pretty
+
+
+def _build_review_view(cards: List[ReviewCard], index: int, pretty: str) -> ReviewView:
+    if not cards:
+        return ReviewView(
+            text="Отзывы за указанный период не найдены.",
+            index=0,
+            total=0,
+            period=pretty,
+        )
+
+    safe_index = max(0, min(index, len(cards) - 1))
+    text = _format_review_card_text(cards[safe_index], safe_index, len(cards), pretty)
+    text = trim_for_telegram(text)
+    return ReviewView(text=text, index=safe_index, total=len(cards), period=pretty)
+
+
+async def get_review_view(
+    user_id: int,
+    period_key: str = "recent",
+    index: int = 0,
+    client: OzonClient | None = None,
+) -> ReviewView:
+    """Вернуть представление отдельной карточки отзыва."""
+
+    cards, pretty = await fetch_recent_reviews(client)
+    return _build_review_view(cards, index, pretty)
+
+
+async def shift_review_view(
+    user_id: int,
+    period_key: str,
+    step: int,
+    client: OzonClient | None = None,
+) -> ReviewView:
+    # Периоды и переключение карточек больше не используются; возвращаем актуальный список
+    return await get_review_view(user_id, period_key, 0, client)
+
 
 
 async def get_reviews_page(
