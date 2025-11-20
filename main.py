@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from typing import Awaitable, Callable
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -20,6 +21,7 @@ from botapp.reviews import (
     get_reviews_week_text,
 )
 from botapp.tg import main_menu_kb
+from botapp.keyboards import reviews_periods_keyboard
 from botapp.ozon_client import get_client
 
 load_dotenv()
@@ -116,7 +118,30 @@ async def cb_full_analytics(callback: CallbackQuery) -> None:
 async def cb_reviews(callback: CallbackQuery) -> None:
     await callback.answer()
     text = await get_reviews_menu_text()
-    await callback.message.answer(text)
+    await callback.message.answer(text, reply_markup=reviews_periods_keyboard())
+
+
+async def _send_reviews_period(
+    callback: CallbackQuery, fetch_text: Callable[[], Awaitable[str]]
+) -> None:
+    await callback.answer()
+    text = await fetch_text()
+    await callback.message.edit_text(text, reply_markup=reviews_periods_keyboard())
+
+
+@router.callback_query(F.data == "reviews_today")
+async def cb_reviews_today(callback: CallbackQuery) -> None:
+    await _send_reviews_period(callback, get_reviews_today_text)
+
+
+@router.callback_query(F.data == "reviews_week")
+async def cb_reviews_week(callback: CallbackQuery) -> None:
+    await _send_reviews_period(callback, get_reviews_week_text)
+
+
+@router.callback_query(F.data == "reviews_month")
+async def cb_reviews_month(callback: CallbackQuery) -> None:
+    await _send_reviews_period(callback, get_reviews_month_text)
 
 
 def build_dispatcher() -> Dispatcher:

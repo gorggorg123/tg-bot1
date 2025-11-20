@@ -128,10 +128,4 @@ async def get_reviews_month_text(client: OzonClient | None = None) -> str:
 
 
 async def get_reviews_menu_text() -> str:
-    return (
-        "⭐ Раздел отзывов\n\n"
-        "Доступны команды:\n"
-        "• /reviews_today — отзывы за сегодня\n"
-        "• /reviews_week — отзывы за 7 дней\n"
-        "• /reviews_month — отзывы за текущий месяц"
-    )
+    return "⭐ Раздел отзывов. Выберите период:"

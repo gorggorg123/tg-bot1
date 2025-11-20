@@ -151,6 +151,22 @@ class OzonClient:
             r.raise_for_status()
         return data
 
+    async def get(self, path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        suffix = path if path.startswith("/") else f"/{path}"
+        url = f"{BASE_URL}{suffix}"
+        r = await self._http_client.get(url, params=params)
+        try:
+            data = r.json()
+        except Exception:
+            text = await r.aread()
+            logger.error("Ozon GET %s -> HTTP %s: %r", url, r.status_code, text[:500])
+            r.raise_for_status()
+            return {}
+        if r.status_code >= 400:
+            logger.error("Ozon GET %s -> HTTP %s: %r", url, r.status_code, data)
+            r.raise_for_status()
+        return data
+
     # ---------- Финансы ----------
 
     async def get_finance_totals(
@@ -180,7 +196,7 @@ class OzonClient:
                 "limit": limit,
                 "offset": offset,
                 "filter": {"since": date_from_iso, "to": date_to_iso},
-                "with": {"analytics_data": True, "financial_data": False, "legal_info": False},
+                "with": {"analytics_data": True, "financial_data": True, "legal_info": False},
             }
             page = await self.post("/v2/posting/fbo/list", body)
             if not isinstance(page, dict):
@@ -208,10 +224,28 @@ class OzonClient:
     # ---------- Аккаунт ----------
 
     async def get_company_info(self) -> Dict[str, Any]:
-        data = await self.post("/v1/company/info", {})
-        if isinstance(data, dict):
-            return data.get("result") or data
-        logger.error("Unexpected company info response: %r", data)
+        paths = ["/v1/company/info", "/v2/company/info"]
+        errors: list[int] = []
+
+        for path in paths:
+            for method in (self.post, self.get):
+                try:
+                    data = await method(path, {} if method is self.post else None)
+                except httpx.HTTPStatusError as exc:
+                    status = exc.response.status_code
+                    if status in (404, 405):
+                        errors.append(status)
+                        continue
+                    raise
+
+                if isinstance(data, dict):
+                    res = data.get("result") or data
+                    if res:
+                        return res
+                logger.error("Unexpected company info response (%s): %r", path, data)
+
+        if errors:
+            logger.warning("Company info endpoint returned %s", errors)
         return {}
 
     # ---------- Отзывы ----------
