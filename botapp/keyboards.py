@@ -102,14 +102,8 @@ def reviews_root_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Новые (без ответа)",
+                    text="🔄 Обновить отзывы",
                     callback_data=ReviewsCallbackData(action="open_list", category="unanswered").pack(),
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="Все отзывы",
-                    callback_data=ReviewsCallbackData(action="open_list", category="all").pack(),
                 )
             ],
             [
@@ -130,54 +124,47 @@ def reviews_navigation_keyboard(
     has_prev = index > 0
     has_next = (index + 1) < total
 
-    buttons = []
-    nav_row = []
-    nav_row.append(
+    nav_row = [
         InlineKeyboardButton(
-            text="⬅️ Предыдущий" if has_prev else "⏪ Начало",
-            callback_data=ReviewsCallbackData(action="nav", category=category, index=max(index - 1, 0)).pack(),
-        )
-    )
-    nav_row.append(
+            text="⬅️ Предыдущий" if has_prev else "⏮️ Начало",
+            callback_data=ReviewsCallbackData(action="nav", category=category, index=max(index - 1, 0), review_id=review_id).pack(),
+        ),
         InlineKeyboardButton(
-            text="Следующий ➡️" if has_next else "⏩ Конец",
-            callback_data=ReviewsCallbackData(action="nav", category=category, index=min(index + 1, total - 1)).pack(),
-        )
-    )
-    buttons.append(nav_row)
+            text="Следующий ➡️" if has_next else "⏭️ Конец",
+            callback_data=ReviewsCallbackData(action="nav", category=category, index=min(index + 1, total - 1), review_id=review_id).pack(),
+        ),
+    ]
 
-    buttons.append(
+    switch_category = "answered" if category != "answered" else "unanswered"
+    switch_label = "Показать отвеченные" if switch_category == "answered" else "Назад к неотвеченным"
+
+    buttons = [
+        nav_row,
         [
             InlineKeyboardButton(
-                text="✍️ Ответ ИИ",
+                text="✏️ Ответить через ИИ",
                 callback_data=ReviewsCallbackData(action="ai", category=category, index=index, review_id=review_id).pack(),
             )
-        ]
-    )
-    buttons.append(
+        ],
         [
             InlineKeyboardButton(
-                text="📝 Редактировать ответ",
-                callback_data=ReviewsCallbackData(action="edit", category=category, index=index, review_id=review_id).pack(),
+                text="✅ Пометить как отвеченный",
+                callback_data=ReviewsCallbackData(action="mark", category=category, index=index, review_id=review_id).pack(),
             )
-        ]
-    )
-    buttons.append(
+        ],
         [
             InlineKeyboardButton(
-                text="🔙 К списку отзывов",
-                callback_data=ReviewsCallbackData(action="back_list").pack(),
+                text=switch_label,
+                callback_data=ReviewsCallbackData(action="switch", category=switch_category, index=0).pack(),
             )
-        ]
-    )
-    buttons.append(
+        ],
         [
             InlineKeyboardButton(
                 text="⬅️ В главное меню",
                 callback_data=MenuCallbackData(section="home", action="open").pack(),
             )
-        ]
-    )
+        ],
+    ]
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -187,7 +174,7 @@ def review_draft_keyboard(category: str, index: int, review_id: str | None) -> I
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📨 Отправить как ответ",
+                    text="👍 Отправить как есть",
                     callback_data=ReviewsCallbackData(action="send", category=category, index=index, review_id=review_id).pack(),
                 )
             ],
@@ -199,7 +186,7 @@ def review_draft_keyboard(category: str, index: int, review_id: str | None) -> I
             ],
             [
                 InlineKeyboardButton(
-                    text="✏️ Изменить",
+                    text="✍️ Отредактировать",
                     callback_data=ReviewsCallbackData(action="edit", category=category, index=index, review_id=review_id).pack(),
                 )
             ],

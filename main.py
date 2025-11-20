@@ -31,9 +31,9 @@ from botapp.reviews import (
     ReviewCard,
     get_ai_reply_for_review,
     get_review_and_card,
+    get_review_by_id,
     get_review_by_index,
     get_review_view,
-    get_reviews_menu_text,
     mark_review_answered,
     refresh_reviews,
     trim_for_telegram,
@@ -60,6 +60,7 @@ router = Router()
 _draft_cache: Dict[Tuple[int, str], str] = {}
 _pending_edit: Dict[int, Tuple[str | None, str, int]] = {}
 _polling_task: asyncio.Task | None = None
+_last_service_messages: Dict[int, int] = {}
 
 
 def _get_draft_key(user_id: int, review_id: str | None) -> Tuple[int, str]:
@@ -77,41 +78,94 @@ async def delete_message_safe(bot: Bot, chat_id: int, message_id: int) -> None:
         logger.debug("Skip delete message: %s", exc)
 
 
+async def send_service_message(
+    bot: Bot, chat_id: int, user_id: int, text: str, reply_markup=None
+) -> Message:
+    """Отправить служебное сообщение, удалив предыдущее для пользователя."""
+
+    prev = _last_service_messages.get(user_id)
+    if prev:
+        await delete_message_safe(bot, chat_id, prev)
+
+    sent = await bot.send_message(chat_id, text, reply_markup=reply_markup)
+    _last_service_messages[user_id] = sent.message_id
+    return sent
+
+
+def remember_service_message(user_id: int, message_id: int) -> None:
+    _last_service_messages[user_id] = message_id
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     text = (
         "Привет! Я помогу быстро смотреть финансы, заказы и отзывы Ozon.\n"
         "Выберите раздел на клавиатуре ниже."
     )
-    await message.answer(text, reply_markup=main_menu_keyboard())
+    await send_service_message(
+        message.bot,
+        message.chat.id,
+        message.from_user.id,
+        text,
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 @router.message(Command("fin_today"))
 @router.message(F.text == "📊 Финансы сегодня")
 async def cmd_fin_today(message: Message) -> None:
     text = await get_finance_today_text()
-    await message.answer(text, reply_markup=main_menu_keyboard())
+    await send_service_message(
+        message.bot,
+        message.chat.id,
+        message.from_user.id,
+        text,
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 @router.message(Command("account"))
 @router.message(F.text == "⚙️ Аккаунт Ozon")
 async def cmd_account(message: Message) -> None:
     text = await get_account_info_text()
-    await message.answer(text, reply_markup=account_keyboard())
+    await send_service_message(
+        message.bot,
+        message.chat.id,
+        message.from_user.id,
+        text,
+        reply_markup=account_keyboard(),
+    )
 
 
 @router.message(Command("fbo"))
 @router.message(F.text == "📦 FBO за сегодня")
 async def cmd_fbo(message: Message) -> None:
     text = await get_orders_today_text()
-    await message.answer(text, reply_markup=fbo_menu_keyboard())
+    await send_service_message(
+        message.bot,
+        message.chat.id,
+        message.from_user.id,
+        text,
+        reply_markup=fbo_menu_keyboard(),
+    )
 
 
 @router.message(Command("reviews"))
 @router.message(F.text == "⭐ Отзывы")
 async def cmd_reviews(message: Message) -> None:
-    text = await get_reviews_menu_text()
-    await message.answer(text, reply_markup=reviews_root_keyboard())
+    user_id = message.from_user.id
+    session = await refresh_reviews(user_id)
+    if not session.unanswered_reviews:
+        await send_service_message(
+            message.bot,
+            message.chat.id,
+            user_id,
+            "Неотвеченных отзывов нет. Можно посмотреть отвеченные или обновить список.",
+            reply_markup=reviews_root_keyboard(),
+        )
+        return
+
+    await _send_review_card(user_id=user_id, category="unanswered", index=0, message=message)
 
 
 async def _send_review_card(
@@ -121,8 +175,9 @@ async def _send_review_card(
     index: int = 0,
     message: Message | None = None,
     callback: CallbackQuery | None = None,
+    review_id: str | None = None,
 ) -> None:
-    view, card = await get_review_and_card(user_id, category, index)
+    view, card = await get_review_and_card(user_id, category, index, review_id=review_id)
     if view.total == 0:
         text = trim_for_telegram(view.text)
         markup = reviews_root_keyboard()
@@ -136,8 +191,10 @@ async def _send_review_card(
 
     try:
         await target.edit_text(text, reply_markup=markup)
+        remember_service_message(user_id, target.message_id)
     except TelegramBadRequest:
-        await target.answer(text, reply_markup=markup)
+        sent = await send_service_message(target.bot, target.chat.id, user_id, text, reply_markup=markup)
+        remember_service_message(user_id, sent.message_id)
 
 
 def _store_draft(user_id: int, review_id: str | None, text: str) -> None:
@@ -208,6 +265,7 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
     category = callback_data.category or "unanswered"
     index = callback_data.index or 0
     user_id = callback.from_user.id
+    review_id = callback_data.review_id
 
     if action == "open_list":
         await callback.answer()
@@ -215,45 +273,74 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
         await _send_review_card(user_id=user_id, category=category, index=0, callback=callback)
         return
 
-    if action == "back_list":
-        await callback.answer()
-        text = await get_reviews_menu_text()
-        await callback.message.answer(text, reply_markup=reviews_root_keyboard())
-        return
-
     if action == "nav":
         await callback.answer()
-        await _send_review_card(user_id=user_id, category=category, index=index, callback=callback)
+        await _send_review_card(user_id=user_id, category=category, index=index, callback=callback, review_id=review_id)
+        return
+
+    if action == "switch":
+        await callback.answer()
+        await _send_review_card(user_id=user_id, category=category, index=0, callback=callback)
         return
 
     if action == "ai":
         await callback.answer("Готовим ответ…", show_alert=False)
-        review = await get_review_by_index(user_id, category, index)
-        await _handle_ai_reply(callback, category, index, review)
+        review, new_index = await get_review_by_id(user_id, category, review_id)
+        await _handle_ai_reply(callback, category, new_index, review)
         return
 
     if action == "regen":
         await callback.answer("Готовим новый ответ…", show_alert=False)
-        review = await get_review_by_index(user_id, category, index)
-        await _handle_ai_reply(callback, category, index, review)
+        review, new_index = await get_review_by_id(user_id, category, review_id)
+        await _handle_ai_reply(callback, category, new_index, review)
         return
 
     if action == "edit":
         await callback.answer()
-        _pending_edit[user_id] = (callback_data.review_id, category, index)
+        _, current_index = await get_review_by_id(user_id, category, review_id)
+        _pending_edit[user_id] = (callback_data.review_id, category, current_index)
         await callback.message.answer(
             "Пришлите отредактированный текст ответа одним сообщением."
         )
         return
 
+    if action == "mark":
+        await callback.answer()
+        mark_review_answered(review_id, user_id)
+        await _send_review_card(user_id=user_id, category=category, index=index, callback=callback, review_id=review_id)
+        return
+
     if action == "send":
         await callback.answer()
         review_id = callback_data.review_id
-        mark_review_answered(review_id)
+        mark_review_answered(review_id, user_id)
         await callback.message.answer(
             "Ответ отмечен как отправленный. (Отправка в Ozon пока не реализована)"
         )
+        await _send_review_card(user_id=user_id, category=category, index=index, callback=callback, review_id=review_id)
         return
+
+
+@router.message()
+async def handle_any(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else 0
+    if user_id in _pending_edit:
+        review_id, category, index = _pending_edit.pop(user_id)
+        text = (message.text or message.caption or "").strip()
+        if not text:
+            await message.answer("Не удалось сохранить пустой ответ, попробуйте ещё раз.")
+            return
+        _store_draft(user_id, review_id, text)
+        mark_review_answered(review_id, user_id)
+        await message.answer(
+            f"Черновик обновлён:\n\n{text}",
+            reply_markup=review_draft_keyboard(category, index, review_id),
+        )
+        await _send_review_card(user_id=user_id, category=category, index=index, message=message, review_id=review_id)
+        return
+
+    # fallback для неизвестных сообщений
+    await message.answer("Выберите действие в меню ниже", reply_markup=main_menu_keyboard())
 
 
 @router.message()

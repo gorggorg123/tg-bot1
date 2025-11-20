@@ -15,7 +15,11 @@ DEFAULT_RECENT_DAYS = 30
 MAX_REVIEW_LEN = 450
 MAX_REVIEWS_LOAD = 200
 MSK_SHIFT = timedelta(hours=3)
-TELEGRAM_SOFT_LIMIT = 3500
+TELEGRAM_SOFT_LIMIT = 4000
+
+_product_name_cache: dict[str, str] = {}
+_review_answered_cache: dict[int, set[str]] = {}
+_sessions: dict[int, "ReviewSession"] = {}
 
 _product_name_cache: dict[str, str] = {}
 _review_answered_cache: set[str] = set()
@@ -48,7 +52,10 @@ class ReviewSession:
     all_reviews: List[ReviewCard] = field(default_factory=list)
     unanswered_reviews: List[ReviewCard] = field(default_factory=list)
     pretty_period: str = ""
-    indexes: Dict[str, int] = field(default_factory=lambda: {"all": 0, "unanswered": 0})
+    indexes: Dict[str, int] = field(default_factory=lambda: {"all": 0, "unanswered": 0, "answered": 0})
+
+    def rebuild_unanswered(self, user_id: int) -> None:
+        self.unanswered_reviews = [c for c in self.all_reviews if not is_answered(c, user_id)]
 
 
 def _parse_date(value: Any) -> datetime | None:
@@ -77,18 +84,23 @@ def _msk_range_last_days(days: int = DEFAULT_RECENT_DAYS) -> Tuple[datetime, dat
     return start_msk, end_msk, pretty
 
 
-def is_answered(review: ReviewCard) -> bool:
-    if review.id and review.id in _review_answered_cache:
+def _answered_for_user(user_id: int) -> set[str]:
+    return _review_answered_cache.setdefault(user_id, set())
+
+
+def is_answered(review: ReviewCard, user_id: int | None = None) -> bool:
+    user_cache = _answered_for_user(user_id or 0)
+    if review.id and review.id in user_cache:
         return True
     return bool(review.answered or (review.answer_text and review.answer_text.strip()))
 
 
-def mark_review_answered(review_id: str | None) -> None:
+def mark_review_answered(review_id: str | None, user_id: int) -> None:
     if review_id:
-        _review_answered_cache.add(review_id)
+        _answered_for_user(user_id).add(review_id)
     # Обновим сессии, чтобы отзыв пропал из непрочитанных
-    for session in _sessions.values():
-        session.unanswered_reviews = [c for c in session.all_reviews if not is_answered(c)]
+    for uid, session in _sessions.items():
+        session.rebuild_unanswered(uid)
 
 
 def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
@@ -138,48 +150,48 @@ def _calc_stats(cards: List[ReviewCard]) -> Tuple[int, float, Dict[int, int]]:
 
 
 def _pick_product_label(card: ReviewCard) -> str:
+    product_id = card.product_id or card.offer_id
     product = card.product_name or ""
-    if not product:
-        if card.product_id:
-            return f"{card.product_id} (имя недоступно)"
-        if card.offer_id:
-            return f"{card.offer_id} (имя недоступно)"
-        return "—"
-    return product
+    if product:
+        return f"{product} (ID: {product_id})" if product_id else product
+    if product_id:
+        return f"{product_id} (название недоступно)"
+    return "— (название недоступно)"
 
 
-def _format_review_card_text(card: ReviewCard, index: int, total: int, period_title: str) -> str:
+def _format_review_card_text(card: ReviewCard, index: int, total: int, period_title: str, user_id: int) -> str:
     """Сформировать карточку одного отзыва."""
 
     date_line = _fmt_dt_msk(card.created_at)
     stars = f"{card.rating}★" if card.rating else "—"
-    status = "Есть ответ продавца" if is_answered(card) else "Без ответа"
+    status = "Есть ответ продавца" if is_answered(card, user_id) else "Без ответа"
     product_line = _pick_product_label(card)
 
-    lines = [
-        f"⭐ Отзыв {index + 1} из {total} • период: {period_title}",
-        "",
-        f"Рейтинг: {stars}",
-        f"Товар: {product_line}",
-    ]
+    lines = [f"⭐ Отзыв {index + 1}/{total}"]
+    if date_line:
+        lines.append(f"Дата: {date_line} (МСК)")
+    lines.extend(
+        [
+            f"Рейтинг: {stars}",
+            f"Позиция: {product_line}",
+        ]
+    )
 
     if card.id:
         lines.append(f"ID отзыва: {card.id}")
-    if date_line:
-        lines.append(f"Дата: {date_line} (МСК)")
 
     lines.extend([
         "",
         "Текст отзыва:",
         card.text or "(пустой отзыв)",
         "",
-        f"Статус ответа: {status}",
+        f"Статус: {status}",
     ])
 
     if card.answer_text:
         lines.extend([
             "",
-            "Ответ продавца:",
+            "Ответ покупателю:",
             card.answer_text,
         ])
 
@@ -189,7 +201,29 @@ def _format_review_card_text(card: ReviewCard, index: int, total: int, period_ti
 def trim_for_telegram(text: str, max_len: int = TELEGRAM_SOFT_LIMIT) -> str:
     if len(text) <= max_len:
         return text
-    return text[: max_len - 1] + "…"
+    suffix = "… (обрезано)"
+    return text[: max_len - len(suffix)] + suffix
+
+
+async def _resolve_product_names(cards: List[ReviewCard], client: OzonClient) -> None:
+    missing_ids = [c.product_id for c in cards if c.product_id and not c.product_name]
+    unique_ids = [pid for pid in dict.fromkeys(missing_ids) if pid]
+    for pid in unique_ids:
+        if pid in _product_name_cache:
+            continue
+        try:
+            title = await client.get_product_name(pid)
+        except Exception:
+            logger.exception("Failed to fetch product name for %s", pid)
+            title = None
+        if title:
+            _product_name_cache[pid] = title
+        else:
+            logger.warning("Product name not resolved for %s", pid)
+
+    for card in cards:
+        if card.product_id and not card.product_name:
+            card.product_name = _product_name_cache.get(card.product_id) or card.product_name
 
 
 async def _resolve_product_names(cards: List[ReviewCard], client: OzonClient) -> None:
@@ -239,17 +273,17 @@ async def fetch_recent_reviews(
     return cards, pretty
 
 
-def _build_review_view(cards: List[ReviewCard], index: int, pretty: str) -> ReviewView:
+def _build_review_view(cards: List[ReviewCard], index: int, pretty: str, user_id: int) -> ReviewView:
     if not cards:
         return ReviewView(
-            text="Отзывы за указанный период не найдены.",
+            text="Отзывы за выбранный период не найдены.",
             index=0,
             total=0,
             period=pretty,
         )
 
     safe_index = max(0, min(index, len(cards) - 1))
-    text = _format_review_card_text(cards[safe_index], safe_index, len(cards), pretty)
+    text = _format_review_card_text(cards[safe_index], safe_index, len(cards), pretty, user_id)
     text = trim_for_telegram(text)
     return ReviewView(text=text, index=safe_index, total=len(cards), period=pretty)
 
@@ -261,18 +295,29 @@ async def _ensure_session(user_id: int, client: OzonClient | None = None) -> Rev
     cards, pretty = await fetch_recent_reviews(client)
     session = ReviewSession(
         all_reviews=cards,
-        unanswered_reviews=[c for c in cards if not is_answered(c)],
+        unanswered_reviews=[c for c in cards if not is_answered(c, user_id)],
         pretty_period=pretty,
     )
     _sessions[user_id] = session
     return session
 
 
-def _get_cards_for_category(session: ReviewSession, category: str) -> List[ReviewCard]:
+def _get_cards_for_category(session: ReviewSession, category: str, user_id: int) -> List[ReviewCard]:
     if category == "unanswered":
-        session.unanswered_reviews = [c for c in session.all_reviews if not is_answered(c)]
+        session.rebuild_unanswered(user_id)
         return session.unanswered_reviews
+    if category == "answered":
+        return [c for c in session.all_reviews if is_answered(c, user_id)]
     return session.all_reviews
+
+
+def _find_card_by_id(cards: List[ReviewCard], review_id: str | None) -> tuple[int, ReviewCard] | tuple[int, None]:
+    if not review_id:
+        return 0, cards[0] if cards else None
+    for idx, card in enumerate(cards):
+        if card.id == review_id:
+            return idx, card
+    return 0, cards[0] if cards else None
 
 
 async def get_review_view(
@@ -282,8 +327,8 @@ async def get_review_view(
     client: OzonClient | None = None,
 ) -> ReviewView:
     session = await _ensure_session(user_id, client)
-    cards = _get_cards_for_category(session, category)
-    view = _build_review_view(cards, index, session.pretty_period)
+    cards = _get_cards_for_category(session, category, user_id)
+    view = _build_review_view(cards, index, session.pretty_period, user_id)
     session.indexes[category] = view.index
     return view
 
@@ -293,12 +338,16 @@ async def get_review_and_card(
     category: str,
     index: int,
     client: OzonClient | None = None,
+    review_id: str | None = None,
 ) -> tuple[ReviewView, ReviewCard | None]:
     session = await _ensure_session(user_id, client)
-    cards = _get_cards_for_category(session, category)
-    view = _build_review_view(cards, index, session.pretty_period)
+    cards = _get_cards_for_category(session, category, user_id)
+    if review_id:
+        index, card = _find_card_by_id(cards, review_id)
+    else:
+        card = cards[index] if cards else None
+    view = _build_review_view(cards, index, session.pretty_period, user_id)
     session.indexes[category] = view.index
-    card = cards[view.index] if cards else None
     return view, card
 
 
@@ -324,11 +373,21 @@ async def get_review_by_index(
     return card
 
 
+async def get_review_by_id(
+    user_id: int,
+    category: str,
+    review_id: str | None,
+    client: OzonClient | None = None,
+) -> tuple[ReviewCard | None, int]:
+    view, card = await get_review_and_card(user_id, category, 0, client, review_id=review_id)
+    return card, view.index
+
+
 async def refresh_reviews(user_id: int, client: OzonClient | None = None) -> ReviewSession:
     cards, pretty = await fetch_recent_reviews(client)
     session = ReviewSession(
         all_reviews=cards,
-        unanswered_reviews=[c for c in cards if not is_answered(c)],
+        unanswered_reviews=[c for c in cards if not is_answered(c, user_id)],
         pretty_period=pretty,
     )
     _sessions[user_id] = session
@@ -360,10 +419,10 @@ __all__ = [
     "get_review_view",
     "shift_review_view",
     "get_review_and_card",
+    "get_review_by_id",
     "get_review_by_index",
     "refresh_reviews",
     "get_ai_reply_for_review",
-    "get_reviews_menu_text",
     "mark_review_answered",
     "is_answered",
 ]

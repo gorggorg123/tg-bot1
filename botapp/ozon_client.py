@@ -379,8 +379,23 @@ class OzonClient:
         if not product_id:
             return None
 
-        payload = {"product_id": str(product_id)}
-        data = await self.post("/v2/product/info", payload)
+        payload: dict[str, str | int] = {"product_id": product_id, "language": "DEFAULT"}
+        # Ozon ожидает product_id числом, но оставляем строку как fallback
+        if str(product_id).isdigit():
+            payload["product_id"] = int(product_id)
+
+        try:
+            data = await self.post("/v2/product/info", payload)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                logger.warning("Product %s not found on Ozon: %s", product_id, exc)
+                return None
+            logger.exception("Product info failed for %s", product_id)
+            return None
+        except Exception:
+            logger.exception("Product info failed for %s", product_id)
+            return None
+
         if not isinstance(data, dict):
             logger.error("Unexpected product info response for %s: %r", product_id, data)
             return None
@@ -388,7 +403,9 @@ class OzonClient:
         res = data.get("result") if isinstance(data.get("result"), dict) else data
         if isinstance(res, dict):
             name = res.get("name") or res.get("title") or res.get("offer_id")
-            return str(name) if name else None
+            if name:
+                return str(name)
+        logger.warning("Product name is missing in response for %s: %r", product_id, res)
         return None
 
     # back-compat
