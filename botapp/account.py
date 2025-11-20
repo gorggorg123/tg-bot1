@@ -26,11 +26,11 @@ async def get_account_info_text(client: OzonClient | None = None) -> str:
     client = client or get_client()
     try:
         info = await client.get_seller_info()
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to fetch account info")
         return "⚠️ Не удалось получить данные аккаунта. Попробуйте позже."
 
-    if not info:
+    if not info or not isinstance(info, dict):
         return (
             "⚠️ Не удалось получить данные аккаунта.\n"
             "Проверьте, включен ли необходимый API-метод в личном кабинете Ozon."
@@ -82,46 +82,48 @@ async def get_account_info_text(client: OzonClient | None = None) -> str:
     lines = ["🧾 <b>Аккаунт Ozon</b>"]
 
     if company_name:
-        lines.append(f"🏢 Компания: <b>{company_name}</b>")
-    if status:
-        lines.append(f"⚙️ Статус: <b>{status}</b>")
+        lines.append(f"Компания: <b>{company_name}</b>")
     if inn:
-        lines.append(f"🧾 ИНН: <code>{inn}</code>")
+        lines.append(f"ИНН: <code>{inn}</code>")
     if ogrn:
-        lines.append(f"📄 ОГРН: <code>{ogrn}</code>")
-    if registered_at:
-        lines.append(f"📅 Регистрация: {registered_at}")
-    if connected_at and connected_at != registered_at:
-        lines.append(f"🔌 Подключение: {connected_at}")
+        lines.append(f"ОГРН: <code>{ogrn}</code>")
     if tax_system:
-        lines.append(f"💼 Налогообложение: {tax_system}")
-    if rating:
-        try:
-            rating_val = float(rating)
-            lines.append(f"⭐ Средний рейтинг: {rating_val:.2f}")
-        except Exception:
-            pass
-    if region:
-        lines.append(f"📍 Регион/склад: {region}{(' • ' + warehouse) if warehouse else ''}")
-    elif warehouse:
-        lines.append(f"📍 Базовый склад: {warehouse}")
-    if email:
-        lines.append(f"✉️ Email: {email}")
+        lines.append(f"Налогообложение: {tax_system}")
+    if region or warehouse:
+        region_line = region or warehouse
+        if region and warehouse and warehouse not in region_line:
+            region_line = f"{region} • {warehouse}"
+        lines.append(f"Регион/склад: {region_line}")
+    if status:
+        lines.append(f"Статус: {status}")
+    if registered_at:
+        lines.append(f"Регистрация: {registered_at}")
+    if connected_at and connected_at != registered_at:
+        lines.append(f"Подключение: {connected_at}")
     if subscription:
         sub_type = subscription.get("type") if isinstance(subscription, dict) else None
+        level = subscription.get("level") if isinstance(subscription, dict) else None
         is_premium = subscription.get("is_premium") if isinstance(subscription, dict) else None
-        status_line = f"Тип: {sub_type}" if sub_type else None
+        parts = []
+        if sub_type:
+            parts.append(str(sub_type))
+        if level:
+            parts.append(str(level))
         if is_premium is not None:
-            status_line = (status_line + " • " if status_line else "") + (
-                "Premium" if is_premium else "Standard"
-            )
-        if status_line:
-            lines.append(f"⭐ Подписка: {status_line}")
+            parts.append("Premium" if is_premium else "Standard")
+        if parts:
+            lines.append(f"Подписка: {' • '.join(parts)}")
+    if rating not in (None, ""):
+        try:
+            rating_val = float(rating)
+            lines.append(f"Средний рейтинг: {rating_val:.2f}")
+        except Exception:
+            pass
+    if email:
+        lines.append(f"Email: {email}")
 
     if len(lines) == 1:
-        lines.append(
-            "⚠️ Не удалось разобрать данные аккаунта."
-        )
+        lines.append("⚠️ Не удалось разобрать данные аккаунта.")
 
     if debug:
         try:

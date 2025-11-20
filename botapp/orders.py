@@ -149,24 +149,40 @@ async def get_orders_today_text(client: OzonClient | None = None) -> str:
     delta_revenue = today["amount_without_cancel"] - yesterday.get(
         "amount_without_cancel", 0
     )
+    delta_avg = today.get("avg_check", 0) - yesterday.get("avg_check", 0)
 
     lines = [
         "📦 FBO • Сводка",
         pretty_today,
         "",
         "Сегодня",
-        f"📦 Заказано: {fmt_int(today['total'])} / {fmt_rub0(today['amount_ordered'])}",
+        f"📊 Заказано: {fmt_int(today['total'])} / {fmt_rub0(today['amount_ordered'])}",
         f"✅ Без отмен: {fmt_int(today['orders_without_cancel'])} / {fmt_rub0(today['amount_without_cancel'])}",
         f"❌ Отмен: {fmt_int(today['cancelled'])} / {fmt_rub0(today['amount_cancelled'])}",
         f"🔁 Возвраты: {fmt_int(today['returns'])} шт",
-        "",
-        "Δ к вчера",
-        f"• Заказы: {_fmt_delta(delta_orders)}",
-        f"• Выручка (без отмен): {_fmt_delta(delta_revenue)} ₽",
     ]
 
     if today.get("orders_without_cancel"):
         lines.append(f"🧾 Средний чек (без отмен): {fmt_rub0(today['avg_check'])}")
+
+    lines.extend(
+        [
+            "",
+            "Δ к вчера",
+            f"• Заказы: {_fmt_delta(delta_orders)}",
+            f"• Выручка (без отмен): {_fmt_delta(delta_revenue)} ₽",
+        ]
+    )
+
+    if today.get("orders_without_cancel"):
+        if yesterday.get("orders_without_cancel"):
+            lines.append(
+                f"🧾 Средний чек (без отмен): {_fmt_delta(delta_avg)} ₽"
+            )
+        else:
+            lines.append(
+                f"🧾 Средний чек (без отмен): {fmt_rub0(today['avg_check'])} (вчера не было заказов)"
+            )
 
     if today.get("top3"):
         lines.append("")

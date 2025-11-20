@@ -283,10 +283,20 @@ class OzonClient:
             logger.error("Unexpected seller info response: %r", data)
             raise OzonAPIError("Некорректный ответ seller/info")
 
-        res = data.get("result") if isinstance(data, dict) else None
-        if isinstance(res, dict):
-            return res
-        logger.error("Seller info response without result: %r", data)
+        # Новые ответы SellerAPI могут не содержать поля result, сразу отдаём payload
+        if "result" in data and isinstance(data.get("result"), dict):
+            payload = data["result"]
+        else:
+            payload = data
+
+        if isinstance(payload, dict):
+            logger.info(
+                "Seller info fetched: company=%s subscription=%s",
+                payload.get("company", {}).get("name") if isinstance(payload.get("company"), dict) else payload.get("company"),
+                payload.get("subscription"),
+            )
+            return payload
+
         raise OzonAPIError("Не удалось получить информацию о продавце")
 
     # ---------- Отзывы ----------
@@ -300,6 +310,22 @@ class OzonClient:
 
         safe_limit = min(max(limit, 20), 100)
         date_filter = {"from": date_from_iso[:10], "to": date_to_iso[:10]}
+
+        def _parse_review_dt(item: Dict[str, Any]) -> datetime | None:
+            raw = (
+                item.get("created_at")
+                or item.get("createdAt")
+                or item.get("date")
+                or item.get("answer_date")
+            )
+            if not raw:
+                return None
+            try:
+                return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+        since_dt = datetime.fromisoformat(date_from_iso.replace("Z", "+00:00"))
 
         reviews: List[Dict[str, Any]] = []
         page = 1
@@ -319,18 +345,31 @@ class OzonClient:
                 arr = res
 
             page_items = [r for r in arr if isinstance(r, dict)]
+            if not page_items:
+                break
+
             reviews.extend(page_items)
 
-            # Ozon API может не всегда возвращать total, поэтому останавливаемся по факту
+            # Останавливаемся, если получили меньше лимита или упёрлись в нижнюю границу периода
             if len(page_items) < safe_limit:
                 break
 
-            # extra защита от бесконечной пагинации
+            oldest = min((_parse_review_dt(it) for it in page_items if _parse_review_dt(it)), default=None)
+            if oldest and oldest < since_dt:
+                break
+
             page += 1
             if page > 20:
                 logger.warning("Reviews pagination stopped after 20 pages")
                 break
 
+        logger.info(
+            "Reviews fetched: %s items for %s..%s with limit=%s",
+            len(reviews),
+            date_filter.get("from"),
+            date_filter.get("to"),
+            safe_limit,
+        )
         return reviews[:max_reviews]
 
     # back-compat

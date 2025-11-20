@@ -33,11 +33,20 @@ def reviews_periods_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="7 дней", callback_data="reviews_week"),
                 InlineKeyboardButton(text="Месяц", callback_data="reviews_month"),
             ],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="to_menu")],
+        ]
+    )
+
+
+def reviews_navigation_keyboard(has_prev: bool, has_next: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
             [
-                InlineKeyboardButton(text="◀ Назад", callback_data="reviews_prev"),
-                InlineKeyboardButton(text="Далее ▶", callback_data="reviews_next"),
+                InlineKeyboardButton(text="◀ Назад", callback_data="reviews_prev" if has_prev else "reviews_prev"),
+                InlineKeyboardButton(text="Далее ▶", callback_data="reviews_next" if has_next else "reviews_next"),
             ],
             [InlineKeyboardButton(text="✍ Черновик ответа", callback_data="reviews_ai_draft")],
+            [InlineKeyboardButton(text="⬅ К периодам", callback_data="reviews_back")],
         ]
     )
 
