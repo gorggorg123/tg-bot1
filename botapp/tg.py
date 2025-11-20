@@ -22,12 +22,6 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="📦 Заказы за сегодня",
-                    callback_data="orders_today",
-                )
-            ],
-            [
-                InlineKeyboardButton(
                     text="👤 Аккаунт Ozon",
                     callback_data="account_info",
                 )
@@ -36,6 +30,12 @@ def main_menu_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="📊 Полная аналитика",
                     callback_data="full_analytics",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📦 FBO",
+                    callback_data="fbo_menu",
                 )
             ],
             [
