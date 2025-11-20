@@ -303,18 +303,28 @@ class OzonClient:
 
     async def get_reviews(
         self,
-        date_from_iso: str,
-        date_to_iso: str,
-        limit: int = 50,
+        date_from: datetime,
+        date_to: datetime,
+        *,
+        limit_per_page: int = 80,
         offset: int = 0,
-        max_reviews: int = 200,
+        max_count: int | None = 200,
     ) -> List[Dict[str, Any]]:
-        """
-        Пагинация по /v1/review/list. Ozon принимает Limit в диапазоне [20, 100].
+        """Загрузить отзывы через /v1/review/list c контролем лимитов.
+
+        Ozon принимает ``Limit`` строго в диапазоне ``[20, 100]``. Чтобы не спамить
+        API лишними вызовами, позволяем задать максимальное количество отзывов
+        ``max_count`` (по умолчанию 200) и пагинируем по ``offset`` с шагом
+        ``safe_limit``.
         """
 
-        safe_limit = max(20, min(limit, 100))
-        date_filter = {"from": date_from_iso[:10], "to": date_to_iso[:10]}
+        safe_limit = max(20, min(limit_per_page, 100))
+        max_reviews = max_count if max_count is not None else 10_000
+
+        date_filter = {
+            "from": date_from.date().isoformat(),
+            "to": date_to.date().isoformat(),
+        }
 
         reviews: List[Dict[str, Any]] = []
         current_offset = max(0, offset)
@@ -325,17 +335,19 @@ class OzonClient:
                 "offset": current_offset,
                 "filter": {"date": date_filter},
             }
+
             data = await self.post("/v1/review/list", body)
             if not isinstance(data, dict):
                 logger.error("Unexpected reviews response: %r", data)
                 break
 
             res = data.get("result") or data
-            arr: List[Dict[str, Any]] = []
             if isinstance(res, dict):
                 arr = res.get("reviews") or res.get("feedbacks") or res.get("items") or []
             elif isinstance(res, list):
                 arr = res
+            else:
+                arr = []
 
             page_items = [r for r in arr if isinstance(r, dict)]
             if not page_items:
@@ -351,12 +363,13 @@ class OzonClient:
                 break
 
         logger.info(
-            "Reviews fetched: %s items for %s..%s with limit=%s offset_start=%s",
+            "Reviews fetched: %s items for %s..%s limit=%s offset_start=%s max=%s",
             len(reviews),
             date_filter.get("from"),
             date_filter.get("to"),
             safe_limit,
             offset,
+            max_count,
         )
         return reviews[:max_reviews]
 

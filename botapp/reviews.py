@@ -7,19 +7,14 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple
 
 from .ai_client import generate_review_reply
-from .ozon_client import (
-    OzonClient,
-    fmt_int,
-    get_client,
-    msk_current_month_range,
-    msk_today_range,
-    msk_week_range,
-)
+from .ozon_client import OzonClient, fmt_int, get_client
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_RECENT_DAYS = 30
 MAX_REVIEW_LEN = 450
-MAX_CACHED_REVIEWS = 200
+MAX_REVIEWS_LOAD = 200
+MSK_SHIFT = timedelta(hours=3)
 
 
 @dataclass
@@ -41,10 +36,6 @@ class ReviewView:
     period: str
 
 
-# user_id -> cache entry
-_user_reviews_cache: Dict[int, Dict[str, Any]] = {}
-
-
 def _parse_date(value: Any) -> datetime | None:
     if not value:
         return None
@@ -57,8 +48,18 @@ def _parse_date(value: Any) -> datetime | None:
 def _fmt_dt_msk(dt: datetime | None) -> str:
     if not dt:
         return ""
-    dt_msk = dt + timedelta(hours=3)
+    dt_msk = dt + MSK_SHIFT
     return dt_msk.strftime("%d.%m.%Y %H:%M")
+
+
+def _msk_range_last_days(days: int = DEFAULT_RECENT_DAYS) -> Tuple[datetime, datetime, str]:
+    """Вернуть диапазон последних *days* дней в МСК (начиная с полуночи)."""
+    now_utc = datetime.utcnow()
+    now_msk = now_utc + MSK_SHIFT
+    start_msk = datetime(now_msk.year, now_msk.month, now_msk.day) - timedelta(days=days - 1)
+    end_msk = datetime(now_msk.year, now_msk.month, now_msk.day, 23, 59, 59)
+    pretty = f"{start_msk:%d.%m.%Y} — {end_msk:%d.%m.%Y} (МСК)"
+    return start_msk, end_msk, pretty
 
 
 def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
@@ -83,44 +84,6 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
     )
 
 
-def _period_meta(period_key: str):
-    mapping = {
-        "today": (msk_today_range, "Сегодня"),
-        "week": (msk_week_range, "Последние 7 дней"),
-        "month": (msk_current_month_range, "Текущий месяц"),
-    }
-    return mapping.get(period_key)
-
-
-async def _fetch_period_reviews(period_key: str, client: OzonClient) -> Tuple[List[ReviewCard], str]:
-    meta = _period_meta(period_key)
-    if not meta:
-        raise ValueError("Неизвестный период отзывов")
-
-    since, to, pretty = meta[0]()
-    logger.info("Fetching reviews period=%s since=%s to=%s", period_key, since, to)
-    raw = await client.get_reviews(since, to, limit=80, max_reviews=MAX_CACHED_REVIEWS)
-    cards = [_normalize_review(r) for r in raw if isinstance(r, dict)]
-    cards.sort(key=lambda c: c.created_at or datetime.min, reverse=True)
-    return cards, pretty
-
-
-async def _ensure_cache(user_id: int, period_key: str, client: OzonClient) -> Dict[str, Any]:
-    cached = _user_reviews_cache.get(user_id)
-    if cached and cached.get("period") == period_key:
-        return cached
-
-    cards, pretty = await _fetch_period_reviews(period_key, client)
-    cache = {
-        "period": period_key,
-        "pretty": pretty,
-        "cards": cards,
-        "index": 0,
-    }
-    _user_reviews_cache[user_id] = cache
-    return cache
-
-
 def _calc_stats(cards: List[ReviewCard]) -> Tuple[int, float, Dict[int, int]]:
     dist = {i: 0 for i in range(1, 6)}
     total = 0
@@ -134,114 +97,119 @@ def _calc_stats(cards: List[ReviewCard]) -> Tuple[int, float, Dict[int, int]]:
     return total, avg, dist
 
 
-def _dist_line(dist: Dict[int, int]) -> str:
-    return (
-        f"1★ {fmt_int(dist[1])} • "
-        f"2★ {fmt_int(dist[2])} • "
-        f"3★ {fmt_int(dist[3])} • "
-        f"4★ {fmt_int(dist[4])} • "
-        f"5★ {fmt_int(dist[5])}"
-    )
-
-
-def _format_header(period_title: str, pretty: str, stats: Tuple[int, float, Dict[int, int]]) -> List[str]:
-    total, avg, dist = stats
-    lines = [
-        f"⭐ Отзывы • {period_title}",
-        pretty,
-        "",
-        f"Всего отзывов: {fmt_int(total)}",
-        f"Средний рейтинг: {avg:.2f}",
-        f"Распределение: {_dist_line(dist)}",
-        "",
-    ]
+def _format_review_block(card: ReviewCard, index: int) -> List[str]:
+    product = card.product_name or card.offer_id or card.product_id
+    lines = [f"{index}. {card.rating}★ {product or ''}".rstrip()]
+    if card.id:
+        lines.append(f"ID отзыва: {card.id}")
+    if card.created_at:
+        lines.append(f"Дата: {_fmt_dt_msk(card.created_at)} (МСК)")
+    lines.append("")
+    lines.append(card.text or "(пустой отзыв)")
     return lines
 
 
-def _format_card(period_key: str, pretty: str, cards: List[ReviewCard], index: int) -> ReviewView:
+async def fetch_recent_reviews(
+    client: OzonClient | None = None,
+    *,
+    days: int = DEFAULT_RECENT_DAYS,
+    limit_per_page: int = 80,
+    max_reviews: int = MAX_REVIEWS_LOAD,
+) -> Tuple[List[ReviewCard], str]:
+    """Загрузить отзывы за последние *days* дней одним списком.
+
+    Серверная часть не делит отзывы по периодам; мы берём фиксированное окно и
+    аккуратно логируем объём выборки.
+    """
+
+    client = client or get_client()
+    since_msk, to_msk, pretty = _msk_range_last_days(days)
+    raw = await client.get_reviews(
+        since_msk,
+        to_msk,
+        limit_per_page=limit_per_page,
+        max_count=max_reviews,
+    )
+    cards = [_normalize_review(r) for r in raw if isinstance(r, dict)]
+    cards.sort(key=lambda c: c.created_at or datetime.min, reverse=True)
+    logger.info(
+        "Reviews fetched (flat): %s items, period=%s",
+        len(cards),
+        pretty,
+    )
+    return cards, pretty
+
+
+def format_reviews_text(cards: List[ReviewCard], pretty: str, *, max_show: int = 50) -> str:
+    """Сформировать текст с заголовком и плоским списком отзывов."""
+
+    shown = min(len(cards), max_show)
+    header = [f"⭐ Отзывы (последние {shown} шт.)", pretty, ""]
+
     if not cards:
-        return ReviewView(
-            text=f"⭐ Отзывы • {period_key}\n{pretty}\n\nЗа выбранный период отзывов нет.",
-            index=0,
-            total=0,
-            period=period_key,
-        )
+        return "\n".join(header + ["Отзывы за указанный период не найдены."])
 
-    stats = _calc_stats(cards)
-    header = _format_header(_period_meta(period_key)[1], pretty, stats)
+    total, avg, dist = _calc_stats(cards)
+    header.extend(
+        [
+            f"Всего: {fmt_int(total)} • Средний рейтинг: {avg:.2f}",
+            f"Распределение: "
+            f"1★ {fmt_int(dist[1])} / 2★ {fmt_int(dist[2])} / "
+            f"3★ {fmt_int(dist[3])} / 4★ {fmt_int(dist[4])} / 5★ {fmt_int(dist[5])}",
+            "",
+        ]
+    )
 
-    card = cards[index]
-    total = len(cards)
-    body = [
-        f"⭐ Отзыв {index + 1} из {total} • период: {_period_meta(period_key)[1]}",
-        "",
-        f"Рейтинг: {card.rating}★",
-    ]
-    product = card.product_name or card.offer_id or card.product_id
-    if product:
-        body.append(f"Товар: {product}")
-    if card.id:
-        body.append(f"ID отзыва: {card.id}")
-    if card.created_at:
-        body.append(f"Дата: {_fmt_dt_msk(card.created_at)} (МСК)")
+    blocks: List[str] = []
+    for idx, card in enumerate(cards[:max_show], start=1):
+        blocks.extend(_format_review_block(card, idx))
+        blocks.append("")
 
-    body.append("")
-    body.append("Текст отзыва:")
-    body.append(card.text or "(пустой отзыв)")
-
-    text = "\n".join(header + body)
-    return ReviewView(text=text, index=index, total=total, period=period_key)
+    return "\n".join(header + blocks).rstrip()
 
 
-async def get_review_view(user_id: int, period_key: str, index: int = 0, client: OzonClient | None = None) -> ReviewView:
-    client = client or get_client()
-    cache = await _ensure_cache(user_id, period_key, client)
-    cards: List[ReviewCard] = cache.get("cards", [])
-    pretty = cache.get("pretty", "")
+async def get_review_view(
+    user_id: int,
+    period_key: str = "recent",
+    index: int = 0,
+    client: OzonClient | None = None,
+) -> ReviewView:
+    """Совместимая обёртка: возвращает плоский список отзывов одним сообщением."""
 
-    safe_index = 0 if not cards else max(0, min(index, len(cards) - 1))
-    cache["index"] = safe_index
-    return _format_card(period_key, pretty, cards, safe_index)
-
-
-async def shift_review_view(user_id: int, period_key: str, step: int, client: OzonClient | None = None) -> ReviewView:
-    client = client or get_client()
-    cache = await _ensure_cache(user_id, period_key, client)
-    cards: List[ReviewCard] = cache.get("cards", [])
-    new_index = cache.get("index", 0) + step
-    if cards:
-        new_index = max(0, min(new_index, len(cards) - 1))
-    cache["index"] = new_index
-    return await get_review_view(user_id, period_key, new_index, client)
+    cards, pretty = await fetch_recent_reviews(client)
+    text = format_reviews_text(cards, pretty)
+    return ReviewView(text=text, index=0, total=len(cards), period="recent")
 
 
-async def get_reviews_today(client: OzonClient | None = None) -> Tuple[List[ReviewCard], str]:
-    client = client or get_client()
-    cards, pretty = await _fetch_period_reviews("today", client)
-    return cards, pretty
+async def shift_review_view(
+    user_id: int,
+    period_key: str,
+    step: int,
+    client: OzonClient | None = None,
+) -> ReviewView:
+    # Периоды и переключение карточек больше не используются; возвращаем актуальный список
+    return await get_review_view(user_id, period_key, 0, client)
 
 
-async def get_reviews_week(client: OzonClient | None = None) -> Tuple[List[ReviewCard], str]:
-    client = client or get_client()
-    cards, pretty = await _fetch_period_reviews("week", client)
-    return cards, pretty
+async def get_current_review(
+    user_id: int,
+    period_key: str = "recent",
+    client: OzonClient | None = None,
+) -> ReviewCard | None:
+    cards, _ = await fetch_recent_reviews(client)
+    return cards[0] if cards else None
 
 
-async def get_reviews_month(client: OzonClient | None = None) -> Tuple[List[ReviewCard], str]:
-    client = client or get_client()
-    cards, pretty = await _fetch_period_reviews("month", client)
-    return cards, pretty
+async def get_reviews_today(client: OzonClient | None = None):  # back-compat
+    return await fetch_recent_reviews(client)
 
 
-async def get_current_review(user_id: int, period_key: str, client: OzonClient | None = None) -> ReviewCard | None:
-    client = client or get_client()
-    cache = await _ensure_cache(user_id, period_key, client)
-    cards: List[ReviewCard] = cache.get("cards", [])
-    if not cards:
-        return None
-    idx = cache.get("index", 0)
-    idx = max(0, min(idx, len(cards) - 1))
-    return cards[idx]
+async def get_reviews_week(client: OzonClient | None = None):  # back-compat
+    return await fetch_recent_reviews(client)
+
+
+async def get_reviews_month(client: OzonClient | None = None):  # back-compat
+    return await fetch_recent_reviews(client)
 
 
 async def get_ai_reply_for_review(review: ReviewCard) -> str:
@@ -257,12 +225,16 @@ async def get_ai_reply_for_review(review: ReviewCard) -> str:
 
 
 async def get_reviews_menu_text() -> str:
-    return "⭐ Раздел отзывов. Выберите период:"
+    # В меню теперь сразу показываем описание периода без деления на today/week/month
+    _, _, pretty = _msk_range_last_days(DEFAULT_RECENT_DAYS)
+    return f"⭐ Отзывы (последние {DEFAULT_RECENT_DAYS} дней)\n{pretty}"
 
 
 __all__ = [
     "ReviewCard",
     "ReviewView",
+    "fetch_recent_reviews",
+    "format_reviews_text",
     "get_review_view",
     "shift_review_view",
     "get_current_review",
