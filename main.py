@@ -343,26 +343,6 @@ async def handle_any(message: Message) -> None:
     await message.answer("Выберите действие в меню ниже", reply_markup=main_menu_keyboard())
 
 
-@router.message()
-async def handle_any(message: Message) -> None:
-    user_id = message.from_user.id if message.from_user else 0
-    if user_id in _pending_edit:
-        review_id, category, index = _pending_edit.pop(user_id)
-        text = (message.text or message.caption or "").strip()
-        if not text:
-            await message.answer("Не удалось сохранить пустой ответ, попробуйте ещё раз.")
-            return
-        _store_draft(user_id, review_id, text)
-        await message.answer(
-            f"Черновик обновлён:\n\n{text}",
-            reply_markup=review_draft_keyboard(category, index, review_id),
-        )
-        return
-
-    # fallback для неизвестных сообщений
-    await message.answer("Выберите действие в меню ниже", reply_markup=main_menu_keyboard())
-
-
 def build_dispatcher() -> Dispatcher:
     dp = Dispatcher()
     dp.include_router(router)

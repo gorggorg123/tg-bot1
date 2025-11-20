@@ -21,10 +21,6 @@ _product_name_cache: dict[str, str] = {}
 _review_answered_cache: dict[int, set[str]] = {}
 _sessions: dict[int, "ReviewSession"] = {}
 
-_product_name_cache: dict[str, str] = {}
-_review_answered_cache: set[str] = set()
-_sessions: dict[int, "ReviewSession"] = {}
-
 
 @dataclass
 class ReviewCard:
@@ -85,7 +81,18 @@ def _msk_range_last_days(days: int = DEFAULT_RECENT_DAYS) -> Tuple[datetime, dat
 
 
 def _answered_for_user(user_id: int) -> set[str]:
-    return _review_answered_cache.setdefault(user_id, set())
+    """Вернуть (и при необходимости восстановить) кэш отвеченных отзывов для пользователя."""
+
+    global _review_answered_cache
+    if not isinstance(_review_answered_cache, dict):
+        logger.warning("Answered cache corrupted, resetting it")
+        _review_answered_cache = {}
+
+    bucket = _review_answered_cache.get(user_id)
+    if not isinstance(bucket, set):
+        bucket = set(bucket or [])
+        _review_answered_cache[user_id] = bucket
+    return bucket
 
 
 def is_answered(review: ReviewCard, user_id: int | None = None) -> bool:
@@ -220,25 +227,6 @@ async def _resolve_product_names(cards: List[ReviewCard], client: OzonClient) ->
             _product_name_cache[pid] = title
         else:
             logger.warning("Product name not resolved for %s", pid)
-
-    for card in cards:
-        if card.product_id and not card.product_name:
-            card.product_name = _product_name_cache.get(card.product_id) or card.product_name
-
-
-async def _resolve_product_names(cards: List[ReviewCard], client: OzonClient) -> None:
-    missing_ids = [c.product_id for c in cards if c.product_id and not c.product_name]
-    unique_ids = [pid for pid in dict.fromkeys(missing_ids) if pid]
-    for pid in unique_ids:
-        if pid in _product_name_cache:
-            continue
-        try:
-            title = await client.get_product_name(pid)
-        except Exception:
-            logger.exception("Failed to fetch product name for %s", pid)
-            title = None
-        if title:
-            _product_name_cache[pid] = title
 
     for card in cards:
         if card.product_id and not card.product_name:
