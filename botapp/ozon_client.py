@@ -373,6 +373,24 @@ class OzonClient:
         )
         return reviews[:max_reviews]
 
+    async def get_product_name(self, product_id: str) -> str | None:
+        """Получить название товара по ``product_id`` через /v2/product/info."""
+
+        if not product_id:
+            return None
+
+        payload = {"product_id": str(product_id)}
+        data = await self.post("/v2/product/info", payload)
+        if not isinstance(data, dict):
+            logger.error("Unexpected product info response for %s: %r", product_id, data)
+            return None
+
+        res = data.get("result") if isinstance(data.get("result"), dict) else data
+        if isinstance(res, dict):
+            name = res.get("name") or res.get("title") or res.get("offer_id")
+            return str(name) if name else None
+        return None
+
     # back-compat
     get_account_info = get_seller_info
 
