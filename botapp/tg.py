@@ -40,6 +40,12 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="📦 FBO",
+                    callback_data="fbo_menu",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="⭐ Отзывы",
                     callback_data="reviews",
                 )

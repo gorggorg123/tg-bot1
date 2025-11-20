@@ -1,4 +1,9 @@
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 main_menu_keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -19,3 +24,31 @@ NOT_IMPLEMENTED_TEXT = (
     "• «🏦 Финансы за сегодня»\n"
     "• «📦 Заказы за сегодня»"
 )
+
+
+def reviews_periods_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Сегодня", callback_data="reviews_today"),
+                InlineKeyboardButton(text="7 дней", callback_data="reviews_week"),
+                InlineKeyboardButton(text="Месяц", callback_data="reviews_month"),
+            ],
+            [
+                InlineKeyboardButton(text="◀ Назад", callback_data="reviews_prev"),
+                InlineKeyboardButton(text="Далее ▶", callback_data="reviews_next"),
+            ],
+            [InlineKeyboardButton(text="✍ Черновик ответа", callback_data="reviews_ai_draft")],
+        ]
+    )
+
+
+def fbo_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Сводка", callback_data="fbo_summary")],
+            [InlineKeyboardButton(text="📅 Месяц", callback_data="fbo_month")],
+            [InlineKeyboardButton(text="🔍 Фильтр", callback_data="fbo_filter")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="to_menu")],
+        ]
+    )
