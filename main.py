@@ -5,32 +5,26 @@ import os
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, Message
-from fastapi import FastAPI
 from dotenv import load_dotenv
+from fastapi import FastAPI
 
 from botapp.account import get_account_info_text
 from botapp.finance import get_finance_today_text
 from botapp.keyboards import (
     MenuCallbackData,
     ReviewsCallbackData,
-    account_keyboard,
     fbo_menu_keyboard,
     main_menu_keyboard,
     reviews_navigation_keyboard,
-    reviews_periods_keyboard,
 )
 from botapp.orders import get_orders_today_text
 from botapp.ozon_client import get_client
-from botapp.reviews import (
-    get_ai_reply_for_review,
-    get_current_review,
-    get_review_view,
-    get_reviews_menu_text,
-    trim_for_telegram,
-)
+from botapp.reviews import MODE_UNANSWERED, get_reviews_page, trim_for_telegram
 
 load_dotenv()
 
@@ -50,7 +44,10 @@ if not OZON_CLIENT_ID or not OZON_API_KEY:
     raise RuntimeError("OZON_CLIENT_ID / OZON_API_KEY are not set")
 
 router = Router()
-_last_reviews_period = "today"
+REVIEWS_STATE_MODE_KEY = "reviews_mode"
+REVIEWS_STATE_PAGE_KEY = "reviews_page"
+REVIEWS_STATE_MSG_KEY = "reviews_message_id"
+REVIEWS_DEFAULT_MODE = MODE_UNANSWERED
 
 
 @router.message(CommandStart())
@@ -70,7 +67,7 @@ async def cmd_fin_today(message: Message) -> None:
 @router.message(F.text == "👤 Аккаунт Ozon")
 async def cmd_account(message: Message) -> None:
     text = await get_account_info_text()
-    await message.answer(text, reply_markup=account_keyboard())
+    await message.answer(text, reply_markup=main_menu_keyboard())
 
 
 @router.message(Command("fbo"))
@@ -82,47 +79,67 @@ async def cmd_fbo(message: Message) -> None:
 
 @router.message(Command("reviews"))
 @router.message(F.text == "⭐ Отзывы")
-async def cmd_reviews(message: Message) -> None:
-    text = await get_reviews_menu_text()
-    await message.answer(text, reply_markup=reviews_periods_keyboard())
+async def cmd_reviews(message: Message, state: FSMContext) -> None:
+    await state.update_data(
+        {
+            REVIEWS_STATE_MODE_KEY: REVIEWS_DEFAULT_MODE,
+            REVIEWS_STATE_PAGE_KEY: 0,
+            REVIEWS_STATE_MSG_KEY: None,
+        }
+    )
+    await _render_reviews_page(message=message, state=state, mode=REVIEWS_DEFAULT_MODE, page=0)
 
 
-async def _send_review_card(
+async def _render_reviews_page(
     *,
-    user_id: int,
-    period_key: str,
-    index: int = 0,
+    state: FSMContext,
+    mode: str | None = None,
+    page: int | None = None,
     message: Message | None = None,
     callback: CallbackQuery | None = None,
 ) -> None:
-    global _last_reviews_period
-    _last_reviews_period = period_key
+    data = await state.get_data()
+    current_mode = mode or data.get(REVIEWS_STATE_MODE_KEY, REVIEWS_DEFAULT_MODE)
+    current_page = page if page is not None else data.get(REVIEWS_STATE_PAGE_KEY, 0)
 
-    view = await get_review_view(user_id, period_key, index)
-
-    if view.total == 0:
-        text = trim_for_telegram(view.text)
-        markup = reviews_periods_keyboard()
-    else:
-        text = trim_for_telegram(view.text)
-        markup = reviews_navigation_keyboard(period_key, view.index, view.total)
+    page_view = await get_reviews_page(mode=current_mode, page=current_page)
+    text = trim_for_telegram(page_view.text)
+    markup = reviews_navigation_keyboard(page_view.mode, page_view.page, page_view.total_pages)
 
     target = callback.message if callback else message
     if target is None:
         return
 
+    last_message_id = data.get(REVIEWS_STATE_MSG_KEY)
+
     try:
         if target.text == text:
             if callback:
-                await callback.answer("Этот период уже выбран")
+                await callback.answer("Без изменений")
             return
         await target.edit_text(text, reply_markup=markup)
+        new_message_id = target.message_id
     except TelegramBadRequest as exc:
         if "message is not modified" in str(exc):
             if callback:
-                await callback.answer("Этот период уже выбран")
-        else:
-            await target.answer(text, reply_markup=markup)
+                await callback.answer("Без изменений")
+            return
+        send_func = callback.message.answer if callback else message.answer  # type: ignore[union-attr]
+        sent = await send_func(text, reply_markup=markup)
+        new_message_id = sent.message_id
+        if last_message_id and callback:
+            try:
+                await callback.bot.delete_message(chat_id=callback.message.chat.id, message_id=last_message_id)
+            except TelegramBadRequest:
+                pass
+
+    await state.update_data(
+        {
+            REVIEWS_STATE_MODE_KEY: page_view.mode,
+            REVIEWS_STATE_PAGE_KEY: page_view.page,
+            REVIEWS_STATE_MSG_KEY: new_message_id,
+        }
+    )
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "home"))
@@ -130,6 +147,7 @@ async def cb_home(callback: CallbackQuery, callback_data: MenuCallbackData) -> N
     await callback.answer()
     await callback.message.answer("Главное меню", reply_markup=main_menu_keyboard())
 
+    view = await get_review_view(user_id, period_key, index)
 
 @router.callback_query(MenuCallbackData.filter(F.section == "fbo"))
 async def cb_fbo(callback: CallbackQuery, callback_data: MenuCallbackData) -> None:
@@ -154,62 +172,31 @@ async def cb_fbo(callback: CallbackQuery, callback_data: MenuCallbackData) -> No
 async def cb_account(callback: CallbackQuery, callback_data: MenuCallbackData) -> None:
     await callback.answer()
     text = await get_account_info_text()
-    await callback.message.answer(text, reply_markup=account_keyboard())
+    await callback.message.answer(text, reply_markup=main_menu_keyboard())
 
 
 @router.callback_query(ReviewsCallbackData.filter())
-async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData) -> None:
-    action = callback_data.action
-    period_key = callback_data.period or _last_reviews_period
-    user_id = callback.from_user.id
+async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData, state: FSMContext) -> None:
+    await callback.answer()
+    data = await state.get_data()
+    current_mode = callback_data.mode or data.get(REVIEWS_STATE_MODE_KEY, REVIEWS_DEFAULT_MODE)
 
-    if action == "period":
-        await callback.answer()
-        await _send_review_card(user_id=user_id, period_key=period_key, index=0, callback=callback)
+    if callback_data.action == "toggle":
+        await state.update_data({REVIEWS_STATE_PAGE_KEY: 0})
+        await _render_reviews_page(state=state, mode=current_mode, page=0, callback=callback)
         return
 
-    if action == "open":
-        await callback.answer()
-        index = callback_data.index or 0
-        await _send_review_card(user_id=user_id, period_key=period_key, index=index, callback=callback)
+    if callback_data.action == "page":
+        page = callback_data.page or 0
+        await _render_reviews_page(state=state, mode=current_mode, page=page, callback=callback)
         return
 
-    if action == "ai":
-        await callback.answer("Готовим ответ…", show_alert=False)
-        review = await get_current_review(user_id, period_key)
-        if not review:
-            await callback.message.answer("Свежих отзывов в выбранном периоде нет.")
-            return
-        try:
-            draft = await get_ai_reply_for_review(review)
-            await callback.message.answer(f"✍️ Черновик ответа ИИ:\n\n{draft}")
-        except Exception:
-            await callback.message.answer(
-                "⚠️ Не удалось получить ответ от ИИ, попробуйте позже."
-            )
-        return
-
-    if action == "change_period":
-        await callback.answer()
-        text = await get_reviews_menu_text()
-        try:
-            await callback.message.edit_text(text, reply_markup=reviews_periods_keyboard())
-        except TelegramBadRequest:
-            await callback.message.answer(text, reply_markup=reviews_periods_keyboard())
-        return
-
-    if action == "back_menu":
-        await callback.answer()
-        text = await get_reviews_menu_text()
-        try:
-            await callback.message.edit_text(text, reply_markup=reviews_periods_keyboard())
-        except TelegramBadRequest:
-            await callback.message.answer(text, reply_markup=reviews_periods_keyboard())
-        return
+    # fallback: показать актуальный список
+    await _render_reviews_page(state=state, mode=current_mode, callback=callback)
 
 
 def build_dispatcher() -> Dispatcher:
-    dp = Dispatcher()
+    dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     return dp
 

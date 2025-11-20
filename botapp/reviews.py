@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from math import ceil
 from typing import Any, Dict, List, Tuple
 
 from .ai_client import generate_review_reply
@@ -16,6 +17,9 @@ MAX_REVIEW_LEN = 450
 MAX_REVIEWS_LOAD = 200
 MSK_SHIFT = timedelta(hours=3)
 TELEGRAM_SOFT_LIMIT = 3500
+REVIEWS_PAGE_SIZE = 5
+MODE_ANSWERED = "answered"
+MODE_UNANSWERED = "unanswered"
 
 
 @dataclass
@@ -31,11 +35,14 @@ class ReviewCard:
 
 
 @dataclass
-class ReviewView:
+class ReviewsPage:
     text: str
-    index: int
-    total: int
-    period: str
+    page: int
+    total_pages: int
+    total_reviews: int
+    total_filtered: int
+    mode: str
+    pretty_period: str
 
 
 def _parse_date(value: Any) -> datetime | None:
@@ -103,37 +110,10 @@ def _calc_stats(cards: List[ReviewCard]) -> Tuple[int, float, Dict[int, int]]:
     return total, avg, dist
 
 
-def _format_review_card_text(card: ReviewCard, index: int, total: int, period_title: str) -> str:
-    """Сформировать карточку одного отзыва.
-
-    Требования пользователя: один отзыв = одно сообщение, с датой, рейтингом,
-    названием товара, текстом и статусом ответа.
-    """
-
-    product = card.product_name or card.offer_id or card.product_id or "—"
-    date_line = _fmt_dt_msk(card.created_at)
-    stars = f"{card.rating}★" if card.rating else "—"
-    lines = [
-        f"⭐ Отзыв {index + 1} из {total} • период: {period_title}",
-        "",
-        f"Рейтинг: {stars}",
-        f"Товар: {product}",
-    ]
-
-    if card.id:
-        lines.append(f"ID отзыва: {card.id}")
-    if date_line:
-        lines.append(f"Дата: {date_line} (МСК)")
-
-    lines.extend([
-        "",
-        "Текст отзыва:",
-        card.text or "(пустой отзыв)",
-        "",
-        f"Статус ответа: {'есть' if card.answered else 'нет'}",
-    ])
-
-    return "\n".join(lines).strip()
+def _shorten(text: str, limit: int = MAX_REVIEW_LEN) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
 
 
 def trim_for_telegram(text: str, max_len: int = TELEGRAM_SOFT_LIMIT) -> str:
@@ -164,6 +144,76 @@ async def fetch_recent_reviews(
         to_msk,
         limit_per_page=limit_per_page,
         max_count=max_reviews,
+    )
+    cards = [_normalize_review(r) for r in raw if isinstance(r, dict)]
+    cards.sort(key=lambda c: c.created_at or datetime.min, reverse=True)
+    logger.info(
+        "Reviews fetched (flat): %s items, period=%s",
+        len(cards),
+        pretty,
+    )
+    return cards, pretty
+
+
+def _format_reviews_page(
+    cards: List[ReviewCard],
+    *,
+    mode: str,
+    page: int,
+    pretty: str,
+    page_size: int = REVIEWS_PAGE_SIZE,
+) -> ReviewsPage:
+    total = len(cards)
+    answered = [c for c in cards if c.answered]
+    unanswered = [c for c in cards if not c.answered]
+    filtered = answered if mode == MODE_ANSWERED else unanswered
+
+    total_filtered = len(filtered)
+    total_pages = max(1, ceil(total_filtered / page_size)) if total_filtered else 1
+    safe_page = max(0, min(page, total_pages - 1))
+
+    start = safe_page * page_size
+    end = start + page_size
+    page_items = filtered[start:end] if filtered else []
+
+    header = [
+        f"⭐ Отзывы (последние {DEFAULT_RECENT_DAYS} дней)",
+        pretty,
+        "",
+        f"Всего: {fmt_int(total)}",
+        f"Без ответа: {fmt_int(len(unanswered))}",
+        f"С ответом: {fmt_int(len(answered))}",
+        "",
+        f"Режим: {'неотвеченные' if mode == MODE_UNANSWERED else 'отвеченные'}",
+    ]
+
+    if not page_items:
+        body = ["Отзывов в выбранном режиме нет."]
+    else:
+        body = []
+        for idx, card in enumerate(page_items, start=start + 1):
+            product = card.product_name or card.offer_id or card.product_id or "—"
+            body.extend(
+                [
+                    f"{idx}) {card.rating or '—'}★ — {product}",
+                    f"Дата: {_fmt_dt_msk(card.created_at) or '—'} (МСК)",
+                    "Текст:",
+                    _shorten(card.text or "(пустой отзыв)", limit=MAX_REVIEW_LEN),
+                    f"Ответ: {'есть' if card.answered else 'нет'}",
+                    "",
+                ]
+            )
+
+    text = "\n".join(header + body).strip()
+    text = trim_for_telegram(text)
+    return ReviewsPage(
+        text=text,
+        page=safe_page,
+        total_pages=total_pages,
+        total_reviews=total,
+        total_filtered=total_filtered,
+        mode=mode,
+        pretty_period=pretty,
     )
     cards = [_normalize_review(r) for r in raw if isinstance(r, dict)]
     cards.sort(key=lambda c: c.created_at or datetime.min, reverse=True)
@@ -212,13 +262,16 @@ async def shift_review_view(
     return await get_review_view(user_id, period_key, 0, client)
 
 
-async def get_current_review(
-    user_id: int,
-    period_key: str = "recent",
+
+async def get_reviews_page(
+    *,
+    mode: str = MODE_UNANSWERED,
+    page: int = 0,
     client: OzonClient | None = None,
-) -> ReviewCard | None:
-    cards, _ = await fetch_recent_reviews(client)
-    return cards[0] if cards else None
+    days: int = DEFAULT_RECENT_DAYS,
+) -> ReviewsPage:
+    cards, pretty = await fetch_recent_reviews(client, days=days)
+    return _format_reviews_page(cards, mode=mode, page=page, pretty=pretty)
 
 
 async def get_reviews_today(client: OzonClient | None = None):  # back-compat
@@ -246,19 +299,18 @@ async def get_ai_reply_for_review(review: ReviewCard) -> str:
 
 
 async def get_reviews_menu_text() -> str:
-    # В меню теперь сразу показываем описание периода без деления на today/week/month
     _, _, pretty = _msk_range_last_days(DEFAULT_RECENT_DAYS)
     return f"⭐ Отзывы (последние {DEFAULT_RECENT_DAYS} дней)\n{pretty}"
 
 
 __all__ = [
     "ReviewCard",
-    "ReviewView",
+    "ReviewsPage",
+    "MODE_ANSWERED",
+    "MODE_UNANSWERED",
     "fetch_recent_reviews",
     "trim_for_telegram",
-    "get_review_view",
-    "shift_review_view",
-    "get_current_review",
+    "get_reviews_page",
     "get_reviews_today",
     "get_reviews_week",
     "get_reviews_month",
