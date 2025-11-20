@@ -358,6 +358,9 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
         await _send_review_card(user_id=user_id, category=category, index=index, callback=callback, review_id=review_id)
         return
 
+    # fallback для неизвестных сообщений
+    await message.answer("Выберите действие в меню ниже", reply_markup=main_menu_keyboard())
+
 
 @router.message()
 async def handle_any(message: Message) -> None:
