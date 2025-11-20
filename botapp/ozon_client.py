@@ -302,36 +302,29 @@ class OzonClient:
     # ---------- Отзывы ----------
 
     async def get_reviews(
-        self, date_from_iso: str, date_to_iso: str, limit: int = 100, max_reviews: int = 400
+        self,
+        date_from_iso: str,
+        date_to_iso: str,
+        limit: int = 50,
+        offset: int = 0,
+        max_reviews: int = 200,
     ) -> List[Dict[str, Any]]:
         """
-        /v1/review/list с пагинацией (limit 20-100) и остановками по дате/количеству.
+        Пагинация по /v1/review/list. Ozon принимает Limit в диапазоне [20, 100].
         """
 
-        safe_limit = min(max(limit, 20), 100)
+        safe_limit = max(20, min(limit, 100))
         date_filter = {"from": date_from_iso[:10], "to": date_to_iso[:10]}
 
-        def _parse_review_dt(item: Dict[str, Any]) -> datetime | None:
-            raw = (
-                item.get("created_at")
-                or item.get("createdAt")
-                or item.get("date")
-                or item.get("answer_date")
-            )
-            if not raw:
-                return None
-            try:
-                return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            except Exception:
-                return None
-
-        since_dt = datetime.fromisoformat(date_from_iso.replace("Z", "+00:00"))
-
         reviews: List[Dict[str, Any]] = []
-        page = 1
+        current_offset = max(0, offset)
 
         while len(reviews) < max_reviews:
-            body = {"page": page, "limit": safe_limit, "filter": {"date": date_filter}}
+            body = {
+                "limit": safe_limit,
+                "offset": current_offset,
+                "filter": {"date": date_filter},
+            }
             data = await self.post("/v1/review/list", body)
             if not isinstance(data, dict):
                 logger.error("Unexpected reviews response: %r", data)
@@ -350,25 +343,20 @@ class OzonClient:
 
             reviews.extend(page_items)
 
-            # Останавливаемся, если получили меньше лимита или упёрлись в нижнюю границу периода
             if len(page_items) < safe_limit:
                 break
 
-            oldest = min((_parse_review_dt(it) for it in page_items if _parse_review_dt(it)), default=None)
-            if oldest and oldest < since_dt:
-                break
-
-            page += 1
-            if page > 20:
-                logger.warning("Reviews pagination stopped after 20 pages")
+            current_offset += safe_limit
+            if current_offset >= max_reviews:
                 break
 
         logger.info(
-            "Reviews fetched: %s items for %s..%s with limit=%s",
+            "Reviews fetched: %s items for %s..%s with limit=%s offset_start=%s",
             len(reviews),
             date_filter.get("from"),
             date_filter.get("to"),
             safe_limit,
+            offset,
         )
         return reviews[:max_reviews]
 

@@ -26,6 +26,14 @@ class MenuCallbackData(CallbackData, prefix="menu"):
     extra: Optional[str] = None
 
 
+class ReviewsCallbackData(CallbackData, prefix="reviews"):
+    """Callback для раздела отзывов."""
+
+    action: str
+    period: Optional[str] = None
+    index: Optional[int] = None
+
+
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     """Reply-клавиатура главного меню."""
 
@@ -96,15 +104,15 @@ def reviews_periods_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text="Сегодня",
-                    callback_data=MenuCallbackData(section="reviews", action="period", extra="today").pack(),
+                    callback_data=ReviewsCallbackData(action="period", period="today").pack(),
                 ),
                 InlineKeyboardButton(
                     text="7 дней",
-                    callback_data=MenuCallbackData(section="reviews", action="period", extra="week").pack(),
+                    callback_data=ReviewsCallbackData(action="period", period="week").pack(),
                 ),
                 InlineKeyboardButton(
                     text="Месяц",
-                    callback_data=MenuCallbackData(section="reviews", action="period", extra="month").pack(),
+                    callback_data=ReviewsCallbackData(action="period", period="month").pack(),
                 ),
             ],
             [
@@ -117,41 +125,62 @@ def reviews_periods_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def reviews_navigation_keyboard(period: str, has_prev: bool, has_next: bool) -> InlineKeyboardMarkup:
+def reviews_navigation_keyboard(period: str, index: int, total: int) -> InlineKeyboardMarkup:
     """Клавиатура для просмотра отдельного отзыва."""
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="◀ Предыдущий",
-                    callback_data=MenuCallbackData(section="reviews", action="nav_prev", extra=period).pack(),
-                ),
-                InlineKeyboardButton(
-                    text="Следующий ▶",
-                    callback_data=MenuCallbackData(section="reviews", action="nav_next", extra=period).pack(),
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✍ Ответ ИИ",
-                    callback_data=MenuCallbackData(section="reviews", action="ai", extra=period).pack(),
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📅 Сменить период",
-                    callback_data=MenuCallbackData(section="reviews", action="back_periods").pack(),
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🏠 В меню",
-                    callback_data=MenuCallbackData(section="home", action="open").pack(),
-                )
-            ],
+    has_prev = index > 0
+    has_next = (index + 1) < total
+
+    buttons = []
+    nav_row = []
+    nav_row.append(
+        InlineKeyboardButton(
+            text="⬅️ Предыдущий" if has_prev else "⏪ Начало",
+            callback_data=ReviewsCallbackData(action="open", period=period, index=max(index - 1, 0)).pack(),
+        )
+    )
+    nav_row.append(
+        InlineKeyboardButton(
+            text="Следующий ➡️" if has_next else "⏩ Конец",
+            callback_data=ReviewsCallbackData(action="open", period=period, index=min(index + 1, total - 1)).pack(),
+        )
+    )
+    buttons.append(nav_row)
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="✍️ Ответ ИИ",
+                callback_data=ReviewsCallbackData(action="ai", period=period, index=index).pack(),
+            )
         ]
     )
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="📅 Сменить период",
+                callback_data=ReviewsCallbackData(action="change_period").pack(),
+            )
+        ]
+    )
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="🏠 В меню отзывов",
+                callback_data=ReviewsCallbackData(action="back_menu").pack(),
+            )
+        ]
+    )
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 В меню",
+                callback_data=MenuCallbackData(section="home", action="open").pack(),
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def account_keyboard() -> InlineKeyboardMarkup:
@@ -162,6 +191,7 @@ def account_keyboard() -> InlineKeyboardMarkup:
 
 __all__ = [
     "MenuCallbackData",
+    "ReviewsCallbackData",
     "main_menu_keyboard",
     "back_home_keyboard",
     "fbo_menu_keyboard",
