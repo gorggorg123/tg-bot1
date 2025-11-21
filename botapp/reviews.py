@@ -75,6 +75,15 @@ def _parse_date(value: Any) -> datetime | None:
     if value is None or value == "":
         return None
 
+    if isinstance(value, dict):
+        nested = next(
+            (value.get(key) for key in ("value", "created_at", "createdAt", "date", "datetime") if value.get(key) not in (None, "")),
+            None,
+        )
+        if nested is None:
+            return None
+        return _parse_date(nested)
+
     # Числовой timestamp (секунды или миллисекунды)
     if isinstance(value, (int, float)):
         try:
@@ -277,15 +286,21 @@ def filter_reviews(
 
     safe_from = _ensure_msk(period_from_msk) if period_from_msk else None
     safe_to = _ensure_msk(period_to_msk) if period_to_msk else None
+    safe_from_date = safe_from.date() if safe_from else None
+    safe_to_date = safe_to.date() if safe_to else None
 
     filtered: list[ReviewCard] = []
     for review in reviews:
-        created_msk = _to_msk(review.created_at) if (safe_from or safe_to) else None
+        created_msk = _to_msk(review.created_at) if (safe_from_date or safe_to_date) else None
 
-        if safe_from and (created_msk is None or created_msk < safe_from):
-            continue
-        if safe_to and (created_msk is None or created_msk > safe_to):
-            continue
+        if safe_from_date or safe_to_date:
+            if created_msk is None:
+                continue
+            created_date = created_msk.date()
+            if safe_from_date and created_date < safe_from_date:
+                continue
+            if safe_to_date and created_date > safe_to_date:
+                continue
 
         if answer_filter == "unanswered" and _has_answer_payload(review):
             continue
@@ -512,6 +527,7 @@ async def fetch_recent_reviews(
         # DEBUG: один пример для сверки схемы ReviewAPI, чтобы не спамить логи
         logger.debug("Sample review payload: %r", raw[0])
     cards = [_normalize_review(r) for r in raw if isinstance(r, dict)]
+    missing_created = sum(1 for c in cards if c.created_at is None)
 
     filtered_cards: list[ReviewCard] = filter_reviews(
         cards, period_from_msk=since_msk, period_to_msk=to_msk, answer_filter="all"
@@ -544,11 +560,13 @@ async def fetch_recent_reviews(
                 _to_msk(sample.created_at),
             )
     logger.info(
-        "Reviews after filter: %s items for period=%s (MSK), filter=all | unanswered=%s | answered=%s",
+        "Reviews after filter: %s items for period=%s (MSK), filter=all | unanswered=%s | answered=%s | missing_dates=%s | dropped_by_date=%s",
         len(filtered_cards),
         pretty,
         unanswered_count,
         answered_count,
+        missing_created,
+        len(cards) - len(filtered_cards),
     )
     return filtered_cards, pretty
 
