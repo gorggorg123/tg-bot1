@@ -15,6 +15,7 @@ DEFAULT_RECENT_DAYS = 30
 MAX_REVIEW_LEN = 450
 MAX_REVIEWS_LOAD = 200
 MSK_SHIFT = timedelta(hours=3)
+MSK_TZ = timezone(MSK_SHIFT)
 TELEGRAM_SOFT_LIMIT = 4000
 REVIEWS_PAGE_SIZE = 10
 SESSION_TTL = timedelta(minutes=2)
@@ -36,6 +37,7 @@ class ReviewCard:
     offer_id: str | None
     product_id: str | None
     created_at: datetime | None
+    raw_created_at: Any | None = None
     answered: bool = False
     answer_text: str | None = None
 
@@ -56,6 +58,7 @@ class ReviewSession:
     indexes: Dict[str, int] = field(default_factory=lambda: {"all": 0, "unanswered": 0, "answered": 0})
     page: Dict[str, int] = field(default_factory=lambda: {"all": 0, "unanswered": 0, "answered": 0})
     loaded_at: datetime = field(default_factory=datetime.utcnow)
+    product_cache: Dict[str, str | None] = field(default_factory=dict)
 
     def rebuild_unanswered(self, user_id: int) -> None:
         self.unanswered_reviews = [c for c in self.all_reviews if not is_answered(c, user_id)]
@@ -72,73 +75,91 @@ def _parse_date(value: Any) -> datetime | None:
     if value is None or value == "":
         return None
 
+    if isinstance(value, dict):
+        nested = next(
+            (value.get(key) for key in ("value", "created_at", "createdAt", "date", "datetime") if value.get(key) not in (None, "")),
+            None,
+        )
+        if nested is None:
+            return None
+        return _parse_date(nested)
+
     # Числовой timestamp (секунды или миллисекунды)
     if isinstance(value, (int, float)):
         try:
-            if value > 10**11:  # миллисекунды
-                return datetime.utcfromtimestamp(value / 1000)
-            return datetime.utcfromtimestamp(value)
+            ts = float(value)
+            ts = ts / 1000 if ts > 10**11 else ts
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
         except Exception:
             return None
 
-    # Строка может содержать чистые цифры либо ISO
-    try:
-        txt = str(value).strip()
-        if not txt:
+    txt = str(value).strip()
+    if not txt:
+        return None
+
+    # Строка, содержащая цифры
+    if txt.isdigit():
+        try:
+            num = int(txt)
+            ts = num / 1000 if num > 10**11 else num
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except Exception:
             return None
 
-        if txt.isdigit():
-            num = int(txt)
-            if num > 10**11:
-                return datetime.utcfromtimestamp(num / 1000)
-            return datetime.utcfromtimestamp(num)
-
+    # ISO-строка (включая варианты с пробелом и Z)
+    try:
         dt = datetime.fromisoformat(txt.replace(" ", "T").replace("Z", "+00:00"))
-        if dt.tzinfo:
-            return dt.astimezone(timezone.utc).replace(tzinfo=None)
-        return dt
     except Exception:
         return None
 
-    # Числовой timestamp (секунды или миллисекунды)
-    if isinstance(value, (int, float)):
-        try:
-            # heuristic: ms timestamps обычно больше 10**12
-            parsed = datetime.utcfromtimestamp(value / 1000) if value > 10**11 else datetime.utcfromtimestamp(value)
-        except Exception:
-            return None
-    else:
-        parsed = None
+    if dt.tzinfo:
+        return dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=timezone.utc)
 
-    # Строковый timestamp / ISO
-    if parsed is None:
-        try:
-            txt = str(value).strip()
-            if not txt:
-                return None
-            parsed = datetime.fromisoformat(txt.replace(" ", "T").replace("Z", "+00:00"))
-        except Exception:
-            return None
 
-    if parsed.tzinfo:
-        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-    return parsed.replace(tzinfo=None)
+def _to_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo:
+        return dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=timezone.utc)
+
+
+def _to_msk(dt: datetime | None) -> datetime | None:
+    base_dt = _to_utc(dt)
+    return base_dt.astimezone(MSK_TZ) if base_dt else None
+
+
+def _msk_now() -> datetime:
+    return datetime.now(timezone.utc).astimezone(MSK_TZ)
+
+
+def _ensure_msk(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo:
+        return dt.astimezone(MSK_TZ)
+    return dt.replace(tzinfo=MSK_TZ)
 
 
 def _fmt_dt_msk(dt: datetime | None) -> str:
     if not dt:
         return ""
-    dt_msk = dt + MSK_SHIFT
+    dt_msk = _to_msk(dt)
+    if not dt_msk:
+        return ""
     return dt_msk.strftime("%d.%m.%Y %H:%M")
 
 
 def _human_age(dt: datetime | None) -> str:
     if not dt:
         return ""
-    now_msk = datetime.utcnow() + MSK_SHIFT
-    dt_msk = dt + MSK_SHIFT
-    delta = now_msk - dt_msk
-    days = delta.days
+    dt_msk = _to_msk(dt)
+    if not dt_msk:
+        return ""
+    dt_msk_date = dt_msk.date()
+    today_msk = _msk_now().date()
+    days = (today_msk - dt_msk_date).days
     if days < 0:
         return "из будущего"
     if days == 0:
@@ -150,11 +171,12 @@ def _human_age(dt: datetime | None) -> str:
 
 def _msk_range_last_days(days: int = DEFAULT_RECENT_DAYS) -> Tuple[datetime, datetime, str]:
     """Вернуть диапазон последних *days* дней в МСК (начиная с полуночи)."""
-    now_utc = datetime.utcnow()
-    now_msk = now_utc + MSK_SHIFT
-    start_msk = datetime(now_msk.year, now_msk.month, now_msk.day) - timedelta(days=days - 1)
-    end_msk = datetime(now_msk.year, now_msk.month, now_msk.day, 23, 59, 59)
-    pretty = f"{start_msk:%d.%m.%Y} — {end_msk:%d.%m.%Y} (МСК)"
+    now_msk = _msk_now()
+    start_msk = datetime(now_msk.year, now_msk.month, now_msk.day, tzinfo=MSK_TZ) - timedelta(
+        days=days - 1
+    )
+    end_msk = now_msk
+    pretty = f"{start_msk:%d.%m.%Y} 00:00 — {end_msk:%d.%m.%Y %H:%M} (МСК)"
     return start_msk, end_msk, pretty
 
 
@@ -173,11 +195,15 @@ def _answered_for_user(user_id: int) -> set[str]:
     return bucket
 
 
+def _has_answer_payload(review: ReviewCard) -> bool:
+    return bool((review.answer_text or "").strip() or review.answered)
+
+
 def is_answered(review: ReviewCard, user_id: int | None = None) -> bool:
     user_cache = _answered_for_user(user_id or 0)
     if review.id and review.id in user_cache:
         return True
-    return bool(review.answered or (review.answer_text and review.answer_text.strip()))
+    return _has_answer_payload(review)
 
 
 def _reset_review_tokens(user_id: int) -> None:
@@ -249,6 +275,43 @@ def mark_review_answered(review_id: str | None, user_id: int) -> None:
         session.rebuild_unanswered(uid)
 
 
+def filter_reviews(
+    reviews: List[ReviewCard],
+    *,
+    period_from_msk: datetime | None = None,
+    period_to_msk: datetime | None = None,
+    answer_filter: str = "all",
+) -> List[ReviewCard]:
+    """Отфильтровать отзывы по периоду (МСК) и наличию ответа."""
+
+    safe_from = _ensure_msk(period_from_msk) if period_from_msk else None
+    safe_to = _ensure_msk(period_to_msk) if period_to_msk else None
+    safe_from_date = safe_from.date() if safe_from else None
+    safe_to_date = safe_to.date() if safe_to else None
+
+    filtered: list[ReviewCard] = []
+    for review in reviews:
+        created_msk = _to_msk(review.created_at) if (safe_from_date or safe_to_date) else None
+
+        if safe_from_date or safe_to_date:
+            if created_msk is None:
+                continue
+            created_date = created_msk.date()
+            if safe_from_date and created_date < safe_from_date:
+                continue
+            if safe_to_date and created_date > safe_to_date:
+                continue
+
+        if answer_filter == "unanswered" and _has_answer_payload(review):
+            continue
+        if answer_filter == "answered" and not _has_answer_payload(review):
+            continue
+
+        filtered.append(review)
+
+    return filtered
+
+
 def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
     rating = int(raw.get("rating") or raw.get("grade") or 0)
     text = (raw.get("text") or raw.get("comment") or "").strip()
@@ -272,35 +335,32 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
     answered_flag = raw.get("answered") or raw.get("has_answer") or raw.get("is_answered")
     answered = bool(answer_payload or answered_flag)
 
-    product_block = raw.get("product") if isinstance(raw.get("product"), dict) else {}
+    product_block_raw = raw.get("product") or raw.get("product_info") or {}
+    product_block = product_block_raw if isinstance(product_block_raw, dict) else {}
+    product_id = raw.get("product_id") or raw.get("sku") or product_block.get("product_id")
+    offer_id = product_block.get("offer_id") or raw.get("offer_id") or raw.get("sku") or raw.get("product_id")
     product_name = (
-        raw.get("product_title")
+        product_block.get("name")
+        or raw.get("product_title")
         or raw.get("product_name")
         or raw.get("title")
-        or (product_block.get("name") if product_block else None)
     )
-
-    offer_id = (
-        raw.get("offer_id")
-        or raw.get("sku")
-        or raw.get("product_id")
-        or product_block.get("offer_id")
-    )
-    product_id = raw.get("product_id") or raw.get("sku") or product_block.get("product_id")
 
     # NEW: приводим идентификаторы к строкам, чтобы избежать ошибок .strip() для int
     offer_id = str(offer_id) if offer_id is not None else None
     product_id = str(product_id) if product_id is not None else None
 
-    created_at = (
-        _parse_date(raw.get("created_at"))
-        or _parse_date(raw.get("createdAt"))
-        or _parse_date(raw.get("creation_date"))
-        or _parse_date(raw.get("created_date"))
-        or _parse_date(raw.get("date"))
-        or _parse_date(raw.get("published_at"))
-        or _parse_date(raw.get("submitted_at"))
-    )
+    created_candidates = [
+        raw.get("created_at"),
+        raw.get("createdAt"),
+        raw.get("creation_date"),
+        raw.get("created_date"),
+        raw.get("date"),
+        raw.get("published_at"),
+        raw.get("submitted_at"),
+    ]
+    raw_created_at = next((v for v in created_candidates if v not in (None, "")), None)
+    created_at = next((dt for dt in (_parse_date(v) for v in created_candidates) if dt), None)
 
     return ReviewCard(
         id=str(raw.get("id") or raw.get("review_id") or raw.get("uuid") or "") or None,
@@ -310,6 +370,7 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
         offer_id=offer_id,
         product_id=product_id,
         created_at=created_at,
+        raw_created_at=raw_created_at,
         answered=answered,
         answer_text=answer_text or None,
     )
@@ -334,7 +395,7 @@ def _pick_product_label(card: ReviewCard) -> str:
     if product:
         return f"{product} (ID: {product_id})" if product_id else product
     if product_id:
-        return f"ID {product_id} (название не найдено)"
+        return f"ID {product_id} (не найден в каталоге)"
     return "— (название недоступно)"
 
 
@@ -350,7 +411,7 @@ def _pick_short_product_label(card: ReviewCard) -> str:
     if name:
         return name[:47] + "…" if len(name) > 50 else name
     if product_id:
-        return f"ID {product_id} (нет имени)"
+        return f"ID {product_id} (не найден в каталоге)"
     return "—"
 
 
@@ -402,22 +463,42 @@ def trim_for_telegram(text: str, max_len: int = TELEGRAM_SOFT_LIMIT) -> str:
     return text[: max_len - len(suffix)] + suffix
 
 
-async def _resolve_product_names(cards: List[ReviewCard], client: OzonClient) -> None:
-    missing_ids = [c.product_id for c in cards if c.product_id and not c.product_name]
+async def _resolve_product_names(
+    cards: List[ReviewCard], client: OzonClient, product_cache: Dict[str, str | None] | None = None
+) -> None:
+    cache = product_cache if product_cache is not None else {}
+
+    missing_ids: list[str] = []
+    for card in cards:
+        if not card.product_id:
+            continue
+        if card.product_id in cache:
+            if not card.product_name:
+                card.product_name = cache[card.product_id]
+            continue
+        if card.product_id in _product_name_cache:
+            cache[card.product_id] = _product_name_cache[card.product_id]
+            if not card.product_name:
+                card.product_name = cache[card.product_id]
+            continue
+        if not card.product_name:
+            missing_ids.append(card.product_id)
+
     unique_ids = [pid for pid in dict.fromkeys(missing_ids) if pid]
     for pid in unique_ids:
-        if pid in _product_name_cache:
+        if pid in cache:
             continue
         try:
             title = await client.get_product_name(pid)
         except Exception as exc:
             logger.warning("Failed to fetch product name for %s: %s", pid, exc)
             title = None
+        cache[pid] = title
         _product_name_cache[pid] = title
 
     for card in cards:
         if card.product_id and not card.product_name:
-            card.product_name = _product_name_cache.get(card.product_id) or card.product_name
+            card.product_name = cache.get(card.product_id) or _product_name_cache.get(card.product_id) or card.product_name
 
 
 async def fetch_recent_reviews(
@@ -426,14 +507,19 @@ async def fetch_recent_reviews(
     days: int = DEFAULT_RECENT_DAYS,
     limit_per_page: int = 80,
     max_reviews: int = MAX_REVIEWS_LOAD,
+    product_cache: Dict[str, str | None] | None = None,
 ) -> Tuple[List[ReviewCard], str]:
     """Загрузить отзывы за последние *days* дней одним списком."""
 
     client = client or get_client()
+    product_cache = product_cache if product_cache is not None else {}
     since_msk, to_msk, pretty = _msk_range_last_days(days)
+    fetch_since_msk = since_msk - timedelta(days=2)
+    fetch_from_utc = _to_utc(fetch_since_msk)
+    fetch_to_utc = _to_utc(to_msk)
     raw = await client.get_reviews(
-        since_msk,
-        to_msk,
+        fetch_from_utc or fetch_since_msk,
+        fetch_to_utc or to_msk,
         limit_per_page=limit_per_page,
         max_count=max_reviews,
     )
@@ -441,14 +527,48 @@ async def fetch_recent_reviews(
         # DEBUG: один пример для сверки схемы ReviewAPI, чтобы не спамить логи
         logger.debug("Sample review payload: %r", raw[0])
     cards = [_normalize_review(r) for r in raw if isinstance(r, dict)]
-    await _resolve_product_names(cards, client)
-    cards.sort(key=lambda c: c.created_at or datetime.min, reverse=True)
-    logger.info(
-        "Reviews fetched (flat): %s items, period=%s",
-        len(cards),
-        pretty,
+    missing_created = sum(1 for c in cards if c.created_at is None)
+
+    filtered_cards: list[ReviewCard] = filter_reviews(
+        cards, period_from_msk=since_msk, period_to_msk=to_msk, answer_filter="all"
     )
-    return cards, pretty
+
+    await _resolve_product_names(filtered_cards, client, product_cache)
+    filtered_cards.sort(
+        key=lambda c: _to_msk(c.created_at) or datetime.min.replace(tzinfo=MSK_TZ),
+        reverse=True,
+    )
+
+    unanswered_count = len(filter_reviews(filtered_cards, answer_filter="unanswered"))
+    answered_count = len(filter_reviews(filtered_cards, answer_filter="answered"))
+
+    logger.info(
+        "Reviews fetched from API: %s items (UTC range: %s — %s)",
+        len(raw),
+        (fetch_from_utc or fetch_since_msk).isoformat(),
+        (fetch_to_utc or to_msk).isoformat(),
+    )
+
+    debug_dates = False
+    if debug_dates:
+        for sample in filtered_cards[:5]:
+            logger.info(
+                "Review debug: id=%s created_at_raw=%r created_at_parsed=%s created_at_msk=%s",
+                sample.id,
+                sample.raw_created_at,
+                sample.created_at,
+                _to_msk(sample.created_at),
+            )
+    logger.info(
+        "Reviews after filter: %s items for period=%s (MSK), filter=all | unanswered=%s | answered=%s | missing_dates=%s | dropped_by_date=%s",
+        len(filtered_cards),
+        pretty,
+        unanswered_count,
+        answered_count,
+        missing_created,
+        len(cards) - len(filtered_cards),
+    )
+    return filtered_cards, pretty
 
 
 def _slice_cards(cards: List[ReviewCard], page: int, page_size: int) -> tuple[List[ReviewCard], int, int]:
@@ -536,12 +656,14 @@ async def _ensure_session(user_id: int, client: OzonClient | None = None) -> Rev
     if session and (now - session.loaded_at) < SESSION_TTL:
         return session
 
-    cards, pretty = await fetch_recent_reviews(client)
+    product_cache: Dict[str, str | None] = {}
+    cards, pretty = await fetch_recent_reviews(client, product_cache=product_cache)
     session = ReviewSession(
         all_reviews=cards,
         unanswered_reviews=[c for c in cards if not is_answered(c, user_id)],
         pretty_period=pretty,
         loaded_at=now,
+        product_cache=product_cache,
     )
     _reset_review_tokens(user_id)
     _sessions[user_id] = session
@@ -647,12 +769,14 @@ async def get_review_by_id(
 
 async def refresh_reviews(user_id: int, client: OzonClient | None = None) -> ReviewSession:
     now = datetime.utcnow()
-    cards, pretty = await fetch_recent_reviews(client)
+    product_cache: Dict[str, str | None] = {}
+    cards, pretty = await fetch_recent_reviews(client, product_cache=product_cache)
     session = ReviewSession(
         all_reviews=cards,
         unanswered_reviews=[c for c in cards if not is_answered(c, user_id)],
         pretty_period=pretty,
         loaded_at=now,
+        product_cache=product_cache,
     )
     _reset_review_tokens(user_id)
     _sessions[user_id] = session
