@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple
 
-from .ai_client import generate_review_reply
-from .ozon_client import OzonClient, fmt_int, get_client
+from .ai_client import AIClientError, generate_review_reply
+from .ozon_client import OzonClient, get_client
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +15,12 @@ DEFAULT_RECENT_DAYS = 30
 MAX_REVIEW_LEN = 450
 MAX_REVIEWS_LOAD = 200
 MSK_SHIFT = timedelta(hours=3)
-TELEGRAM_SOFT_LIMIT = 3500
+TELEGRAM_SOFT_LIMIT = 4000
+REVIEWS_PAGE_SIZE = 10
+
+_product_name_cache: dict[str, str | None] = {}
+_review_answered_cache: dict[int, set[str]] = {}
+_sessions: dict[int, "ReviewSession"] = {}
 
 
 @dataclass
@@ -28,6 +33,7 @@ class ReviewCard:
     product_id: str | None
     created_at: datetime | None
     answered: bool = False
+    answer_text: str | None = None
 
 
 @dataclass
@@ -36,6 +42,18 @@ class ReviewView:
     index: int
     total: int
     period: str
+
+
+@dataclass
+class ReviewSession:
+    all_reviews: List[ReviewCard] = field(default_factory=list)
+    unanswered_reviews: List[ReviewCard] = field(default_factory=list)
+    pretty_period: str = ""
+    indexes: Dict[str, int] = field(default_factory=lambda: {"all": 0, "unanswered": 0, "answered": 0})
+    page: Dict[str, int] = field(default_factory=lambda: {"all": 0, "unanswered": 0, "answered": 0})
+
+    def rebuild_unanswered(self, user_id: int) -> None:
+        self.unanswered_reviews = [c for c in self.all_reviews if not is_answered(c, user_id)]
 
 
 def _parse_date(value: Any) -> datetime | None:
@@ -64,6 +82,36 @@ def _msk_range_last_days(days: int = DEFAULT_RECENT_DAYS) -> Tuple[datetime, dat
     return start_msk, end_msk, pretty
 
 
+def _answered_for_user(user_id: int) -> set[str]:
+    """Вернуть (и при необходимости восстановить) кэш отвеченных отзывов для пользователя."""
+
+    global _review_answered_cache
+    if not isinstance(_review_answered_cache, dict):
+        logger.warning("Answered cache corrupted, resetting it")
+        _review_answered_cache = {}
+
+    bucket = _review_answered_cache.get(user_id)
+    if not isinstance(bucket, set):
+        bucket = set(bucket or [])
+        _review_answered_cache[user_id] = bucket
+    return bucket
+
+
+def is_answered(review: ReviewCard, user_id: int | None = None) -> bool:
+    user_cache = _answered_for_user(user_id or 0)
+    if review.id and review.id in user_cache:
+        return True
+    return bool(review.answered or (review.answer_text and review.answer_text.strip()))
+
+
+def mark_review_answered(review_id: str | None, user_id: int) -> None:
+    if review_id:
+        _answered_for_user(user_id).add(review_id)
+    # Обновим сессии, чтобы отзыв пропал из непрочитанных
+    for uid, session in _sessions.items():
+        session.rebuild_unanswered(uid)
+
+
 def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
     rating = int(raw.get("rating") or raw.get("grade") or 0)
     text = (raw.get("text") or raw.get("comment") or "").strip()
@@ -71,22 +119,37 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
     if len(text) > MAX_REVIEW_LEN:
         text = text[: MAX_REVIEW_LEN - 1] + "…"
 
-    answer_payload = raw.get("answer") or raw.get("reply") or raw.get("response")
+    answer_payload = raw.get("answer") or raw.get("reply") or raw.get("response") or {}
+    answer_text = ""
+    if isinstance(answer_payload, dict):
+        answer_text = str(answer_payload.get("text") or answer_payload.get("comment") or "").strip()
+    elif isinstance(answer_payload, str):
+        answer_text = answer_payload.strip()
+
     answered = bool(answer_payload or raw.get("answered"))
+
+    product_name = raw.get("product_title") or raw.get("product_name") or raw.get("title")
+    offer_id = raw.get("offer_id") or raw.get("sku") or raw.get("product_id")
+    product_id = raw.get("product_id") or raw.get("sku") or None
+
+    # NEW: приводим идентификаторы к строкам, чтобы избежать ошибок .strip() для int
+    offer_id = str(offer_id) if offer_id is not None else None
+    product_id = str(product_id) if product_id is not None else None
 
     return ReviewCard(
         id=str(raw.get("id") or raw.get("review_id") or "") or None,
         rating=rating,
         text=text,
-        product_name=(raw.get("product_title") or raw.get("product_name") or raw.get("title")),
-        offer_id=(raw.get("offer_id") or raw.get("sku") or raw.get("product_id")),
-        product_id=(raw.get("product_id") or raw.get("sku") or None),
+        product_name=product_name,
+        offer_id=offer_id,
+        product_id=product_id,
         created_at=(
             _parse_date(raw.get("date"))
             or _parse_date(raw.get("created_at"))
             or _parse_date(raw.get("createdAt"))
         ),
         answered=answered,
+        answer_text=answer_text or None,
     )
 
 
@@ -103,45 +166,96 @@ def _calc_stats(cards: List[ReviewCard]) -> Tuple[int, float, Dict[int, int]]:
     return total, avg, dist
 
 
-def _format_review_card_text(card: ReviewCard, index: int, total: int, period_title: str) -> str:
-    """Сформировать карточку одного отзыва.
+def _pick_product_label(card: ReviewCard) -> str:
+    product_id = card.product_id or card.offer_id
+    product = card.product_name or ""
+    if product:
+        return f"{product} (ID: {product_id})" if product_id else product
+    if product_id:
+        return f"ID {product_id} (название не найдено)"
+    return "— (название недоступно)"
 
-    Требования пользователя: один отзыв = одно сообщение, с датой, рейтингом,
-    названием товара, текстом и статусом ответа.
-    """
 
-    product = card.product_name or card.offer_id or card.product_id or "—"
+def _pick_short_product_label(card: ReviewCard) -> str:
+    """Короткое имя товара для таблицы."""
+
+    name_raw = card.product_name
+    name = str(name_raw).strip() if name_raw is not None else ""
+
+    product_id_raw = card.product_id or card.offer_id
+    product_id = str(product_id_raw).strip() if product_id_raw is not None else ""
+
+    if name:
+        return name[:47] + "…" if len(name) > 50 else name
+    if product_id:
+        return f"ID {product_id} (нет имени)"
+    return "—"
+
+
+def format_review_card_text(
+    *,
+    card: ReviewCard,
+    index: int,
+    total: int,
+    period_title: str,
+    user_id: int,
+    current_answer: str | None = None,
+) -> str:
+    """Сформировать карточку одного отзыва с блоком текущего ответа."""
+
     date_line = _fmt_dt_msk(card.created_at)
     stars = f"{card.rating}★" if card.rating else "—"
-    lines = [
-        f"⭐ Отзыв {index + 1} из {total} • период: {period_title}",
-        "",
-        f"Рейтинг: {stars}",
-        f"Товар: {product}",
-    ]
+    product_line = _pick_product_label(card)
+    status = "Есть ответ" if is_answered(card, user_id) else "Без ответа"
+    answer_text = current_answer or card.answer_text or "(ответа пока нет)"
 
+    title_parts = [f"{stars}"]
+    if date_line:
+        title_parts.append(date_line)
+    title = " • ".join(title_parts) if title_parts else "Отзыв"
+
+    lines = [f"⭐ {title}", f"Позиция: {product_line}"]
     if card.id:
         lines.append(f"ID отзыва: {card.id}")
-    if date_line:
-        lines.append(f"Дата: {date_line} (МСК)")
 
     lines.extend([
         "",
         "Текст отзыва:",
         card.text or "(пустой отзыв)",
         "",
-        f"Статус ответа: {'есть' if card.answered else 'нет'}",
+        f"Статус: {status}",
+        "",
+        "Текущий ответ:",
+        answer_text,
     ])
 
-    return "\n".join(lines).strip()
+    body = "\n".join(lines).strip()
+    return trim_for_telegram(body)
 
 
 def trim_for_telegram(text: str, max_len: int = TELEGRAM_SOFT_LIMIT) -> str:
-    """Обрезать текст до безопасной длины для Telegram, оставляя пометку."""
-
     if len(text) <= max_len:
         return text
-    return text[: max_len - 1] + "…"
+    suffix = "… (обрезано)"
+    return text[: max_len - len(suffix)] + suffix
+
+
+async def _resolve_product_names(cards: List[ReviewCard], client: OzonClient) -> None:
+    missing_ids = [c.product_id for c in cards if c.product_id and not c.product_name]
+    unique_ids = [pid for pid in dict.fromkeys(missing_ids) if pid]
+    for pid in unique_ids:
+        if pid in _product_name_cache:
+            continue
+        try:
+            title = await client.get_product_name(pid)
+        except Exception as exc:
+            logger.warning("Failed to fetch product name for %s: %s", pid, exc)
+            title = None
+        _product_name_cache[pid] = title
+
+    for card in cards:
+        if card.product_id and not card.product_name:
+            card.product_name = _product_name_cache.get(card.product_id) or card.product_name
 
 
 async def fetch_recent_reviews(
@@ -151,11 +265,7 @@ async def fetch_recent_reviews(
     limit_per_page: int = 80,
     max_reviews: int = MAX_REVIEWS_LOAD,
 ) -> Tuple[List[ReviewCard], str]:
-    """Загрузить отзывы за последние *days* дней одним списком.
-
-    Серверная часть не делит отзывы по периодам; мы берём фиксированное окно и
-    аккуратно логируем объём выборки.
-    """
+    """Загрузить отзывы за последние *days* дней одним списком."""
 
     client = client or get_client()
     since_msk, to_msk, pretty = _msk_range_last_days(days)
@@ -166,6 +276,7 @@ async def fetch_recent_reviews(
         max_count=max_reviews,
     )
     cards = [_normalize_review(r) for r in raw if isinstance(r, dict)]
+    await _resolve_product_names(cards, client)
     cards.sort(key=lambda c: c.created_at or datetime.min, reverse=True)
     logger.info(
         "Reviews fetched (flat): %s items, period=%s",
@@ -175,80 +286,211 @@ async def fetch_recent_reviews(
     return cards, pretty
 
 
-def _build_review_view(cards: List[ReviewCard], index: int, pretty: str) -> ReviewView:
+def _slice_cards(cards: List[ReviewCard], page: int, page_size: int) -> tuple[List[ReviewCard], int, int]:
+    total = len(cards)
+    total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+    safe_page = max(0, min(page, total_pages - 1))
+    start = safe_page * page_size
+    end = start + page_size
+    return cards[start:end], safe_page, total_pages
+
+
+def build_reviews_table(
+    *,
+    cards: List[ReviewCard],
+    pretty_period: str,
+    category: str,
+    user_id: int,
+    page: int = 0,
+    page_size: int = REVIEWS_PAGE_SIZE,
+) -> tuple[str, List[tuple[str, str | None, int]], int, int]:
+    """Собрать текст таблицы и кнопки для списка отзывов."""
+
+    if not cards:
+        return (
+            "Отзывы не найдены за выбранный период.",
+            [],
+            0,
+            0,
+        )
+
+    slice_items, safe_page, total_pages = _slice_cards(cards, page, page_size)
+    rows: List[str] = [f"⭐ Отзывы ({category})", pretty_period, ""]
+    items: List[tuple[str, str | None, int]] = []
+
+    for idx, card in enumerate(slice_items):
+        global_index = safe_page * page_size + idx
+        status = "✅" if is_answered(card, user_id) else "✏️"
+        stars = f"{card.rating}★" if card.rating else "—"
+        snippet = (card.text or "").strip()
+        if len(snippet) > 50:
+            snippet = snippet[:47] + "…"
+        product_short = _pick_short_product_label(card)
+        label = f"{status} {stars} | {snippet or 'пусто'} | {product_short}"
+        items.append((label, card.id, global_index))
+
+    rows.append(f"Страница {safe_page + 1}/{total_pages}")
+    text = "\n".join(rows)
+    return trim_for_telegram(text), items, safe_page, total_pages
+
+
+def _build_review_view(cards: List[ReviewCard], index: int, pretty: str, user_id: int) -> ReviewView:
     if not cards:
         return ReviewView(
-            text="Отзывы за указанный период не найдены.",
+            text="Отзывы за выбранный период не найдены.",
             index=0,
             total=0,
             period=pretty,
         )
 
     safe_index = max(0, min(index, len(cards) - 1))
-    text = _format_review_card_text(cards[safe_index], safe_index, len(cards), pretty)
-    text = trim_for_telegram(text)
+    text = format_review_card_text(
+        card=cards[safe_index],
+        index=safe_index,
+        total=len(cards),
+        period_title=pretty,
+        user_id=user_id,
+    )
     return ReviewView(text=text, index=safe_index, total=len(cards), period=pretty)
+
+
+async def _ensure_session(user_id: int, client: OzonClient | None = None) -> ReviewSession:
+    if user_id in _sessions:
+        return _sessions[user_id]
+
+    cards, pretty = await fetch_recent_reviews(client)
+    session = ReviewSession(
+        all_reviews=cards,
+        unanswered_reviews=[c for c in cards if not is_answered(c, user_id)],
+        pretty_period=pretty,
+    )
+    _sessions[user_id] = session
+    return session
+
+
+def _get_cards_for_category(session: ReviewSession, category: str, user_id: int) -> List[ReviewCard]:
+    if category == "unanswered":
+        session.rebuild_unanswered(user_id)
+        return session.unanswered_reviews
+    if category == "answered":
+        return [c for c in session.all_reviews if is_answered(c, user_id)]
+    return session.all_reviews
+
+
+def _find_card_by_id(cards: List[ReviewCard], review_id: str | None) -> tuple[int, ReviewCard] | tuple[int, None]:
+    if not review_id:
+        return 0, cards[0] if cards else None
+    for idx, card in enumerate(cards):
+        if card.id == review_id:
+            return idx, card
+    return 0, cards[0] if cards else None
 
 
 async def get_review_view(
     user_id: int,
-    period_key: str = "recent",
+    category: str = "unanswered",
     index: int = 0,
     client: OzonClient | None = None,
 ) -> ReviewView:
-    """Вернуть представление отдельной карточки отзыва."""
+    session = await _ensure_session(user_id, client)
+    cards = _get_cards_for_category(session, category, user_id)
+    view = _build_review_view(cards, index, session.pretty_period, user_id)
+    session.indexes[category] = view.index
+    return view
 
-    cards, pretty = await fetch_recent_reviews(client)
-    return _build_review_view(cards, index, pretty)
+
+async def get_reviews_table(
+    *, user_id: int, category: str = "all", page: int = 0, client: OzonClient | None = None
+) -> tuple[str, list[tuple[str, str | None, int]], int, int]:
+    session = await _ensure_session(user_id, client)
+    cards = _get_cards_for_category(session, category, user_id)
+    text, items, safe_page, total_pages = build_reviews_table(
+        cards=cards,
+        pretty_period=session.pretty_period,
+        category=category,
+        user_id=user_id,
+        page=page,
+    )
+    session.page[category] = safe_page
+    return text, items, safe_page, total_pages
+
+
+async def get_review_and_card(
+    user_id: int,
+    category: str,
+    index: int,
+    client: OzonClient | None = None,
+    review_id: str | None = None,
+) -> tuple[ReviewView, ReviewCard | None]:
+    session = await _ensure_session(user_id, client)
+    cards = _get_cards_for_category(session, category, user_id)
+    if review_id:
+        index, card = _find_card_by_id(cards, review_id)
+    else:
+        card = cards[index] if cards else None
+    view = _build_review_view(cards, index, session.pretty_period, user_id)
+    session.indexes[category] = view.index
+    return view, card
 
 
 async def shift_review_view(
     user_id: int,
-    period_key: str,
+    category: str,
     step: int,
     client: OzonClient | None = None,
 ) -> ReviewView:
-    # Периоды и переключение карточек больше не используются; возвращаем актуальный список
-    return await get_review_view(user_id, period_key, 0, client)
+    session = await _ensure_session(user_id, client)
+    current = session.indexes.get(category, 0)
+    new_index = current + step
+    return await get_review_view(user_id, category, new_index, client)
 
 
-async def get_current_review(
+async def get_review_by_index(
     user_id: int,
-    period_key: str = "recent",
+    category: str,
+    index: int,
     client: OzonClient | None = None,
 ) -> ReviewCard | None:
-    cards, _ = await fetch_recent_reviews(client)
-    return cards[0] if cards else None
+    _, card = await get_review_and_card(user_id, category, index, client)
+    return card
 
 
-async def get_reviews_today(client: OzonClient | None = None):  # back-compat
-    return await fetch_recent_reviews(client)
+async def get_review_by_id(
+    user_id: int,
+    category: str,
+    review_id: str | None,
+    client: OzonClient | None = None,
+) -> tuple[ReviewCard | None, int]:
+    view, card = await get_review_and_card(user_id, category, 0, client, review_id=review_id)
+    return card, view.index
 
 
-async def get_reviews_week(client: OzonClient | None = None):  # back-compat
-    return await fetch_recent_reviews(client)
-
-
-async def get_reviews_month(client: OzonClient | None = None):  # back-compat
-    return await fetch_recent_reviews(client)
+async def refresh_reviews(user_id: int, client: OzonClient | None = None) -> ReviewSession:
+    cards, pretty = await fetch_recent_reviews(client)
+    session = ReviewSession(
+        all_reviews=cards,
+        unanswered_reviews=[c for c in cards if not is_answered(c, user_id)],
+        pretty_period=pretty,
+    )
+    _sessions[user_id] = session
+    return session
 
 
 async def get_ai_reply_for_review(review: ReviewCard) -> str:
-    try:
-        return await generate_review_reply(
-            review_text=review.text,
-            product_name=review.product_name,
-            rating=review.rating,
-        )
-    except Exception:
-        logger.exception("AI reply generation failed")
-        raise
+    return await generate_review_reply(
+        review_text=review.text,
+        product_name=review.product_name,
+        rating=review.rating,
+    )
 
 
 async def get_reviews_menu_text() -> str:
-    # В меню теперь сразу показываем описание периода без деления на today/week/month
     _, _, pretty = _msk_range_last_days(DEFAULT_RECENT_DAYS)
-    return f"⭐ Отзывы (последние {DEFAULT_RECENT_DAYS} дней)\n{pretty}"
+    return (
+        "⭐ Отзывы\n"
+        "Выберите список: новые без ответа или все за период."\
+        f"\n{pretty}"
+    )
 
 
 __all__ = [
@@ -258,10 +500,13 @@ __all__ = [
     "trim_for_telegram",
     "get_review_view",
     "shift_review_view",
-    "get_current_review",
-    "get_reviews_today",
-    "get_reviews_week",
-    "get_reviews_month",
+    "get_review_and_card",
+    "get_review_by_id",
+    "get_review_by_index",
+    "get_reviews_table",
+    "refresh_reviews",
     "get_ai_reply_for_review",
-    "get_reviews_menu_text",
+    "mark_review_answered",
+    "is_answered",
+    "format_review_card_text",
 ]

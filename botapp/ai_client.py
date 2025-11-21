@@ -6,54 +6,65 @@ import os
 from typing import Optional
 
 from openai import AsyncOpenAI
+from openai import APIStatusError, NotFoundError, PermissionDeniedError
 
 logger = logging.getLogger(__name__)
 
-_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 _client: Optional[AsyncOpenAI] = None
 
 
+class AIClientError(RuntimeError):
+    """Пользовательская ошибка работы с OpenAI."""
+
+    def __init__(self, user_message: str):
+        super().__init__(user_message)
+        self.user_message = user_message
+
+
 def _get_client() -> AsyncOpenAI:
-    if not _OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not set")
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        raise AIClientError("OPENAI_API_KEY is not set")
+
     global _client
     if _client is None:
-        _client = AsyncOpenAI(api_key=_OPENAI_API_KEY)
+        _client = AsyncOpenAI(api_key=api_key)
     return _client
 
 
 async def generate_review_reply(
+    *,
     review_text: str,
     product_name: str | None,
     rating: int | None,
+    user_prompt: str | None = None,
+    previous_answer: str | None = None,
     language: str = "ru",
-) -> str:
+) -> str | None:
     """Return a short, friendly draft reply to a customer review.
 
-    If OpenAI rejects the request (e.g. no access to the default model), we log a
-    warning and fall back to a simple canned reply instead of bubbling the error
-    to Telegram users.
+    Возвращает None при любой ошибке OpenAI, чтобы верхний слой показал
+    пользователю лаконичное предупреждение.
     """
-
-    if not _OPENAI_API_KEY:
-        logger.warning("OPENAI_API_KEY is missing; cannot generate AI reply")
-        raise RuntimeError("OPENAI_API_KEY missing")
 
     client = _get_client()
     system_prompt = (
-        "Ты сотрудник бренда ITOM. Пиши кратко, дружелюбно, человеческим языком,"
-        " без канцелярита. Отвечай на русском."
+        "Ты — продавец на Ozon. Пиши кратко, вежливо, по-человечески,"
+        " без канцелярита и токсичности. Отвечай на русском."
     )
+
     user_parts = [f"Отзыв: {review_text.strip()}"[:2000]]
     if product_name:
         user_parts.append(f"Товар: {product_name}")
     if rating:
         user_parts.append(f"Оценка: {rating}★")
+    if previous_answer:
+        user_parts.append(f"Предыдущий вариант ответа: {previous_answer[:1000]}")
+    if user_prompt:
+        user_parts.append(f"Пожелание к ответу: {user_prompt.strip()[:800]}")
 
     message = "\n".join(user_parts)
-    # Разрешаем задать модель через окружение; по умолчанию используем более
-    # доступную gpt-4o-mini, чтобы избежать 403 model_not_found, как на Render.
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    model = "gpt-4o-mini"
 
     try:
         resp = await client.chat.completions.create(
@@ -65,12 +76,18 @@ async def generate_review_reply(
             max_tokens=300,
             temperature=0.6,
         )
-    except Exception as exc:
-        logger.warning("OpenAI call failed (%s); using canned reply", exc)
-        return "Спасибо за ваш отзыв! Мы уже передали его команде."  # fallback
+    except (PermissionDeniedError, NotFoundError) as exc:  # 403/model not found
+        logger.warning("OpenAI model error: %s", exc)
+        return None
+    except APIStatusError as exc:
+        logger.warning("OpenAI API status error: %s", exc)
+        return None
+    except Exception as exc:  # pragma: no cover - защитный слой
+        logger.exception("OpenAI unexpected error: %s", exc)
+        return None
 
     choice = resp.choices[0].message.content if resp.choices else None
     return choice.strip() if choice else "Спасибо за ваш отзыв!"
 
 
-__all__ = ["generate_review_reply"]
+__all__ = ["generate_review_reply", "AIClientError"]
