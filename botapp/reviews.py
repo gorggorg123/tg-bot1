@@ -65,11 +65,10 @@ class ReviewSession:
 
 
 def _parse_date(value: Any) -> datetime | None:
-    """Привести любые варианты дат из ReviewAPI к datetime (UTC).
+    """Привести дату из Ozon к aware-UTC datetime.
 
-    Ozon может вернуть ``created_at`` как ISO-строку, строку с числовым timestamp
-    или голое число (sec/ms). Чтобы не получать сдвиги на год, нормализуем всё
-    к ``datetime`` в UTC без дополнительных «магических» правок.
+    Поддерживаем ISO-строки, timestamp в секундах/миллисекундах и вложенные
+    словари. Наивные даты считаем UTC и только после этого конвертируем.
     """
 
     if value is None or value == "":
@@ -77,7 +76,11 @@ def _parse_date(value: Any) -> datetime | None:
 
     if isinstance(value, dict):
         nested = next(
-            (value.get(key) for key in ("value", "created_at", "createdAt", "date", "datetime") if value.get(key) not in (None, "")),
+            (
+                value.get(key)
+                for key in ("value", "created_at", "createdAt", "date", "datetime")
+                if value.get(key) not in (None, "")
+            ),
             None,
         )
         if nested is None:
@@ -97,7 +100,7 @@ def _parse_date(value: Any) -> datetime | None:
     if not txt:
         return None
 
-    # Строка, содержащая цифры
+    # Строка с timestamp
     if txt.isdigit():
         try:
             num = int(txt)
@@ -302,11 +305,11 @@ def _filter_reviews_and_stats(
     from_is_date = isinstance(period_from_msk, date) and not isinstance(period_from_msk, datetime)
     to_is_date = isinstance(period_to_msk, date) and not isinstance(period_to_msk, datetime)
 
-    safe_from = _ensure_msk(period_from_msk) if period_from_msk else None
-    safe_to = _ensure_msk(period_to_msk, end_of_day=to_is_date) if period_to_msk else None
+    safe_from_msk = _ensure_msk(period_from_msk) if period_from_msk else None
+    safe_to_msk = _ensure_msk(period_to_msk, end_of_day=to_is_date) if period_to_msk else None
 
-    if safe_from and safe_to and safe_from > safe_to:
-        safe_from, safe_to = safe_to, safe_from
+    if safe_from_msk and safe_to_msk and safe_from_msk > safe_to_msk:
+        safe_from_msk, safe_to_msk = safe_to_msk, safe_from_msk
 
     stats = {
         "missing_dates": 0,
@@ -317,25 +320,28 @@ def _filter_reviews_and_stats(
 
     filtered: list[ReviewCard] = []
     collected_dates: list[datetime] = []
+    seen_dates: list[datetime] = []
 
     for review in reviews:
-        created_msk = _to_msk(review.created_at)
+        created_utc = _to_utc(review.created_at)
+        created_msk = created_utc.astimezone(MSK_TZ) if created_utc else None
 
-        if safe_from or safe_to:
+        if created_msk:
+            seen_dates.append(created_msk)
+
+        if safe_from_msk or safe_to_msk:
             if created_msk is None:
                 stats["missing_dates"] += 1
                 continue
 
-            collected_dates.append(created_msk)
-
             if from_is_date or to_is_date:
                 created_key = created_msk.date()
-                from_key = safe_from.date() if safe_from else None
-                to_key = safe_to.date() if safe_to else None
+                from_key = safe_from_msk.date() if safe_from_msk else None
+                to_key = safe_to_msk.date() if safe_to_msk else None
             else:
                 created_key = created_msk
-                from_key = safe_from
-                to_key = safe_to
+                from_key = safe_from_msk
+                to_key = safe_to_msk
 
             if from_key and created_key < from_key:
                 stats["dropped_by_date"] += 1
@@ -343,6 +349,8 @@ def _filter_reviews_and_stats(
             if to_key and created_key > to_key:
                 stats["dropped_by_date"] += 1
                 continue
+
+            collected_dates.append(created_msk)
 
         if answer_filter == "unanswered" and _has_answer_payload(review):
             continue
@@ -354,15 +362,24 @@ def _filter_reviews_and_stats(
     stats["answered"] = sum(1 for r in filtered if _has_answer_payload(r))
     stats["unanswered"] = len(filtered) - stats["answered"]
 
-    if (safe_from or safe_to) and collected_dates:
+    if (safe_from_msk or safe_to_msk) and collected_dates:
         earliest = min(collected_dates)
         latest = max(collected_dates)
         logger.debug(
-            "Filter window=%s..%s (MSK), seen=%s..%s (MSK) before drops", 
-            safe_from,
-            safe_to,
+            "Filter window=%s..%s (MSK), seen_in_window=%s..%s (MSK) before drops",
+            safe_from_msk,
+            safe_to_msk,
             earliest,
             latest,
+        )
+
+    if seen_dates:
+        min_seen, max_seen = min(seen_dates), max(seen_dates)
+        logger.debug(
+            "Observed review dates (MSK) span %s..%s across %s items",
+            min_seen,
+            max_seen,
+            len(seen_dates),
         )
 
     return filtered, stats
@@ -384,6 +401,14 @@ def filter_reviews(
         answer_filter=answer_filter,
     )
     return filtered
+
+
+def _range_summary_msk(values: list[datetime]) -> str:
+    if not values:
+        return "—"
+    earliest = min(values)
+    latest = max(values)
+    return f"{earliest} — {latest}"
 
 
 def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
@@ -619,6 +644,23 @@ async def fetch_recent_reviews(
         (fetch_from_utc or fetch_since_msk).isoformat(),
         (fetch_to_utc or to_msk).isoformat(),
     )
+
+    raw_dates_msk = [dt for dt in (_to_msk(c.created_at) for c in cards) if dt]
+    filtered_dates_msk = [dt for dt in (_to_msk(c.created_at) for c in filtered_cards) if dt]
+
+    logger.info(
+        "Reviews date span (MSK): raw=%s filtered=%s",
+        _range_summary_msk(raw_dates_msk),
+        _range_summary_msk(filtered_dates_msk),
+    )
+
+    if stats.get("dropped_by_date") == len(cards) and cards:
+        logger.warning(
+            "All reviews dropped by date: window_msk=%s..%s, raw_span=%s",
+            since_msk,
+            to_msk,
+            _range_summary_msk(raw_dates_msk),
+        )
 
     debug_dates = False
     if debug_dates:
