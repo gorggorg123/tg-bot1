@@ -179,9 +179,11 @@ def _pick_product_label(card: ReviewCard) -> str:
 def _pick_short_product_label(card: ReviewCard) -> str:
     """Короткое имя товара для таблицы."""
 
-    name = (card.product_name or "").strip()
-    product_id_raw = card.product_id or card.offer_id or ""
-    product_id = str(product_id_raw).strip()
+    name_raw = card.product_name
+    name = str(name_raw).strip() if name_raw is not None else ""
+
+    product_id_raw = card.product_id or card.offer_id
+    product_id = str(product_id_raw).strip() if product_id_raw is not None else ""
 
     if name:
         return name[:47] + "…" if len(name) > 50 else name

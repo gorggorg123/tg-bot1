@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from contextlib import suppress
 from typing import Dict, Tuple
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -62,6 +63,7 @@ router = Router()
 _draft_cache: Dict[Tuple[int, str], str] = {}
 _pending_edit: Dict[int, Tuple[str | None, str, int]] = {}
 _polling_task: asyncio.Task | None = None
+_polling_lock = asyncio.Lock()
 _last_service_messages: Dict[int, int] = {}
 
 
@@ -358,73 +360,6 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
         await _send_review_card(user_id=user_id, category=category, index=index, callback=callback, review_id=review_id)
         return
 
-    if action == "send":
-        await callback.answer()
-        review_id = callback_data.review_id
-        mark_review_answered(review_id, user_id)
-        await callback.message.answer(
-            "Ответ отмечен как отправленный. (Отправка в Ozon пока не реализована)"
-        )
-        await _send_review_card(user_id=user_id, category=category, index=index, callback=callback, review_id=review_id)
-        return
-
-    if action == "send":
-        await callback.answer()
-        review_id = callback_data.review_id
-        mark_review_answered(review_id, user_id)
-        await callback.message.answer(
-            "Ответ отмечен как отправленный. (Отправка в Ozon пока не реализована)"
-        )
-        await _send_review_card(user_id=user_id, category=category, index=index, callback=callback, review_id=review_id)
-        return
-
-    # fallback для неизвестных сообщений
-    await message.answer("Выберите действие в меню ниже", reply_markup=main_menu_keyboard())
-
-
-@router.message()
-async def handle_any(message: Message) -> None:
-    user_id = message.from_user.id if message.from_user else 0
-    if user_id in _pending_edit:
-        review_id, category, index = _pending_edit.pop(user_id)
-        text = (message.text or message.caption or "").strip()
-        if not text:
-            await message.answer("Не удалось сохранить пустой ответ, попробуйте ещё раз.")
-            return
-        _store_draft(user_id, review_id, text)
-        mark_review_answered(review_id, user_id)
-        await message.answer(
-            f"Черновик обновлён:\n\n{text}",
-            reply_markup=review_draft_keyboard(category, index, review_id),
-        )
-        await _send_review_card(user_id=user_id, category=category, index=index, message=message, review_id=review_id)
-        return
-
-    # fallback для неизвестных сообщений
-    await message.answer("Выберите действие в меню ниже", reply_markup=main_menu_keyboard())
-
-
-@router.message()
-async def handle_any(message: Message) -> None:
-    user_id = message.from_user.id if message.from_user else 0
-    if user_id in _pending_edit:
-        review_id, category, index = _pending_edit.pop(user_id)
-        text = (message.text or message.caption or "").strip()
-        if not text:
-            await message.answer("Не удалось сохранить пустой ответ, попробуйте ещё раз.")
-            return
-        _store_draft(user_id, review_id, text)
-        mark_review_answered(review_id, user_id)
-        await message.answer(
-            f"Черновик обновлён:\n\n{text}",
-            reply_markup=review_draft_keyboard(category, index, review_id),
-        )
-        await _send_review_card(user_id=user_id, category=category, index=index, message=message, review_id=review_id)
-        return
-
-    # fallback для неизвестных сообщений
-    await message.answer("Выберите действие в меню ниже", reply_markup=main_menu_keyboard())
-
 
 @router.message()
 async def handle_any(message: Message) -> None:
@@ -463,18 +398,29 @@ app = FastAPI()
 
 
 async def start_bot() -> None:
-    global _polling_task
-    if _polling_task and not _polling_task.done():
-        return
+    """Стартуем polling один раз за процесс."""
 
-    logger.info("Запускаю Telegram-бота (long polling)…")
-    _polling_task = asyncio.create_task(
-        dp.start_polling(
-            bot,
-            allowed_updates=dp.resolve_used_update_types(),
+    global _polling_task
+    async with _polling_lock:
+        if _polling_task and not _polling_task.done():
+            logger.info("Polling уже запущен, повторно не стартуем")
+            return
+        if _polling_task and _polling_task.done():
+            _polling_task = None
+
+        logger.info("Telegram bot polling started (single instance)")
+        _polling_task = asyncio.create_task(
+            dp.start_polling(
+                bot,
+                allowed_updates=dp.resolve_used_update_types(),
+            )
         )
-    )
-    await _polling_task
+
+    try:
+        await _polling_task
+    except asyncio.CancelledError:
+        logger.info("Polling task cancelled, shutting down")
+        raise
 
 
 @app.on_event("startup")
@@ -493,6 +439,10 @@ async def on_shutdown() -> None:
         client = None
     if client:
         await client.aclose()
+    if _polling_task and not _polling_task.done():
+        _polling_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _polling_task
     await bot.session.close()
 
 
