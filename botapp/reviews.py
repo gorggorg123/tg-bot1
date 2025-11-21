@@ -272,13 +272,13 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
     answered_flag = raw.get("answered") or raw.get("has_answer") or raw.get("is_answered")
     answered = bool(answer_payload or answered_flag)
 
+    product_block = raw.get("product") if isinstance(raw.get("product"), dict) else {}
     product_name = (
         raw.get("product_title")
         or raw.get("product_name")
         or raw.get("title")
         or (product_block.get("name") if product_block else None)
     )
-    product_block = raw.get("product") if isinstance(raw.get("product"), dict) else {}
 
     offer_id = (
         raw.get("offer_id")
