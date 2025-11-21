@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 
 from .ai_client import AIClientError, generate_review_reply
@@ -134,12 +134,27 @@ def _msk_now() -> datetime:
     return datetime.now(timezone.utc).astimezone(MSK_TZ)
 
 
-def _ensure_msk(dt: datetime | None) -> datetime | None:
+def _ensure_msk(dt: datetime | date | None, *, end_of_day: bool = False) -> datetime | None:
+    """Привести границы периода к datetime в МСК.
+
+    Поддерживает как ``datetime``, так и ``date``. Для ``date`` добавляется
+    ``time.min`` либо ``time.max`` в зависимости от флага ``end_of_day``.
+    """
+
     if dt is None:
         return None
-    if dt.tzinfo:
-        return dt.astimezone(MSK_TZ)
-    return dt.replace(tzinfo=MSK_TZ)
+
+    base_dt: datetime
+    if isinstance(dt, datetime):
+        base_dt = dt
+    elif isinstance(dt, date):
+        base_dt = datetime.combine(dt, time.max if end_of_day else time.min)
+    else:
+        return None
+
+    if base_dt.tzinfo:
+        return base_dt.astimezone(MSK_TZ)
+    return base_dt.replace(tzinfo=MSK_TZ)
 
 
 def _fmt_dt_msk(dt: datetime | None) -> str:
@@ -275,31 +290,41 @@ def mark_review_answered(review_id: str | None, user_id: int) -> None:
         session.rebuild_unanswered(uid)
 
 
-def filter_reviews(
+def _filter_reviews_and_stats(
     reviews: List[ReviewCard],
     *,
-    period_from_msk: datetime | None = None,
-    period_to_msk: datetime | None = None,
+    period_from_msk: datetime | date | None = None,
+    period_to_msk: datetime | date | None = None,
     answer_filter: str = "all",
-) -> List[ReviewCard]:
-    """Отфильтровать отзывы по периоду (МСК) и наличию ответа."""
+) -> tuple[List[ReviewCard], dict[str, int]]:
+    """Отфильтровать отзывы и вернуть счётчики исключений."""
 
     safe_from = _ensure_msk(period_from_msk) if period_from_msk else None
-    safe_to = _ensure_msk(period_to_msk) if period_to_msk else None
-    safe_from_date = safe_from.date() if safe_from else None
-    safe_to_date = safe_to.date() if safe_to else None
+    safe_to = _ensure_msk(period_to_msk, end_of_day=True) if period_to_msk else None
+
+    if safe_from and safe_to and safe_from > safe_to:
+        safe_from, safe_to = safe_to, safe_from
+
+    stats = {
+        "missing_dates": 0,
+        "dropped_by_date": 0,
+        "answered": 0,
+        "unanswered": 0,
+    }
 
     filtered: list[ReviewCard] = []
     for review in reviews:
-        created_msk = _to_msk(review.created_at) if (safe_from_date or safe_to_date) else None
+        created_msk = _to_msk(review.created_at)
 
-        if safe_from_date or safe_to_date:
+        if safe_from or safe_to:
             if created_msk is None:
+                stats["missing_dates"] += 1
                 continue
-            created_date = created_msk.date()
-            if safe_from_date and created_date < safe_from_date:
+            if safe_from and created_msk < safe_from:
+                stats["dropped_by_date"] += 1
                 continue
-            if safe_to_date and created_date > safe_to_date:
+            if safe_to and created_msk > safe_to:
+                stats["dropped_by_date"] += 1
                 continue
 
         if answer_filter == "unanswered" and _has_answer_payload(review):
@@ -309,6 +334,26 @@ def filter_reviews(
 
         filtered.append(review)
 
+    stats["answered"] = sum(1 for r in filtered if _has_answer_payload(r))
+    stats["unanswered"] = len(filtered) - stats["answered"]
+    return filtered, stats
+
+
+def filter_reviews(
+    reviews: List[ReviewCard],
+    *,
+    period_from_msk: datetime | date | None = None,
+    period_to_msk: datetime | date | None = None,
+    answer_filter: str = "all",
+) -> List[ReviewCard]:
+    """Отфильтровать отзывы по периоду (МСК) и наличию ответа."""
+
+    filtered, _ = _filter_reviews_and_stats(
+        reviews,
+        period_from_msk=period_from_msk,
+        period_to_msk=period_to_msk,
+        answer_filter=answer_filter,
+    )
     return filtered
 
 
@@ -527,12 +572,9 @@ async def fetch_recent_reviews(
         # DEBUG: один пример для сверки схемы ReviewAPI, чтобы не спамить логи
         logger.debug("Sample review payload: %r", raw[0])
     cards = [_normalize_review(r) for r in raw if isinstance(r, dict)]
-    missing_created = sum(1 for c in cards if c.created_at is None)
-
-    filtered_cards: list[ReviewCard] = filter_reviews(
+    filtered_cards, stats = _filter_reviews_and_stats(
         cards, period_from_msk=since_msk, period_to_msk=to_msk, answer_filter="all"
     )
-
     await _resolve_product_names(filtered_cards, client, product_cache)
     filtered_cards.sort(
         key=lambda c: _to_msk(c.created_at) or datetime.min.replace(tzinfo=MSK_TZ),
@@ -565,8 +607,8 @@ async def fetch_recent_reviews(
         pretty,
         unanswered_count,
         answered_count,
-        missing_created,
-        len(cards) - len(filtered_cards),
+        stats.get("missing_dates", 0),
+        stats.get("dropped_by_date", len(cards) - len(filtered_cards)),
     )
     return filtered_cards, pretty
 
