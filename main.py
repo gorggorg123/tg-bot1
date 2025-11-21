@@ -358,6 +358,73 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
         await _send_review_card(user_id=user_id, category=category, index=index, callback=callback, review_id=review_id)
         return
 
+    if action == "send":
+        await callback.answer()
+        review_id = callback_data.review_id
+        mark_review_answered(review_id, user_id)
+        await callback.message.answer(
+            "Ответ отмечен как отправленный. (Отправка в Ozon пока не реализована)"
+        )
+        await _send_review_card(user_id=user_id, category=category, index=index, callback=callback, review_id=review_id)
+        return
+
+    if action == "send":
+        await callback.answer()
+        review_id = callback_data.review_id
+        mark_review_answered(review_id, user_id)
+        await callback.message.answer(
+            "Ответ отмечен как отправленный. (Отправка в Ozon пока не реализована)"
+        )
+        await _send_review_card(user_id=user_id, category=category, index=index, callback=callback, review_id=review_id)
+        return
+
+    # fallback для неизвестных сообщений
+    await message.answer("Выберите действие в меню ниже", reply_markup=main_menu_keyboard())
+
+
+@router.message()
+async def handle_any(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else 0
+    if user_id in _pending_edit:
+        review_id, category, index = _pending_edit.pop(user_id)
+        text = (message.text or message.caption or "").strip()
+        if not text:
+            await message.answer("Не удалось сохранить пустой ответ, попробуйте ещё раз.")
+            return
+        _store_draft(user_id, review_id, text)
+        mark_review_answered(review_id, user_id)
+        await message.answer(
+            f"Черновик обновлён:\n\n{text}",
+            reply_markup=review_draft_keyboard(category, index, review_id),
+        )
+        await _send_review_card(user_id=user_id, category=category, index=index, message=message, review_id=review_id)
+        return
+
+    # fallback для неизвестных сообщений
+    await message.answer("Выберите действие в меню ниже", reply_markup=main_menu_keyboard())
+
+
+@router.message()
+async def handle_any(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else 0
+    if user_id in _pending_edit:
+        review_id, category, index = _pending_edit.pop(user_id)
+        text = (message.text or message.caption or "").strip()
+        if not text:
+            await message.answer("Не удалось сохранить пустой ответ, попробуйте ещё раз.")
+            return
+        _store_draft(user_id, review_id, text)
+        mark_review_answered(review_id, user_id)
+        await message.answer(
+            f"Черновик обновлён:\n\n{text}",
+            reply_markup=review_draft_keyboard(category, index, review_id),
+        )
+        await _send_review_card(user_id=user_id, category=category, index=index, message=message, review_id=review_id)
+        return
+
+    # fallback для неизвестных сообщений
+    await message.answer("Выберите действие в меню ниже", reply_markup=main_menu_keyboard())
+
 
 @router.message()
 async def handle_any(message: Message) -> None:
