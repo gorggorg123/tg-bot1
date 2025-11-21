@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 
 from .ai_client import AIClientError, generate_review_reply
@@ -62,12 +62,39 @@ class ReviewSession:
 
 
 def _parse_date(value: Any) -> datetime | None:
-    if not value:
+    """Привести любые варианты дат из ReviewAPI к datetime.
+
+    В ответе v1/review/list поле может приходить как ISO-строка, так и unix-число.
+    Мы обрабатываем оба варианта, чтобы дата всегда отображалась и участвовала
+    в сортировке.
+    """
+
+    if value is None or value == "":
         return None
-    try:
-        return datetime.fromisoformat(str(value).replace(" ", "T").replace("Z", "+00:00"))
-    except Exception:
-        return None
+
+    # Числовой timestamp (секунды или миллисекунды)
+    if isinstance(value, (int, float)):
+        try:
+            # heuristic: ms timestamps обычно больше 10**12
+            parsed = datetime.utcfromtimestamp(value / 1000) if value > 10**11 else datetime.utcfromtimestamp(value)
+        except Exception:
+            return None
+    else:
+        parsed = None
+
+    # Строковый timestamp / ISO
+    if parsed is None:
+        try:
+            txt = str(value).strip()
+            if not txt:
+                return None
+            parsed = datetime.fromisoformat(txt.replace(" ", "T").replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    if parsed.tzinfo:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed.replace(tzinfo=None)
 
 
 def _fmt_dt_msk(dt: datetime | None) -> str:
@@ -208,7 +235,24 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
     elif isinstance(answer_payload, str):
         answer_text = answer_payload.strip()
 
-    answered = bool(answer_payload or raw.get("answered"))
+    answered_flag = raw.get("answered") or raw.get("has_answer")
+    answered = bool(answer_payload or answered_flag)
+
+    product_name = raw.get("product_title") or raw.get("product_name") or raw.get("title")
+    offer_id = raw.get("offer_id") or raw.get("sku") or raw.get("product_id")
+    product_id = raw.get("product_id") or raw.get("sku") or None
+
+    # NEW: приводим идентификаторы к строкам, чтобы избежать ошибок .strip() для int
+    offer_id = str(offer_id) if offer_id is not None else None
+    product_id = str(product_id) if product_id is not None else None
+
+    created_at = (
+        _parse_date(raw.get("created_at"))
+        or _parse_date(raw.get("createdAt"))
+        or _parse_date(raw.get("date"))
+        or _parse_date(raw.get("published_at"))
+        or _parse_date(raw.get("submitted_at"))
+    )
 
     product_name = raw.get("product_title") or raw.get("product_name") or raw.get("title")
     offer_id = raw.get("offer_id") or raw.get("sku") or raw.get("product_id")
@@ -219,17 +263,13 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
     product_id = str(product_id) if product_id is not None else None
 
     return ReviewCard(
-        id=str(raw.get("id") or raw.get("review_id") or "") or None,
+        id=str(raw.get("id") or raw.get("review_id") or raw.get("uuid") or "") or None,
         rating=rating,
         text=text,
         product_name=product_name,
         offer_id=offer_id,
         product_id=product_id,
-        created_at=(
-            _parse_date(raw.get("date"))
-            or _parse_date(raw.get("created_at"))
-            or _parse_date(raw.get("createdAt"))
-        ),
+        created_at=created_at,
         answered=answered,
         answer_text=answer_text or None,
     )
@@ -357,6 +397,9 @@ async def fetch_recent_reviews(
         limit_per_page=limit_per_page,
         max_count=max_reviews,
     )
+    if raw:
+        # DEBUG: один пример для сверки схемы ReviewAPI, чтобы не спамить логи
+        logger.debug("Sample review payload: %r", raw[0])
     cards = [_normalize_review(r) for r in raw if isinstance(r, dict)]
     await _resolve_product_names(cards, client)
     cards.sort(key=lambda c: c.created_at or datetime.min, reverse=True)
