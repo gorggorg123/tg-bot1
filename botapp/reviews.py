@@ -15,6 +15,7 @@ DEFAULT_RECENT_DAYS = 30
 MAX_REVIEW_LEN = 450
 MAX_REVIEWS_LOAD = 200
 MSK_SHIFT = timedelta(hours=3)
+MSK_TZ = timezone(MSK_SHIFT)
 TELEGRAM_SOFT_LIMIT = 4000
 REVIEWS_PAGE_SIZE = 10
 SESSION_TTL = timedelta(minutes=2)
@@ -79,7 +80,7 @@ def _parse_date(value: Any) -> datetime | None:
         try:
             ts = float(value)
             ts = ts / 1000 if ts > 10**11 else ts
-            return datetime.utcfromtimestamp(ts)
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
         except Exception:
             return None
 
@@ -92,7 +93,7 @@ def _parse_date(value: Any) -> datetime | None:
         try:
             num = int(txt)
             ts = num / 1000 if num > 10**11 else num
-            return datetime.utcfromtimestamp(ts)
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
         except Exception:
             return None
 
@@ -103,21 +104,33 @@ def _parse_date(value: Any) -> datetime | None:
         return None
 
     if dt.tzinfo:
-        return dt.astimezone(timezone.utc).replace(tzinfo=None)
-    return dt
+        return dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=timezone.utc)
 
 
-def _to_utc_naive(dt: datetime | None) -> datetime | None:
+def _to_utc(dt: datetime | None) -> datetime | None:
     if dt is None:
         return None
     if dt.tzinfo:
-        return dt.astimezone(timezone.utc).replace(tzinfo=None)
-    return dt
+        return dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=timezone.utc)
 
 
 def _to_msk(dt: datetime | None) -> datetime | None:
-    base_dt = _to_utc_naive(dt)
-    return base_dt + MSK_SHIFT if base_dt else None
+    base_dt = _to_utc(dt)
+    return base_dt.astimezone(MSK_TZ) if base_dt else None
+
+
+def _msk_now() -> datetime:
+    return datetime.now(timezone.utc).astimezone(MSK_TZ)
+
+
+def _ensure_msk(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo:
+        return dt.astimezone(MSK_TZ)
+    return dt.replace(tzinfo=MSK_TZ)
 
 
 def _fmt_dt_msk(dt: datetime | None) -> str:
@@ -136,7 +149,7 @@ def _human_age(dt: datetime | None) -> str:
     if not dt_msk:
         return ""
     dt_msk_date = dt_msk.date()
-    today_msk = (datetime.utcnow() + MSK_SHIFT).date()
+    today_msk = _msk_now().date()
     days = (today_msk - dt_msk_date).days
     if days < 0:
         return "из будущего"
@@ -149,9 +162,10 @@ def _human_age(dt: datetime | None) -> str:
 
 def _msk_range_last_days(days: int = DEFAULT_RECENT_DAYS) -> Tuple[datetime, datetime, str]:
     """Вернуть диапазон последних *days* дней в МСК (начиная с полуночи)."""
-    now_utc = datetime.utcnow()
-    now_msk = now_utc + MSK_SHIFT
-    start_msk = datetime(now_msk.year, now_msk.month, now_msk.day) - timedelta(days=days - 1)
+    now_msk = _msk_now()
+    start_msk = datetime(now_msk.year, now_msk.month, now_msk.day, tzinfo=MSK_TZ) - timedelta(
+        days=days - 1
+    )
     end_msk = now_msk
     pretty = f"{start_msk:%d.%m.%Y} 00:00 — {end_msk:%d.%m.%Y %H:%M} (МСК)"
     return start_msk, end_msk, pretty
@@ -172,11 +186,15 @@ def _answered_for_user(user_id: int) -> set[str]:
     return bucket
 
 
+def _has_answer_payload(review: ReviewCard) -> bool:
+    return bool((review.answer_text or "").strip() or review.answered)
+
+
 def is_answered(review: ReviewCard, user_id: int | None = None) -> bool:
     user_cache = _answered_for_user(user_id or 0)
     if review.id and review.id in user_cache:
         return True
-    return bool(review.answered or (review.answer_text and review.answer_text.strip()))
+    return _has_answer_payload(review)
 
 
 def _reset_review_tokens(user_id: int) -> None:
@@ -246,6 +264,37 @@ def mark_review_answered(review_id: str | None, user_id: int) -> None:
     # Обновим сессии, чтобы отзыв пропал из непрочитанных
     for uid, session in _sessions.items():
         session.rebuild_unanswered(uid)
+
+
+def filter_reviews(
+    reviews: List[ReviewCard],
+    *,
+    period_from_msk: datetime | None = None,
+    period_to_msk: datetime | None = None,
+    answer_filter: str = "all",
+) -> List[ReviewCard]:
+    """Отфильтровать отзывы по периоду (МСК) и наличию ответа."""
+
+    safe_from = _ensure_msk(period_from_msk) if period_from_msk else None
+    safe_to = _ensure_msk(period_to_msk) if period_to_msk else None
+
+    filtered: list[ReviewCard] = []
+    for review in reviews:
+        created_msk = _to_msk(review.created_at) if (safe_from or safe_to) else None
+
+        if safe_from and (created_msk is None or created_msk < safe_from):
+            continue
+        if safe_to and (created_msk is None or created_msk > safe_to):
+            continue
+
+        if answer_filter == "unanswered" and _has_answer_payload(review):
+            continue
+        if answer_filter == "answered" and not _has_answer_payload(review):
+            continue
+
+        filtered.append(review)
+
+    return filtered
 
 
 def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
@@ -451,9 +500,11 @@ async def fetch_recent_reviews(
     product_cache = product_cache if product_cache is not None else {}
     since_msk, to_msk, pretty = _msk_range_last_days(days)
     fetch_since_msk = since_msk - timedelta(days=2)
+    fetch_from_utc = _to_utc(fetch_since_msk)
+    fetch_to_utc = _to_utc(to_msk)
     raw = await client.get_reviews(
-        fetch_since_msk,
-        to_msk,
+        fetch_from_utc or fetch_since_msk,
+        fetch_to_utc or to_msk,
         limit_per_page=limit_per_page,
         max_count=max_reviews,
     )
@@ -462,17 +513,25 @@ async def fetch_recent_reviews(
         logger.debug("Sample review payload: %r", raw[0])
     cards = [_normalize_review(r) for r in raw if isinstance(r, dict)]
 
-    filtered_cards: list[ReviewCard] = []
-    for card in cards:
-        created_msk = _to_msk(card.created_at)
-        if created_msk is None:
-            continue
-        if created_msk < since_msk or created_msk > to_msk:
-            continue
-        filtered_cards.append(card)
+    filtered_cards: list[ReviewCard] = filter_reviews(
+        cards, period_from_msk=since_msk, period_to_msk=to_msk, answer_filter="all"
+    )
 
     await _resolve_product_names(filtered_cards, client, product_cache)
-    filtered_cards.sort(key=lambda c: _to_msk(c.created_at) or datetime.min, reverse=True)
+    filtered_cards.sort(
+        key=lambda c: _to_msk(c.created_at) or datetime.min.replace(tzinfo=MSK_TZ),
+        reverse=True,
+    )
+
+    unanswered_count = len(filter_reviews(filtered_cards, answer_filter="unanswered"))
+    answered_count = len(filter_reviews(filtered_cards, answer_filter="answered"))
+
+    logger.info(
+        "Reviews fetched from API: %s items (UTC range: %s — %s)",
+        len(raw),
+        (fetch_from_utc or fetch_since_msk).isoformat(),
+        (fetch_to_utc or to_msk).isoformat(),
+    )
 
     debug_dates = False
     if debug_dates:
@@ -484,13 +543,14 @@ async def fetch_recent_reviews(
                 sample.created_at,
                 _to_msk(sample.created_at),
             )
-    cards = filtered_cards
     logger.info(
-        "Reviews fetched (flat): %s items, period=%s",
-        len(cards),
+        "Reviews after filter: %s items for period=%s (MSK), filter=all | unanswered=%s | answered=%s",
+        len(filtered_cards),
         pretty,
+        unanswered_count,
+        answered_count,
     )
-    return cards, pretty
+    return filtered_cards, pretty
 
 
 def _slice_cards(cards: List[ReviewCard], page: int, page_size: int) -> tuple[List[ReviewCard], int, int]:

@@ -21,6 +21,7 @@ load_dotenv()
 
 BASE_URL = "https://api-seller.ozon.ru"
 MSK_SHIFT = timedelta(hours=3)
+MSK_TZ = timezone(MSK_SHIFT)
 
 _product_name_cache: dict[str, str | None] = {}
 _product_not_found_warned: set[str] = set()
@@ -29,6 +30,12 @@ _product_not_found_warned: set[str] = set()
 def _iso_z(dt: datetime) -> str:
     """Вернуть ISO-строку в UTC с Z без миллисекунд."""
     return dt.replace(microsecond=0).isoformat() + "Z"
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    if dt.tzinfo:
+        return dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=timezone.utc)
 
 
 def msk_today_range() -> Tuple[str, str, str]:
@@ -331,9 +338,11 @@ class OzonClient:
         safe_limit = max(20, min(limit_per_page, 100))
         max_reviews = max_count if max_count is not None else 10_000
 
+        date_from_utc = _ensure_utc(date_from)
+        date_to_utc = _ensure_utc(date_to)
         date_filter = {
-            "from": date_from.date().isoformat(),
-            "to": date_to.date().isoformat(),
+            "from": date_from_utc.date().isoformat(),
+            "to": date_to_utc.date().isoformat(),
         }
 
         reviews: List[Dict[str, Any]] = []
