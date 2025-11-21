@@ -100,6 +100,30 @@ def _parse_date(value: Any) -> datetime | None:
     except Exception:
         return None
 
+    # Числовой timestamp (секунды или миллисекунды)
+    if isinstance(value, (int, float)):
+        try:
+            # heuristic: ms timestamps обычно больше 10**12
+            parsed = datetime.utcfromtimestamp(value / 1000) if value > 10**11 else datetime.utcfromtimestamp(value)
+        except Exception:
+            return None
+    else:
+        parsed = None
+
+    # Строковый timestamp / ISO
+    if parsed is None:
+        try:
+            txt = str(value).strip()
+            if not txt:
+                return None
+            parsed = datetime.fromisoformat(txt.replace(" ", "T").replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    if parsed.tzinfo:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed.replace(tzinfo=None)
+
 
 def _fmt_dt_msk(dt: datetime | None) -> str:
     if not dt:
