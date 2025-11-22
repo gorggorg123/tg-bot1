@@ -461,11 +461,13 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
         product_block.get("title"),
         product_block.get("product_name"),
         product_block.get("productTitle"),
+        product_block.get("product_title"),
         raw.get("product_title"),
         raw.get("product_name"),
         raw.get("title"),
         raw.get("product_title_text"),
         raw.get("productTitle"),
+        raw.get("name"),
     ]
     product_name = next((str(v).strip() for v in product_name_fields if v not in (None, "")), None)
 
@@ -535,7 +537,7 @@ def _pick_product_label(card: ReviewCard) -> str:
         return f"{title}: {article_value}"
     if card.product_id:
         return f"ID: {card.product_id}"
-    return "—"
+    return "— (название недоступно)"
 
 
 def _pick_short_product_label(card: ReviewCard) -> str:
@@ -611,7 +613,7 @@ async def _resolve_product_names(
 ) -> None:
     cache = product_cache if product_cache is not None else {}
 
-    missing_ids: list[str] = []
+    missing_ids: set[str] = set()
     for card in cards:
         if not card.product_id:
             continue
@@ -621,21 +623,18 @@ async def _resolve_product_names(
             _product_name_cache.setdefault(card.product_id, card.product_name)
             continue
 
-        if card.product_id in cache:
-            card.product_name = cache[card.product_id]
-            continue
-
-        if card.product_id in _product_name_cache:
+        cached_name = cache.get(card.product_id)
+        if cached_name is None and card.product_id in _product_name_cache:
             cached_name = _product_name_cache[card.product_id]
             cache[card.product_id] = cached_name
+
+        if cached_name is not None:
             card.product_name = cached_name
             continue
 
-        if card.product_id not in missing_ids:
-            missing_ids.append(card.product_id)
+        missing_ids.add(card.product_id)
 
-    unique_ids = [pid for pid in missing_ids if pid and pid not in cache]
-    for pid in unique_ids:
+    for pid in missing_ids:
         try:
             title = await client.get_product_name(pid)
         except Exception as exc:

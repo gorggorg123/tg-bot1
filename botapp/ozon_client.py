@@ -413,7 +413,7 @@ class OzonClient:
         return reviews[:max_reviews]
 
     async def get_product_name(self, product_id: str) -> str | None:
-        """Получить название товара по product_id c мягкими фолбэками и кэшем."""
+        """Получить название товара по product_id с кэшем и мягкими фолбэками."""
 
         if not product_id:
             return None
@@ -421,26 +421,56 @@ class OzonClient:
         if product_id in _product_name_cache:
             return _product_name_cache[product_id]
 
-        numeric_id: int | None = None
-        if str(product_id).isdigit():
+        normalized_id = str(product_id).strip()
+        payload_id: int | str = normalized_id
+        if normalized_id.isdigit():
             try:
-                numeric_id = int(product_id)
+                payload_id = int(normalized_id)
             except Exception:
-                numeric_id = None
+                payload_id = normalized_id
 
-        payload: dict[str, int | str] = {"product_id": numeric_id if numeric_id is not None else product_id}
+        payload: dict[str, int | str] = {"product_id": payload_id}
 
-        paths = ("/v2/product/info", "/v1/product/info")
+        def _extract_name(res: dict[str, Any] | None) -> str | None:
+            if not isinstance(res, dict):
+                return None
+            return str(
+                next(
+                    (
+                        v
+                        for v in (
+                            res.get("name"),
+                            res.get("title"),
+                            res.get("product_name"),
+                            res.get("offer_id"),
+                        )
+                        if v not in (None, "")
+                    ),
+                    "",
+                )
+            ).strip() or None
+
+        api = self._get_seller_api()
+        if api and hasattr(api, "product_info"):
+            try:
+                res = await api.product_info(product_id=payload["product_id"])  # type: ignore[arg-type]
+                if hasattr(res, "model_dump"):
+                    res = res.model_dump()
+                name = _extract_name(res if isinstance(res, dict) else None)
+                if name:
+                    _product_name_cache[product_id] = name
+                    return name
+            except Exception as exc:
+                logger.warning("SellerAPI product_info failed for %s: %s", product_id, exc)
+
+        paths = ("/v1/product/info", "/v2/product/info")
         for path in paths:
             try:
                 data = await self.post(path, payload)
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 404:
-                    if product_id not in _product_not_found_warned:
-                        logger.warning("Product %s not found on %s (404)", product_id, path)
-                        _product_not_found_warned.add(product_id)
-                    _product_name_cache[product_id] = None
-                    return None
+                    logger.info("Product %s returned 404 at %s, trying next", product_id, path)
+                    continue
                 logger.warning(
                     "Product info HTTP %s for %s at %s",
                     exc.response.status_code,
@@ -457,29 +487,14 @@ class OzonClient:
                 continue
 
             res = data.get("result") if isinstance(data.get("result"), dict) else data
-            if isinstance(res, dict):
-                name = res.get("name") or res.get("title") or res.get("offer_id")
-                if name:
-                    _product_name_cache[product_id] = str(name)
-                    return str(name)
-            logger.warning("Product name missing for %s at %s", product_id, path)
-
-        api = self._get_seller_api()
-        if api and hasattr(api, "product_info"):
-            try:
-                res = await api.product_info(product_id=payload["product_id"])  # type: ignore[arg-type]
-                if hasattr(res, "model_dump"):
-                    res = res.model_dump()
-                if isinstance(res, dict):
-                    name = res.get("name") or res.get("title") or res.get("offer_id")
-                    if name:
-                        _product_name_cache[product_id] = str(name)
-                        return str(name)
-            except Exception as exc:
-                logger.warning("SellerAPI product_info failed for %s: %s", product_id, exc)
+            name = _extract_name(res if isinstance(res, dict) else None)
+            if name:
+                _product_name_cache[product_id] = name
+                return name
+            logger.info("Product name missing for %s at %s, trying next", product_id, path)
 
         if product_id not in _product_not_found_warned:
-            logger.warning("Product %s not found on Ozon (cached miss)", product_id)
+            logger.warning("Product %s not found in Ozon catalog (cached miss)", product_id)
             _product_not_found_warned.add(product_id)
         _product_name_cache[product_id] = None
         return None
