@@ -285,12 +285,21 @@ def encode_review_id(user_id: int, review_id: str | None) -> str | None:
     return _get_review_token(user_id, review_id)
 
 
-def mark_review_answered(review_id: str | None, user_id: int) -> None:
+def mark_review_answered(review_id: str | None, user_id: int, answer_text: str | None = None) -> None:
     if review_id:
         _answered_for_user(user_id).add(review_id)
-    # Обновим сессии, чтобы отзыв пропал из непрочитанных
-    for uid, session in _sessions.items():
-        session.rebuild_unanswered(uid)
+
+    session = _sessions.get(user_id)
+    if not session:
+        return
+
+    for card in session.all_reviews:
+        if review_id and card.id == review_id:
+            card.answered = True
+            if answer_text is not None:
+                card.answer_text = answer_text
+
+    session.rebuild_unanswered(user_id)
 
 
 def _filter_reviews_and_stats(
@@ -440,18 +449,29 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
 
     product_block_raw = raw.get("product") or raw.get("product_info") or {}
     product_block = product_block_raw if isinstance(product_block_raw, dict) else {}
-    product_id = raw.get("product_id") or raw.get("sku") or product_block.get("product_id")
-    offer_id = product_block.get("offer_id") or raw.get("offer_id") or raw.get("sku") or raw.get("product_id")
-    product_name = (
-        product_block.get("name")
-        or raw.get("product_title")
-        or raw.get("product_name")
-        or raw.get("title")
+    product_id_raw = raw.get("product_id") or raw.get("sku") or product_block.get("product_id")
+    offer_id_raw = (
+        product_block.get("offer_id")
+        or raw.get("offer_id")
+        or raw.get("sku")
+        or raw.get("product_id")
     )
+    product_name_fields = [
+        product_block.get("name"),
+        product_block.get("title"),
+        product_block.get("product_name"),
+        product_block.get("productTitle"),
+        raw.get("product_title"),
+        raw.get("product_name"),
+        raw.get("title"),
+        raw.get("product_title_text"),
+        raw.get("productTitle"),
+    ]
+    product_name = next((str(v).strip() for v in product_name_fields if v not in (None, "")), None)
 
     # NEW: приводим идентификаторы к строкам, чтобы избежать ошибок .strip() для int
-    offer_id = str(offer_id) if offer_id is not None else None
-    product_id = str(product_id) if product_id is not None else None
+    offer_id = str(offer_id_raw) if offer_id_raw is not None else None
+    product_id = str(product_id_raw) if product_id_raw is not None else None
 
     created_candidates = [
         raw.get("created_at"),
@@ -492,14 +512,30 @@ def _calc_stats(cards: List[ReviewCard]) -> Tuple[int, float, Dict[int, int]]:
     return total, avg, dist
 
 
+def _product_article(card: ReviewCard) -> tuple[str | None, str | None]:
+    if card.offer_id:
+        return "SKU", card.offer_id
+    if card.product_id:
+        return "ID", card.product_id
+    return None, None
+
+
 def _pick_product_label(card: ReviewCard) -> str:
-    product_id = card.product_id or card.offer_id
-    product = card.product_name or ""
+    product = (card.product_name or "").strip()
+    article_label, article_value = _product_article(card)
+
+    if product and article_label and article_value:
+        return f"{product} ({article_label}: {article_value})"
+    if product and card.product_id:
+        return f"{product} (ID: {card.product_id})"
     if product:
-        return f"{product} (ID: {product_id})" if product_id else product
-    if product_id:
-        return f"ID {product_id} (не найден в каталоге)"
-    return "— (название недоступно)"
+        return product
+    if article_label and article_value:
+        title = "Артикул" if article_label == "SKU" else article_label
+        return f"{title}: {article_value}"
+    if card.product_id:
+        return f"ID: {card.product_id}"
+    return "—"
 
 
 def _pick_short_product_label(card: ReviewCard) -> str:
@@ -508,13 +544,15 @@ def _pick_short_product_label(card: ReviewCard) -> str:
     name_raw = card.product_name
     name = str(name_raw).strip() if name_raw is not None else ""
 
-    product_id_raw = card.product_id or card.offer_id
-    product_id = str(product_id_raw).strip() if product_id_raw is not None else ""
+    article_label, article_value = _product_article(card)
 
     if name:
         return name[:47] + "…" if len(name) > 50 else name
-    if product_id:
-        return f"ID {product_id} (не найден в каталоге)"
+    if article_label and article_value:
+        title = "Артикул" if article_label == "SKU" else article_label
+        return f"{title}: {article_value}"
+    if card.product_id:
+        return f"ID: {card.product_id}"
     return "—"
 
 
@@ -540,20 +578,22 @@ def format_review_card_text(
         title_parts.append(date_line)
     title = " • ".join(title_parts) if title_parts else "Отзыв"
 
-    lines = [f"⭐ {title}", f"Позиция: {product_line}"]
-    if card.id:
-        lines.append(f"ID отзыва: {card.id}")
-
-    lines.extend([
+    text_body = card.text or "(пустой отзыв)"
+    lines = [
+        f"{title} • {period_title}",
+        "",
+        f"Позиция: {product_line}",
         "",
         "Текст отзыва:",
-        card.text or "(пустой отзыв)",
+        text_body,
         "",
         f"Статус: {status}",
         "",
         "Текущий ответ:",
         answer_text,
-    ])
+    ]
+    if card.id:
+        lines.insert(3, f"ID отзыва: {card.id}")
 
     body = "\n".join(lines).strip()
     return trim_for_telegram(body)
@@ -575,22 +615,27 @@ async def _resolve_product_names(
     for card in cards:
         if not card.product_id:
             continue
+
+        if card.product_name:
+            cache.setdefault(card.product_id, card.product_name)
+            _product_name_cache.setdefault(card.product_id, card.product_name)
+            continue
+
         if card.product_id in cache:
-            if not card.product_name:
-                card.product_name = cache[card.product_id]
+            card.product_name = cache[card.product_id]
             continue
+
         if card.product_id in _product_name_cache:
-            cache[card.product_id] = _product_name_cache[card.product_id]
-            if not card.product_name:
-                card.product_name = cache[card.product_id]
+            cached_name = _product_name_cache[card.product_id]
+            cache[card.product_id] = cached_name
+            card.product_name = cached_name
             continue
-        if not card.product_name:
+
+        if card.product_id not in missing_ids:
             missing_ids.append(card.product_id)
 
-    unique_ids = [pid for pid in dict.fromkeys(missing_ids) if pid]
+    unique_ids = [pid for pid in missing_ids if pid and pid not in cache]
     for pid in unique_ids:
-        if pid in cache:
-            continue
         try:
             title = await client.get_product_name(pid)
         except Exception as exc:
