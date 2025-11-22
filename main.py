@@ -263,40 +263,52 @@ async def _send_review_card(
     if list_msg and target and target.message_id == list_msg[1]:
         target = None  # Не трогаем сообщение-таблицу
 
-    active_bot = target.bot if target else (callback.message.bot if callback else None)
-    active_chat = target.chat.id if target else (callback.message.chat.id if callback else None)
-    stored = _review_card_messages.get(user_id)
-    preferred_id = stored[1] if stored else None
+    active_bot = None
+    active_chat = None
+    if target:
+        active_bot = target.bot
+        active_chat = target.chat.id
+    elif callback and callback.message:
+        active_bot = callback.message.bot
+        active_chat = callback.message.chat.id
 
-    if active_bot and active_chat and preferred_id:
+    if not active_bot or active_chat is None:
+        return
+
+    stored = _review_card_messages.get(user_id)
+    preferred_chat_id, preferred_msg_id = stored if stored else (None, None)
+
+    if preferred_msg_id and preferred_chat_id == active_chat:
         try:
             edited = await active_bot.edit_message_text(
                 text=text,
-                chat_id=active_chat,
-                message_id=preferred_id,
+                chat_id=preferred_chat_id,
+                message_id=preferred_msg_id,
                 reply_markup=markup,
             )
-            _remember_card_message(user_id, active_chat, edited.message_id)
+            _remember_card_message(user_id, preferred_chat_id, edited.message_id)
             return
         except TelegramBadRequest:
             with suppress(Exception):
-                await delete_message_safe(active_bot, active_chat, preferred_id)
+                await delete_message_safe(active_bot, preferred_chat_id, preferred_msg_id)
 
-    if target and active_bot and active_chat:
+    if target:
         try:
             edited = await target.edit_text(text, reply_markup=markup)
             _remember_card_message(user_id, active_chat, edited.message_id)
+            if preferred_msg_id and preferred_msg_id != edited.message_id:
+                with suppress(Exception):
+                    await delete_message_safe(active_bot, active_chat, preferred_msg_id)
             return
         except TelegramBadRequest:
             with suppress(Exception):
                 await delete_message_safe(active_bot, active_chat, target.message_id)
 
-    if active_bot and active_chat:
-        sent = await active_bot.send_message(active_chat, text, reply_markup=markup)
-        if target and target.message_id != sent.message_id:
-            with suppress(Exception):
-                await delete_message_safe(active_bot, active_chat, target.message_id)
-        _remember_card_message(user_id, active_chat, sent.message_id)
+    sent = await active_bot.send_message(active_chat, text, reply_markup=markup)
+    _remember_card_message(user_id, active_chat, sent.message_id)
+    if preferred_msg_id and preferred_msg_id != sent.message_id:
+        with suppress(Exception):
+            await delete_message_safe(active_bot, active_chat, preferred_msg_id)
 
 
 def _get_local_answer(user_id: int, review_id: str | None) -> str | None:
@@ -347,7 +359,9 @@ async def _handle_ai_reply(
         await target.answer("⚠️ Не удалось получить ответ от ИИ")
         return
 
-    _remember_local_answer(user_id, review.id, draft)
+    final_answer = draft
+    _remember_local_answer(user_id, review.id, final_answer)
+    mark_review_answered(review.id, user_id, final_answer)
     await _send_review_card(
         user_id=user_id,
         category=category,
@@ -356,7 +370,7 @@ async def _handle_ai_reply(
         message=target if isinstance(target, Message) else None,
         review_id=review.id,
         page=page,
-        answer_override=draft,
+        answer_override=final_answer,
     )
 
 
