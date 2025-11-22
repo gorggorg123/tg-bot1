@@ -1,4 +1,3 @@
-# botapp/reviews.py
 from __future__ import annotations
 
 import logging
@@ -13,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_RECENT_DAYS = 30
 MAX_REVIEW_LEN = 450
-MAX_REVIEWS_LOAD = 200
+MAX_REVIEWS_LOAD = 2000  # было 200 — из-за этого брали только 200 старых отзывов
 MSK_SHIFT = timedelta(hours=3)
 MSK_TZ = timezone(MSK_SHIFT)
 TELEGRAM_SOFT_LIMIT = 4000
@@ -692,7 +691,7 @@ async def fetch_recent_reviews(
                 _to_msk(sample.created_at),
             )
     logger.info(
-        "Reviews after filter: %s items for period=%s (MSK), filter=all | unanswered=%s | answered=%s | missing_dates=%s | dropped_by_date=%s",
+        "Reviews after filter: %s items for period=%s (МСК), filter=all | unanswered=%s | answered=%s | missing_dates=%s | dropped_by_date=%s",
         len(filtered_cards),
         pretty,
         unanswered_count,
