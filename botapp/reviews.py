@@ -648,6 +648,14 @@ async def fetch_recent_reviews(
     unanswered_count = len(filter_reviews(filtered_cards, answer_filter="unanswered"))
     answered_count = len(filter_reviews(filtered_cards, answer_filter="answered"))
 
+    raw_dates_utc = [dt for dt in (_to_utc(c.created_at) for c in cards) if dt]
+    raw_dates_msk = [dt.astimezone(MSK_TZ) for dt in raw_dates_utc]
+    filtered_dates_msk = [dt for dt in (_to_msk(c.created_at) for c in filtered_cards) if dt]
+
+    year_counts: dict[int, int] = {}
+    for dt in raw_dates_utc:
+        year_counts[dt.year] = year_counts.get(dt.year, 0) + 1
+
     logger.info(
         "Reviews fetched from API: %s items (UTC range: %s — %s) | filter_msk_dates=%s..%s",
         len(raw),
@@ -657,13 +665,12 @@ async def fetch_recent_reviews(
         filter_to_date,
     )
 
-    raw_dates_msk = [dt for dt in (_to_msk(c.created_at) for c in cards) if dt]
-    filtered_dates_msk = [dt for dt in (_to_msk(c.created_at) for c in filtered_cards) if dt]
-
     logger.info(
-        "Reviews date span (MSK): raw=%s filtered=%s",
+        "Reviews date span (MSK): raw=%s filtered=%s | raw_span_utc=%s | year_counts=%s",
         _range_summary_msk(raw_dates_msk),
         _range_summary_msk(filtered_dates_msk),
+        _range_summary_msk(raw_dates_utc),
+        year_counts,
     )
 
     if stats.get("dropped_by_date") == len(cards) and cards:

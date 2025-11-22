@@ -29,7 +29,15 @@ _product_not_found_warned: set[str] = set()
 
 def _iso_z(dt: datetime) -> str:
     """Вернуть ISO-строку в UTC с Z без миллисекунд."""
-    return dt.replace(microsecond=0).isoformat() + "Z"
+
+    dt_utc = _ensure_utc(dt)
+    return dt_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    if dt.tzinfo:
+        return dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=timezone.utc)
 
 
 def _ensure_utc(dt: datetime) -> datetime:
@@ -324,7 +332,6 @@ class OzonClient:
         date_to: datetime,
         *,
         limit_per_page: int = 80,
-        offset: int = 0,
         max_count: int | None = 200,
     ) -> List[Dict[str, Any]]:
         """Загрузить отзывы через /v1/review/list c контролем лимитов.
@@ -341,19 +348,27 @@ class OzonClient:
         date_from_utc = _ensure_utc(date_from)
         date_to_utc = _ensure_utc(date_to)
         date_filter = {
-            "from": date_from_utc.date().isoformat(),
-            "to": date_to_utc.date().isoformat(),
+            "from": _iso_z(date_from_utc),
+            "to": _iso_z(date_to_utc),
         }
 
         reviews: List[Dict[str, Any]] = []
-        current_offset = max(0, offset)
+        current_offset = 0
+        last_id: str | None = None
+        pages = 0
 
         while len(reviews) < max_reviews:
-            body = {
+            body: Dict[str, Any] = {
                 "limit": safe_limit,
-                "offset": current_offset,
                 "filter": {"date": date_filter},
             }
+
+            # Ozon поддерживает пагинацию либо через offset, либо через last_id + has_next.
+            # Отдаём предпочтение last_id, если он уже получен на предыдущих страницах.
+            if last_id:
+                body["last_id"] = last_id
+            else:
+                body["offset"] = current_offset
 
             data = await self.post("/v1/review/list", body)
             if not isinstance(data, dict):
@@ -363,31 +378,51 @@ class OzonClient:
             res = data.get("result") or data
             if isinstance(res, dict):
                 arr = res.get("reviews") or res.get("feedbacks") or res.get("items") or []
+                has_next = bool(res.get("has_next") or res.get("hasNext"))
+                next_last_id = res.get("last_id") or res.get("lastId")
             elif isinstance(res, list):
                 arr = res
+                has_next = False
+                next_last_id = None
             else:
                 arr = []
+                has_next = False
+                next_last_id = None
 
             page_items = [r for r in arr if isinstance(r, dict)]
             if not page_items:
                 break
 
             reviews.extend(page_items)
+            pages += 1
+
+            if len(reviews) >= max_reviews:
+                break
+
+            if has_next and next_last_id:
+                last_id = str(next_last_id)
+                continue
+
+            if has_next:
+                current_offset += safe_limit
+                continue
 
             if len(page_items) < safe_limit:
                 break
 
+            # В случаях без has_next двигаемся по offset, но всё равно ограничиваем max_reviews.
             current_offset += safe_limit
             if current_offset >= max_reviews:
                 break
 
         logger.info(
-            "Reviews fetched: %s items for %s..%s limit=%s offset_start=%s max=%s",
+            "Reviews fetched: %s items for %s..%s limit=%s offset_start=%s pages=%s max=%s",
             len(reviews),
             date_filter.get("from"),
             date_filter.get("to"),
             safe_limit,
-            offset,
+            0,
+            pages,
             max_count,
         )
         return reviews[:max_reviews]
