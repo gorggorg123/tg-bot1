@@ -678,6 +678,16 @@ def has_write_credentials() -> bool:
 
     return bool((os.getenv("OZON_WRITE_API_KEY") or "").strip())
 
+    cid = (os.getenv("OZON_CLIENT_ID_WRITE") or os.getenv("OZON_CLIENT_ID") or "").strip()
+    key = (os.getenv("OZON_API_KEY_WRITE") or os.getenv("OZON_API_KEY") or "").strip()
+    return bool(cid and key)
+
+
+def get_client(*, write: bool = False) -> OzonClient:
+    """Ленивая инициализация клиента с учётом .env.
+
+    По умолчанию используется read-пара, для записи передайте write=True.
+    """
 
 def get_client() -> OzonClient:
     """Ленивая инициализация клиента для чтения."""
