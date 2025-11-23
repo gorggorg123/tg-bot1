@@ -28,7 +28,7 @@ _product_not_found_warned: set[str] = set()
 
 
 def _parse_sku_title_map(payload: Dict[str, Any] | None) -> tuple[Dict[str, str], list[Any]]:
-    """Построить мапу sku -> title из ответа /v3/analytics/data."""
+    """Построить мапу sku -> title из ответа /v1/analytics/data."""
 
     if not isinstance(payload, dict):
         return {}, []
@@ -43,20 +43,33 @@ def _parse_sku_title_map(payload: Dict[str, Any] | None) -> tuple[Dict[str, str]
         if not isinstance(row, dict):
             continue
         dimensions = row.get("dimensions") if isinstance(row.get("dimensions"), list) else []
-        for dim in dimensions:
-            if not isinstance(dim, dict):
-                continue
-            if dim.get("id") != "sku":
-                continue
-            sku_val = dim.get("value") or dim.get("id_value") or dim.get("sku")
-            title_val = dim.get("name") or dim.get("title") or dim.get("description")
-            if sku_val in (None, ""):
-                continue
-            sku_key = str(sku_val).strip()
-            if not sku_key:
-                continue
-            if title_val not in (None, ""):
-                sku_title_map[sku_key] = str(title_val).strip()
+        if not dimensions:
+            continue
+
+        sku_key: str | None = None
+        title_val: Any = None
+
+        legacy_dim = next(
+            (dim for dim in dimensions if isinstance(dim, dict) and dim.get("id") == "sku"),
+            None,
+        )
+        if isinstance(legacy_dim, dict):
+            sku_raw = legacy_dim.get("value") or legacy_dim.get("id_value") or legacy_dim.get("sku")
+            title_val = legacy_dim.get("name") or legacy_dim.get("title") or legacy_dim.get("description")
+            sku_key = str(sku_raw).strip() if sku_raw not in (None, "") else None
+
+        if sku_key is None:
+            first_dim = next((dim for dim in dimensions if isinstance(dim, dict)), None)
+            if isinstance(first_dim, dict):
+                sku_raw = first_dim.get("value") or first_dim.get("id") or first_dim.get("sku")
+                title_val = first_dim.get("name") or first_dim.get("title") or title_val
+                sku_key = str(sku_raw).strip() if sku_raw not in (None, "") else None
+
+        if not sku_key:
+            continue
+
+        if title_val not in (None, ""):
+            sku_title_map[sku_key] = str(title_val).strip()
 
     return sku_title_map, data_rows
 
@@ -172,11 +185,15 @@ def s_num(x: Any) -> float:
         return 0.0
 
 
-def _env_credentials() -> tuple[str, str]:
+def _env_read_credentials() -> tuple[str, str]:
+    """Прочитать пару Client-Id/Api-Key для чтения."""
+
     client_id = (os.getenv("OZON_CLIENT_ID") or "").strip()
     api_key = (os.getenv("OZON_API_KEY") or "").strip()
+
     if not client_id or not api_key:
-        raise RuntimeError("Не заданы OZON_CLIENT_ID / OZON_API_KEY")
+        raise RuntimeError("Не заданы креденшалы OZON_CLIENT_ID / OZON_API_KEY")
+
     return client_id, api_key
 
 
@@ -487,10 +504,46 @@ class OzonClient:
         }
         return await self._post_with_status("/v1/review/list", body)
 
+    async def create_review_comment(
+        self,
+        review_id: str,
+        text: str,
+        mark_as_processed: bool = True,
+        parent_comment_id: str | None = None,
+    ) -> dict:
+        body: dict[str, Any] = {
+            "review_id": review_id,
+            "text": text,
+            "mark_review_as_processed": mark_as_processed,
+        }
+        if parent_comment_id:
+            body["parent_comment_id"] = parent_comment_id
+
+        try:
+            res = await self.post("/v1/review/comment/create", body)
+        except httpx.HTTPStatusError as exc:
+            logger.warning(
+                "Failed to create review comment %s HTTP %s: %s",
+                review_id,
+                exc.response.status_code,
+                exc,
+            )
+            raise
+        except Exception as exc:
+            logger.warning("Failed to create review comment %s: %s", review_id, exc)
+            raise
+
+        logger.info(
+            "Review %s comment created via /v1/review/comment/create: %s",
+            review_id,
+            res,
+        )
+        return res
+
     async def get_analytics_by_sku(
         self, date_from: str, date_to: str, *, limit: int = 1000, offset: int = 0
     ) -> tuple[int, Dict[str, Any] | None]:
-        """Вызов /v3/analytics/data для получения метаданных по SKU."""
+        """Вызов /v1/analytics/data для получения метаданных по SKU."""
 
         body = {
             "date_from": date_from,
@@ -502,18 +555,23 @@ class OzonClient:
             "limit": max(1, min(limit, 1000)),
             "offset": max(0, offset),
         }
-        return await self._post_with_status("/v3/analytics/data", body)
+        return await self._post_with_status("/v1/analytics/data", body)
 
     async def get_sku_title_map(
         self, date_from: str, date_to: str, *, limit: int = 1000, offset: int = 0
     ) -> tuple[int, Dict[str, str], list[Any]]:
-        """Получить мапу SKU -> название через /v3/analytics/data."""
+        """Получить мапу SKU -> название через /v1/analytics/data."""
 
         status, payload = await self.get_analytics_by_sku(
             date_from, date_to, limit=limit, offset=offset
         )
         if status >= 400:
-            logger.warning("Analytics HTTP %s for %s..%s", status, date_from, date_to)
+            logger.warning(
+                "Analytics /v1/analytics/data HTTP %s for %s..%s",
+                status,
+                date_from,
+                date_to,
+            )
         if not isinstance(payload, dict):
             return status, {}, []
 
@@ -611,14 +669,44 @@ class OzonClient:
     get_account_info = get_seller_info
 
 
-_client: OzonClient | None = None
+_client_read: OzonClient | None = None
+_client_write: OzonClient | None = None
+
+
+def has_write_credentials() -> bool:
+    """Проверить наличие write-ключа в окружении."""
+
+    return bool((os.getenv("OZON_WRITE_API_KEY") or "").strip())
 
 
 def get_client() -> OzonClient:
-    """Ленивая инициализация клиента с учётом .env."""
-    global _client
-    if _client is None:
-        client_id, api_key = _env_credentials()
-        _client = OzonClient(client_id=client_id, api_key=api_key)
-    return _client
+    """Ленивая инициализация клиента для чтения."""
+
+    global _client_read
+    if _client_read is None:
+        client_id, api_key = _env_read_credentials()
+        _client_read = OzonClient(client_id=client_id, api_key=api_key)
+    return _client_read
+
+
+def get_write_client() -> OzonClient | None:
+    """Получить write-клиент, если ключ в окружении задан."""
+
+    global _client_write
+    api_key = (os.getenv("OZON_WRITE_API_KEY") or "").strip()
+    if not api_key:
+        return None
+
+    client_id = (
+        os.getenv("OZON_WRITE_CLIENT_ID")
+        or os.getenv("OZON_CLIENT_ID")
+        or ""
+    ).strip()
+    if not client_id:
+        logger.warning("OZON_WRITE_API_KEY задан, но OZON_WRITE_CLIENT_ID пуст")
+        return None
+
+    if _client_write is None:
+        _client_write = OzonClient(client_id=client_id, api_key=api_key)
+    return _client_write
 

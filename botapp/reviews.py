@@ -646,7 +646,7 @@ async def _resolve_product_names(
         if not card.product_id and card.offer_id:
             card.product_id = card.offer_id
 
-        sku = next((v for v in (card.offer_id, card.product_id) if v), None)
+        sku = card.product_id
         if not sku:
             continue
 
@@ -685,9 +685,41 @@ async def _resolve_product_names(
         _product_name_cache[sku] = title
 
     for card in cards:
-        sku = next((v for v in (card.offer_id, card.product_id) if v), None)
-        if sku and not card.product_name:
-            card.product_name = cache.get(sku) or _product_name_cache.get(sku) or card.product_name
+        if card.product_name:
+            continue
+
+        sku = card.product_id or card.offer_id
+        if not sku:
+            continue
+
+        cached_name = cache.get(sku)
+        if cached_name is None and sku in _product_name_cache:
+            cached_name = _product_name_cache.get(sku)
+            cache.setdefault(sku, cached_name)
+
+        if cached_name:
+            card.product_name = cached_name
+
+    missing_ids: set[str] = {
+        card.product_id
+        for card in cards
+        if card.product_id and not card.product_name and card.product_id not in cache and card.product_id not in _product_name_cache
+    }
+
+    for product_id in missing_ids:
+        name: str | None = None
+        try:
+            name = await client.get_product_name(product_id)
+        except Exception as exc:
+            logger.warning("Failed to fetch product name for %s: %s", product_id, exc)
+
+        cache[product_id] = name
+        _product_name_cache[product_id] = name
+
+        if name:
+            for card in cards:
+                if card.product_id == product_id and not card.product_name:
+                    card.product_name = name
 
 
 async def fetch_recent_reviews(

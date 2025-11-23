@@ -12,6 +12,8 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
+from botapp.ozon_client import has_write_credentials
+
 
 class MenuCallbackData(CallbackData, prefix="menu"):
     """Универсальный callback для внутренних меню.
@@ -144,35 +146,52 @@ def reviews_navigation_keyboard(
     return review_card_keyboard(category=category, page=0, review_id=review_id)
 
 
-def review_card_keyboard(*, category: str, page: int, review_id: str | None) -> InlineKeyboardMarkup:
+def review_card_keyboard(
+    *, category: str, page: int, review_id: str | None, can_send: bool = True
+) -> InlineKeyboardMarkup:
     """Кнопки под карточкой отзыва."""
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="✉️ Ответ через ИИ",
+                callback_data=ReviewsCallbackData(
+                    action="card_ai", category=category, page=page, review_id=review_id
+                ).pack(),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🔁 Пересобрать по моему промту",
+                callback_data=ReviewsCallbackData(
+                    action="card_reprompt", category=category, page=page, review_id=review_id
+                ).pack(),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="✏️ Ввести ответ вручную",
+                callback_data=ReviewsCallbackData(
+                    action="card_manual", category=category, page=page, review_id=review_id
+                ).pack(),
+            ),
+        ],
+    ]
+
+    if can_send and has_write_credentials():
+        rows.append(
             [
                 InlineKeyboardButton(
-                    text="✉️ Ответ через ИИ",
+                    text="✅ Отправить на Ozon",
                     callback_data=ReviewsCallbackData(
-                        action="card_ai", category=category, page=page, review_id=review_id
+                        action="send", category=category, page=page, review_id=review_id
                     ).pack(),
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔁 Пересобрать по моему промту",
-                    callback_data=ReviewsCallbackData(
-                        action="card_reprompt", category=category, page=page, review_id=review_id
-                    ).pack(),
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✏️ Ввести ответ вручную",
-                    callback_data=ReviewsCallbackData(
-                        action="card_manual", category=category, page=page, review_id=review_id
-                    ).pack(),
-                ),
-            ],
+            ]
+        )
+
+    rows.extend(
+        [
             [
                 InlineKeyboardButton(
                     text="⬅️ Назад к списку",
@@ -189,6 +208,8 @@ def review_card_keyboard(*, category: str, page: int, review_id: str | None) -> 
             ],
         ]
     )
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def reviews_list_keyboard(
