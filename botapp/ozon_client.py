@@ -27,6 +27,40 @@ _product_name_cache: dict[str, str | None] = {}
 _product_not_found_warned: set[str] = set()
 
 
+def _parse_sku_title_map(payload: Dict[str, Any] | None) -> tuple[Dict[str, str], list[Any]]:
+    """Построить мапу sku -> title из ответа /v3/analytics/data."""
+
+    if not isinstance(payload, dict):
+        return {}, []
+
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+    data_rows = result.get("data") if isinstance(result, dict) else []
+    if not isinstance(data_rows, list):
+        return {}, []
+
+    sku_title_map: Dict[str, str] = {}
+    for row in data_rows:
+        if not isinstance(row, dict):
+            continue
+        dimensions = row.get("dimensions") if isinstance(row.get("dimensions"), list) else []
+        for dim in dimensions:
+            if not isinstance(dim, dict):
+                continue
+            if dim.get("id") != "sku":
+                continue
+            sku_val = dim.get("value") or dim.get("id_value") or dim.get("sku")
+            title_val = dim.get("name") or dim.get("title") or dim.get("description")
+            if sku_val in (None, ""):
+                continue
+            sku_key = str(sku_val).strip()
+            if not sku_key:
+                continue
+            if title_val not in (None, ""):
+                sku_title_map[sku_key] = str(title_val).strip()
+
+    return sku_title_map, data_rows
+
+
 def _iso_z(dt: datetime) -> str:
     """Вернуть ISO-строку в UTC с Z без миллисекунд."""
 
@@ -469,6 +503,22 @@ class OzonClient:
             "offset": max(0, offset),
         }
         return await self._post_with_status("/v3/analytics/data", body)
+
+    async def get_sku_title_map(
+        self, date_from: str, date_to: str, *, limit: int = 1000, offset: int = 0
+    ) -> tuple[int, Dict[str, str], list[Any]]:
+        """Получить мапу SKU -> название через /v3/analytics/data."""
+
+        status, payload = await self.get_analytics_by_sku(
+            date_from, date_to, limit=limit, offset=offset
+        )
+        if status >= 400:
+            logger.warning("Analytics HTTP %s for %s..%s", status, date_from, date_to)
+        if not isinstance(payload, dict):
+            return status, {}, []
+
+        sku_title_map, sample_rows = _parse_sku_title_map(payload)
+        return status, sku_title_map, sample_rows
 
     async def get_product_name(self, product_id: str) -> str | None:
         """Получить название товара по product_id с кэшем и мягкими фолбэками."""

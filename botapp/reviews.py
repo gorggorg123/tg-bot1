@@ -451,7 +451,12 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
 
     product_block_raw = raw.get("product") or raw.get("product_info") or {}
     product_block = product_block_raw if isinstance(product_block_raw, dict) else {}
-    product_id_raw = raw.get("product_id") or raw.get("sku") or product_block.get("product_id")
+    product_id_raw = (
+        raw.get("sku")
+        or product_block.get("sku")
+        or raw.get("product_id")
+        or product_block.get("product_id")
+    )
     offer_id_raw = (
         product_block.get("offer_id")
         or raw.get("offer_id")
@@ -627,43 +632,62 @@ def _iso_date(dt: datetime) -> str:
 
 
 async def _resolve_product_names(
-    cards: List[ReviewCard], client: OzonClient, product_cache: Dict[str, str | None] | None = None
+    cards: List[ReviewCard],
+    client: OzonClient,
+    product_cache: Dict[str, str | None] | None = None,
+    *,
+    analytics_from: str | None = None,
+    analytics_to: str | None = None,
 ) -> None:
     cache = product_cache if product_cache is not None else {}
 
-    missing_ids: set[str] = set()
+    sku_set: set[str] = set()
     for card in cards:
-        if not card.product_id:
+        if not card.product_id and card.offer_id:
+            card.product_id = card.offer_id
+
+        sku = next((v for v in (card.offer_id, card.product_id) if v), None)
+        if not sku:
             continue
 
         if card.product_name:
-            cache.setdefault(card.product_id, card.product_name)
-            _product_name_cache.setdefault(card.product_id, card.product_name)
+            cache.setdefault(sku, card.product_name)
+            _product_name_cache.setdefault(sku, card.product_name)
             continue
 
-        cached_name = cache.get(card.product_id)
-        if cached_name is None and card.product_id in _product_name_cache:
-            cached_name = _product_name_cache[card.product_id]
-            cache[card.product_id] = cached_name
+        cached_name = cache.get(sku)
+        if cached_name is None and sku in _product_name_cache:
+            cached_name = _product_name_cache[sku]
+            cache[sku] = cached_name
 
-        if cached_name is not None:
+        if cached_name:
             card.product_name = cached_name
             continue
 
-        missing_ids.add(card.product_id)
+        sku_set.add(sku)
 
-    for pid in missing_ids:
+    fetched_map: Dict[str, str] = {}
+    if sku_set and analytics_from and analytics_to:
         try:
-            title = await client.get_product_name(pid)
+            status, fetched_map, _ = await client.get_sku_title_map(
+                analytics_from, analytics_to, limit=1000, offset=0
+            )
+            if status != 200:
+                logger.warning(
+                    "SKU analytics HTTP %s while resolving %s products", status, len(sku_set)
+                )
+                fetched_map = {}
         except Exception as exc:
-            logger.warning("Failed to fetch product name for %s: %s", pid, exc)
-            title = None
-        cache[pid] = title
-        _product_name_cache[pid] = title
+            logger.warning("Failed to fetch SKU analytics: %s", exc)
+
+    for sku, title in fetched_map.items():
+        cache[sku] = title
+        _product_name_cache[sku] = title
 
     for card in cards:
-        if card.product_id and not card.product_name:
-            card.product_name = cache.get(card.product_id) or _product_name_cache.get(card.product_id) or card.product_name
+        sku = next((v for v in (card.offer_id, card.product_id) if v), None)
+        if sku and not card.product_name:
+            card.product_name = cache.get(sku) or _product_name_cache.get(sku) or card.product_name
 
 
 async def fetch_recent_reviews(
@@ -683,6 +707,8 @@ async def fetch_recent_reviews(
     fetch_since_msk = since_msk - timedelta(days=2)
     fetch_from_utc = _to_utc(fetch_since_msk)
     fetch_to_utc = _to_utc(to_msk)
+    analytics_from = _iso_date(fetch_from_utc or fetch_since_msk)
+    analytics_to = _iso_date(fetch_to_utc or to_msk)
     raw = await client.get_reviews(
         fetch_from_utc or fetch_since_msk,
         fetch_to_utc or to_msk,
@@ -702,7 +728,13 @@ async def fetch_recent_reviews(
         period_to_msk=filter_to_date,
         answer_filter="all",
     )
-    await _resolve_product_names(filtered_cards, client, product_cache)
+    await _resolve_product_names(
+        filtered_cards,
+        client,
+        product_cache,
+        analytics_from=analytics_from,
+        analytics_to=analytics_to,
+    )
     filtered_cards.sort(
         key=lambda c: _to_msk(c.created_at) or datetime.min.replace(tzinfo=MSK_TZ),
         reverse=True,
@@ -1019,40 +1051,6 @@ def _collect_review_sku(
     return sku, product_id_orig, product_block, sku_raw
 
 
-def _build_sku_title_map(payload: Dict[str, Any] | None) -> tuple[Dict[str, str], list[Any]]:
-    """Построить мапу sku -> title из ответа /v3/analytics/data."""
-
-    if not isinstance(payload, dict):
-        return {}, []
-
-    result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
-    data_rows = result.get("data") if isinstance(result, dict) else []
-    if not isinstance(data_rows, list):
-        return {}, []
-
-    sku_title_map: Dict[str, str] = {}
-    for row in data_rows:
-        if not isinstance(row, dict):
-            continue
-        dimensions = row.get("dimensions") if isinstance(row.get("dimensions"), list) else []
-        for dim in dimensions:
-            if not isinstance(dim, dict):
-                continue
-            if dim.get("id") != "sku":
-                continue
-            sku_val = dim.get("value") or dim.get("id_value") or dim.get("sku")
-            title_val = dim.get("name") or dim.get("title") or dim.get("description")
-            if sku_val in (None, ""):
-                continue
-            sku_key = str(sku_val).strip()
-            if not sku_key:
-                continue
-            if title_val not in (None, ""):
-                sku_title_map[sku_key] = str(title_val).strip()
-
-    return sku_title_map, data_rows[:API_ANALYTICS_SAMPLE_LIMIT]
-
-
 async def build_reviews_preview(
     *, days: int = DEFAULT_RECENT_DAYS, client: OzonClient | None = None
 ) -> Dict[str, Any]:
@@ -1129,10 +1127,10 @@ async def build_reviews_preview(
 
     if sku_set:
         try:
-            analytics_status, analytics_payload = await client.get_analytics_by_sku(
+            analytics_status, sku_title_map, sample_rows = await client.get_sku_title_map(
                 analytics_from, analytics_to, limit=1000, offset=0
             )
-            sku_title_map, analytics_sample = _build_sku_title_map(analytics_payload)
+            analytics_sample = sample_rows[:API_ANALYTICS_SAMPLE_LIMIT]
             if analytics_status != 200:
                 analytics_error = f"Analytics HTTP {analytics_status}"
         except Exception as exc:  # pragma: no cover - сетевые ошибки
