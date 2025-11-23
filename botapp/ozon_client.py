@@ -43,20 +43,33 @@ def _parse_sku_title_map(payload: Dict[str, Any] | None) -> tuple[Dict[str, str]
         if not isinstance(row, dict):
             continue
         dimensions = row.get("dimensions") if isinstance(row.get("dimensions"), list) else []
-        for dim in dimensions:
-            if not isinstance(dim, dict):
-                continue
-            if dim.get("id") != "sku":
-                continue
-            sku_val = dim.get("value") or dim.get("id_value") or dim.get("sku")
-            title_val = dim.get("name") or dim.get("title") or dim.get("description")
-            if sku_val in (None, ""):
-                continue
-            sku_key = str(sku_val).strip()
-            if not sku_key:
-                continue
-            if title_val not in (None, ""):
-                sku_title_map[sku_key] = str(title_val).strip()
+        if not dimensions:
+            continue
+
+        sku_key: str | None = None
+        title_val: Any = None
+
+        legacy_dim = next(
+            (dim for dim in dimensions if isinstance(dim, dict) and dim.get("id") == "sku"),
+            None,
+        )
+        if isinstance(legacy_dim, dict):
+            sku_raw = legacy_dim.get("value") or legacy_dim.get("id_value") or legacy_dim.get("sku")
+            title_val = legacy_dim.get("name") or legacy_dim.get("title") or legacy_dim.get("description")
+            sku_key = str(sku_raw).strip() if sku_raw not in (None, "") else None
+
+        if sku_key is None:
+            first_dim = next((dim for dim in dimensions if isinstance(dim, dict)), None)
+            if isinstance(first_dim, dict):
+                sku_raw = first_dim.get("value") or first_dim.get("id") or first_dim.get("sku")
+                title_val = first_dim.get("name") or first_dim.get("title") or title_val
+                sku_key = str(sku_raw).strip() if sku_raw not in (None, "") else None
+
+        if not sku_key:
+            continue
+
+        if title_val not in (None, ""):
+            sku_title_map[sku_key] = str(title_val).strip()
 
     return sku_title_map, data_rows
 
