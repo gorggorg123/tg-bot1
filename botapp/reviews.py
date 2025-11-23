@@ -27,6 +27,8 @@ _sessions: dict[int, "ReviewSession"] = {}
 _review_id_to_token: dict[int, dict[str, str]] = {}
 _token_to_review_id: dict[int, dict[str, str]] = {}
 
+API_ANALYTICS_SAMPLE_LIMIT = 5
+
 
 @dataclass
 class ReviewCard:
@@ -285,12 +287,21 @@ def encode_review_id(user_id: int, review_id: str | None) -> str | None:
     return _get_review_token(user_id, review_id)
 
 
-def mark_review_answered(review_id: str | None, user_id: int) -> None:
+def mark_review_answered(review_id: str | None, user_id: int, answer_text: str | None = None) -> None:
     if review_id:
         _answered_for_user(user_id).add(review_id)
-    # Обновим сессии, чтобы отзыв пропал из непрочитанных
-    for uid, session in _sessions.items():
-        session.rebuild_unanswered(uid)
+
+    session = _sessions.get(user_id)
+    if not session:
+        return
+
+    for card in session.all_reviews:
+        if review_id and card.id == review_id:
+            card.answered = True
+            if answer_text is not None:
+                card.answer_text = answer_text
+
+    session.rebuild_unanswered(user_id)
 
 
 def _filter_reviews_and_stats(
@@ -440,18 +451,36 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
 
     product_block_raw = raw.get("product") or raw.get("product_info") or {}
     product_block = product_block_raw if isinstance(product_block_raw, dict) else {}
-    product_id = raw.get("product_id") or raw.get("sku") or product_block.get("product_id")
-    offer_id = product_block.get("offer_id") or raw.get("offer_id") or raw.get("sku") or raw.get("product_id")
-    product_name = (
-        product_block.get("name")
-        or raw.get("product_title")
-        or raw.get("product_name")
-        or raw.get("title")
+    product_id_raw = (
+        raw.get("sku")
+        or product_block.get("sku")
+        or raw.get("product_id")
+        or product_block.get("product_id")
     )
+    offer_id_raw = (
+        product_block.get("offer_id")
+        or raw.get("offer_id")
+        or raw.get("sku")
+        or raw.get("product_id")
+    )
+    product_name_fields = [
+        product_block.get("name"),
+        product_block.get("title"),
+        product_block.get("product_name"),
+        product_block.get("productTitle"),
+        product_block.get("product_title"),
+        raw.get("product_title"),
+        raw.get("product_name"),
+        raw.get("title"),
+        raw.get("product_title_text"),
+        raw.get("productTitle"),
+        raw.get("name"),
+    ]
+    product_name = next((str(v).strip() for v in product_name_fields if v not in (None, "")), None)
 
     # NEW: приводим идентификаторы к строкам, чтобы избежать ошибок .strip() для int
-    offer_id = str(offer_id) if offer_id is not None else None
-    product_id = str(product_id) if product_id is not None else None
+    offer_id = str(offer_id_raw) if offer_id_raw is not None else None
+    product_id = str(product_id_raw) if product_id_raw is not None else None
 
     created_candidates = [
         raw.get("created_at"),
@@ -492,13 +521,29 @@ def _calc_stats(cards: List[ReviewCard]) -> Tuple[int, float, Dict[int, int]]:
     return total, avg, dist
 
 
+def _product_article(card: ReviewCard) -> tuple[str | None, str | None]:
+    if card.offer_id:
+        return "SKU", card.offer_id
+    if card.product_id:
+        return "ID", card.product_id
+    return None, None
+
+
 def _pick_product_label(card: ReviewCard) -> str:
-    product_id = card.product_id or card.offer_id
-    product = card.product_name or ""
+    product = (card.product_name or "").strip()
+    article_label, article_value = _product_article(card)
+
+    if product and article_label and article_value:
+        return f"{product} ({article_label}: {article_value})"
+    if product and card.product_id:
+        return f"{product} (ID: {card.product_id})"
     if product:
-        return f"{product} (ID: {product_id})" if product_id else product
-    if product_id:
-        return f"ID {product_id} (не найден в каталоге)"
+        return product
+    if article_label and article_value:
+        title = "Артикул" if article_label == "SKU" else article_label
+        return f"{title}: {article_value}"
+    if card.product_id:
+        return f"ID: {card.product_id}"
     return "— (название недоступно)"
 
 
@@ -508,13 +553,15 @@ def _pick_short_product_label(card: ReviewCard) -> str:
     name_raw = card.product_name
     name = str(name_raw).strip() if name_raw is not None else ""
 
-    product_id_raw = card.product_id or card.offer_id
-    product_id = str(product_id_raw).strip() if product_id_raw is not None else ""
+    article_label, article_value = _product_article(card)
 
     if name:
         return name[:47] + "…" if len(name) > 50 else name
-    if product_id:
-        return f"ID {product_id} (не найден в каталоге)"
+    if article_label and article_value:
+        title = "Артикул" if article_label == "SKU" else article_label
+        return f"{title}: {article_value}"
+    if card.product_id:
+        return f"ID: {card.product_id}"
     return "—"
 
 
@@ -540,20 +587,22 @@ def format_review_card_text(
         title_parts.append(date_line)
     title = " • ".join(title_parts) if title_parts else "Отзыв"
 
-    lines = [f"⭐ {title}", f"Позиция: {product_line}"]
-    if card.id:
-        lines.append(f"ID отзыва: {card.id}")
-
-    lines.extend([
+    text_body = card.text or "(пустой отзыв)"
+    lines = [
+        f"{title} • {period_title}",
+        "",
+        f"Позиция: {product_line}",
         "",
         "Текст отзыва:",
-        card.text or "(пустой отзыв)",
+        text_body,
         "",
         f"Статус: {status}",
         "",
         "Текущий ответ:",
         answer_text,
-    ])
+    ]
+    if card.id:
+        lines.insert(3, f"ID отзыва: {card.id}")
 
     body = "\n".join(lines).strip()
     return trim_for_telegram(body)
@@ -566,42 +615,79 @@ def trim_for_telegram(text: str, max_len: int = TELEGRAM_SOFT_LIMIT) -> str:
     return text[: max_len - len(suffix)] + suffix
 
 
+def _iso_no_ms(dt: datetime) -> str:
+    """ISO-строка без миллисекунд с суффиксом Z для UTC."""
+
+    if dt.tzinfo:
+        dt = dt.astimezone(timezone.utc)
+    else:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _iso_date(dt: datetime) -> str:
+    if dt.tzinfo:
+        dt = dt.astimezone(timezone.utc)
+    return dt.date().isoformat()
+
+
 async def _resolve_product_names(
-    cards: List[ReviewCard], client: OzonClient, product_cache: Dict[str, str | None] | None = None
+    cards: List[ReviewCard],
+    client: OzonClient,
+    product_cache: Dict[str, str | None] | None = None,
+    *,
+    analytics_from: str | None = None,
+    analytics_to: str | None = None,
 ) -> None:
     cache = product_cache if product_cache is not None else {}
 
-    missing_ids: list[str] = []
+    sku_set: set[str] = set()
     for card in cards:
-        if not card.product_id:
-            continue
-        if card.product_id in cache:
-            if not card.product_name:
-                card.product_name = cache[card.product_id]
-            continue
-        if card.product_id in _product_name_cache:
-            cache[card.product_id] = _product_name_cache[card.product_id]
-            if not card.product_name:
-                card.product_name = cache[card.product_id]
-            continue
-        if not card.product_name:
-            missing_ids.append(card.product_id)
+        if not card.product_id and card.offer_id:
+            card.product_id = card.offer_id
 
-    unique_ids = [pid for pid in dict.fromkeys(missing_ids) if pid]
-    for pid in unique_ids:
-        if pid in cache:
+        sku = next((v for v in (card.offer_id, card.product_id) if v), None)
+        if not sku:
             continue
+
+        if card.product_name:
+            cache.setdefault(sku, card.product_name)
+            _product_name_cache.setdefault(sku, card.product_name)
+            continue
+
+        cached_name = cache.get(sku)
+        if cached_name is None and sku in _product_name_cache:
+            cached_name = _product_name_cache[sku]
+            cache[sku] = cached_name
+
+        if cached_name:
+            card.product_name = cached_name
+            continue
+
+        sku_set.add(sku)
+
+    fetched_map: Dict[str, str] = {}
+    if sku_set and analytics_from and analytics_to:
         try:
-            title = await client.get_product_name(pid)
+            status, fetched_map, _ = await client.get_sku_title_map(
+                analytics_from, analytics_to, limit=1000, offset=0
+            )
+            if status != 200:
+                logger.warning(
+                    "SKU analytics HTTP %s while resolving %s products", status, len(sku_set)
+                )
+                fetched_map = {}
         except Exception as exc:
-            logger.warning("Failed to fetch product name for %s: %s", pid, exc)
-            title = None
-        cache[pid] = title
-        _product_name_cache[pid] = title
+            logger.warning("Failed to fetch SKU analytics: %s", exc)
+
+    for sku, title in fetched_map.items():
+        cache[sku] = title
+        _product_name_cache[sku] = title
 
     for card in cards:
-        if card.product_id and not card.product_name:
-            card.product_name = cache.get(card.product_id) or _product_name_cache.get(card.product_id) or card.product_name
+        sku = next((v for v in (card.offer_id, card.product_id) if v), None)
+        if sku and not card.product_name:
+            card.product_name = cache.get(sku) or _product_name_cache.get(sku) or card.product_name
 
 
 async def fetch_recent_reviews(
@@ -621,6 +707,8 @@ async def fetch_recent_reviews(
     fetch_since_msk = since_msk - timedelta(days=2)
     fetch_from_utc = _to_utc(fetch_since_msk)
     fetch_to_utc = _to_utc(to_msk)
+    analytics_from = _iso_date(fetch_from_utc or fetch_since_msk)
+    analytics_to = _iso_date(fetch_to_utc or to_msk)
     raw = await client.get_reviews(
         fetch_from_utc or fetch_since_msk,
         fetch_to_utc or to_msk,
@@ -640,7 +728,13 @@ async def fetch_recent_reviews(
         period_to_msk=filter_to_date,
         answer_filter="all",
     )
-    await _resolve_product_names(filtered_cards, client, product_cache)
+    await _resolve_product_names(
+        filtered_cards,
+        client,
+        product_cache,
+        analytics_from=analytics_from,
+        analytics_to=analytics_to,
+    )
     filtered_cards.sort(
         key=lambda c: _to_msk(c.created_at) or datetime.min.replace(tzinfo=MSK_TZ),
         reverse=True,
@@ -933,6 +1027,129 @@ async def get_reviews_menu_text() -> str:
     )
 
 
+def _collect_review_sku(
+    review: Dict[str, Any]
+) -> tuple[str | None, Any, Dict[str, Any], Any]:
+    product_block_raw = review.get("product") or review.get("product_info") or {}
+    product_block = product_block_raw if isinstance(product_block_raw, dict) else {}
+    raw_fields = review.get("raw_fields") if isinstance(review.get("raw_fields"), dict) else {}
+
+    sku_candidates = [
+        review.get("sku"),
+        product_block.get("sku"),
+        product_block.get("offer_id"),
+        product_block.get("offerId"),
+        review.get("product_id"),
+        review.get("productId"),
+        raw_fields.get("sku"),
+    ]
+    sku_raw = next((v for v in sku_candidates if v not in (None, "")), None)
+    sku = str(sku_raw).strip() if sku_raw is not None else None
+
+    product_id_orig = review.get("product_id") or product_block.get("product_id") or raw_fields.get("product_id")
+
+    return sku, product_id_orig, product_block, sku_raw
+
+
+async def build_reviews_preview(
+    *, days: int = DEFAULT_RECENT_DAYS, client: OzonClient | None = None
+) -> Dict[str, Any]:
+    """Построить JSON-ответ по отзывам и аналитике, аналогичный Cloudflare Worker."""
+
+    safe_days = max(1, days)
+    client = client or get_client()
+
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    date_start = now - timedelta(days=safe_days)
+    date_end = now
+
+    date_start_iso = _iso_no_ms(date_start)
+    date_end_iso = _iso_no_ms(date_end)
+    analytics_from = _iso_date(date_start)
+    analytics_to = _iso_date(date_end)
+
+    ozon_status, reviews_payload = await client.get_reviews_page(
+        date_start_iso, date_end_iso, limit=100, page=1
+    )
+
+    response: Dict[str, Any] = {
+        "date_from": date_start_iso,
+        "date_to": date_end_iso,
+        "ozon_status": ozon_status,
+        "reviews_count": 0,
+        "product_titles_count": 0,
+        "reviews_preview": [],
+        "analytics_status": None,
+        "analytics_error": None,
+        "analytics_sample": [],
+    }
+
+    if ozon_status != 200 or not isinstance(reviews_payload, dict):
+        response["ozon_status"] = f"HTTP {ozon_status}"
+        response["analytics_error"] = "Отзывы недоступны"
+        return response
+
+    reviews_root = reviews_payload.get("result") if isinstance(reviews_payload.get("result"), dict) else reviews_payload
+    items = reviews_root.get("reviews") or reviews_root.get("feedbacks") or reviews_root.get("items") or []
+    reviews_list = [r for r in items if isinstance(r, dict)] if isinstance(items, list) else []
+
+    previews: list[Dict[str, Any]] = []
+    sku_set: set[str] = set()
+
+    for rev in reviews_list:
+        review_id = rev.get("review_id") or rev.get("id") or rev.get("uuid")
+        rating = int(rev.get("rating") or 0)
+        text = str(rev.get("text") or rev.get("comment") or "")
+
+        sku, product_id_raw, raw_product, raw_sku = _collect_review_sku(rev)
+        if sku:
+            sku_set.add(sku)
+
+        previews.append(
+            {
+                "review_id": str(review_id) if review_id is not None else None,
+                "rating": rating,
+                "text": text,
+                "product_id": sku,
+                "product_name": None,
+                "raw_product": raw_product if raw_product else None,
+                "raw_fields": {"product_id": product_id_raw, "sku": raw_sku},
+            }
+        )
+
+    response["reviews_preview"] = previews
+    response["reviews_count"] = len(previews)
+
+    analytics_status: int | None = None
+    analytics_error: str | None = None
+    sku_title_map: Dict[str, str] = {}
+    analytics_sample: list[Any] = []
+
+    if sku_set:
+        try:
+            analytics_status, sku_title_map, sample_rows = await client.get_sku_title_map(
+                analytics_from, analytics_to, limit=1000, offset=0
+            )
+            analytics_sample = sample_rows[:API_ANALYTICS_SAMPLE_LIMIT]
+            if analytics_status != 200:
+                analytics_error = f"Analytics HTTP {analytics_status}"
+        except Exception as exc:  # pragma: no cover - сетевые ошибки
+            analytics_error = str(exc)
+
+    if sku_title_map:
+        for item in previews:
+            pid = item.get("product_id")
+            if pid and pid in sku_title_map:
+                item["product_name"] = sku_title_map.get(pid)
+
+    response["product_titles_count"] = len(sku_title_map)
+    response["analytics_status"] = analytics_status
+    response["analytics_error"] = analytics_error
+    response["analytics_sample"] = analytics_sample
+
+    return response
+
+
 __all__ = [
     "ReviewCard",
     "ReviewView",
@@ -951,5 +1168,6 @@ __all__ = [
     "encode_review_id",
     "resolve_review_id",
     "format_review_card_text",
+    "build_reviews_preview",
 ]
 

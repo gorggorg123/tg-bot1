@@ -27,6 +27,40 @@ _product_name_cache: dict[str, str | None] = {}
 _product_not_found_warned: set[str] = set()
 
 
+def _parse_sku_title_map(payload: Dict[str, Any] | None) -> tuple[Dict[str, str], list[Any]]:
+    """Построить мапу sku -> title из ответа /v3/analytics/data."""
+
+    if not isinstance(payload, dict):
+        return {}, []
+
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+    data_rows = result.get("data") if isinstance(result, dict) else []
+    if not isinstance(data_rows, list):
+        return {}, []
+
+    sku_title_map: Dict[str, str] = {}
+    for row in data_rows:
+        if not isinstance(row, dict):
+            continue
+        dimensions = row.get("dimensions") if isinstance(row.get("dimensions"), list) else []
+        for dim in dimensions:
+            if not isinstance(dim, dict):
+                continue
+            if dim.get("id") != "sku":
+                continue
+            sku_val = dim.get("value") or dim.get("id_value") or dim.get("sku")
+            title_val = dim.get("name") or dim.get("title") or dim.get("description")
+            if sku_val in (None, ""):
+                continue
+            sku_key = str(sku_val).strip()
+            if not sku_key:
+                continue
+            if title_val not in (None, ""):
+                sku_title_map[sku_key] = str(title_val).strip()
+
+    return sku_title_map, data_rows
+
+
 def _iso_z(dt: datetime) -> str:
     """Вернуть ISO-строку в UTC с Z без миллисекунд."""
 
@@ -187,6 +221,30 @@ class OzonClient:
         if self._seller_api is None:
             self._seller_api = SellerAPI(client_id=self.client_id, api_key=self.api_key)
         return self._seller_api
+
+    async def _post_with_status(
+        self, path: str, json: Dict[str, Any]
+    ) -> tuple[int, Dict[str, Any] | None]:
+        """Отправить POST-запрос и вернуть статус + JSON без raise_for_status."""
+
+        suffix = path if path.startswith("/") else f"/{path}"
+        url = f"{BASE_URL}{suffix}"
+        r = await self._http_client.post(url, json=json)
+        status = r.status_code
+        try:
+            data = r.json()
+        except Exception:
+            try:
+                raw = await r.aread()
+            except Exception:
+                raw = b""
+            logger.error("Ozon %s -> JSON decode failed: %s", url, raw[:500])
+            return status, None
+
+        if status >= 400:
+            logger.warning("Ozon %s -> HTTP %s: %s", url, status, data)
+
+        return status, data if isinstance(data, dict) else None
 
     async def post(self, path: str, json: Dict[str, Any]) -> Dict[str, Any]:
         # Формируем абсолютный URL вручную, чтобы в логах всегда была явная точка входа
@@ -412,8 +470,58 @@ class OzonClient:
         )
         return reviews[:max_reviews]
 
+    async def get_reviews_page(
+        self, date_start_iso: str, date_end_iso: str, *, limit: int = 100, page: int = 1
+    ) -> tuple[int, Dict[str, Any] | None]:
+        """
+        Получить страницу отзывов через /v1/review/list без исключений.
+
+        Возвращает (HTTP статус, JSON или None).
+        """
+
+        body = {
+            "page": max(1, page),
+            "limit": max(1, min(limit, 100)),
+            "date_start": date_start_iso,
+            "date_end": date_end_iso,
+        }
+        return await self._post_with_status("/v1/review/list", body)
+
+    async def get_analytics_by_sku(
+        self, date_from: str, date_to: str, *, limit: int = 1000, offset: int = 0
+    ) -> tuple[int, Dict[str, Any] | None]:
+        """Вызов /v3/analytics/data для получения метаданных по SKU."""
+
+        body = {
+            "date_from": date_from,
+            "date_to": date_to,
+            "dimension": ["sku"],
+            "metrics": ["revenue"],
+            "filters": [],
+            "sort": [{"key": "revenue", "order": "DESC"}],
+            "limit": max(1, min(limit, 1000)),
+            "offset": max(0, offset),
+        }
+        return await self._post_with_status("/v3/analytics/data", body)
+
+    async def get_sku_title_map(
+        self, date_from: str, date_to: str, *, limit: int = 1000, offset: int = 0
+    ) -> tuple[int, Dict[str, str], list[Any]]:
+        """Получить мапу SKU -> название через /v3/analytics/data."""
+
+        status, payload = await self.get_analytics_by_sku(
+            date_from, date_to, limit=limit, offset=offset
+        )
+        if status >= 400:
+            logger.warning("Analytics HTTP %s for %s..%s", status, date_from, date_to)
+        if not isinstance(payload, dict):
+            return status, {}, []
+
+        sku_title_map, sample_rows = _parse_sku_title_map(payload)
+        return status, sku_title_map, sample_rows
+
     async def get_product_name(self, product_id: str) -> str | None:
-        """Получить название товара по product_id c мягкими фолбэками и кэшем."""
+        """Получить название товара по product_id с кэшем и мягкими фолбэками."""
 
         if not product_id:
             return None
@@ -421,26 +529,56 @@ class OzonClient:
         if product_id in _product_name_cache:
             return _product_name_cache[product_id]
 
-        numeric_id: int | None = None
-        if str(product_id).isdigit():
+        normalized_id = str(product_id).strip()
+        payload_id: int | str = normalized_id
+        if normalized_id.isdigit():
             try:
-                numeric_id = int(product_id)
+                payload_id = int(normalized_id)
             except Exception:
-                numeric_id = None
+                payload_id = normalized_id
 
-        payload: dict[str, int | str] = {"product_id": numeric_id if numeric_id is not None else product_id}
+        payload: dict[str, int | str] = {"product_id": payload_id}
 
-        paths = ("/v2/product/info", "/v1/product/info")
+        def _extract_name(res: dict[str, Any] | None) -> str | None:
+            if not isinstance(res, dict):
+                return None
+            return str(
+                next(
+                    (
+                        v
+                        for v in (
+                            res.get("name"),
+                            res.get("title"),
+                            res.get("product_name"),
+                            res.get("offer_id"),
+                        )
+                        if v not in (None, "")
+                    ),
+                    "",
+                )
+            ).strip() or None
+
+        api = self._get_seller_api()
+        if api and hasattr(api, "product_info"):
+            try:
+                res = await api.product_info(product_id=payload["product_id"])  # type: ignore[arg-type]
+                if hasattr(res, "model_dump"):
+                    res = res.model_dump()
+                name = _extract_name(res if isinstance(res, dict) else None)
+                if name:
+                    _product_name_cache[product_id] = name
+                    return name
+            except Exception as exc:
+                logger.warning("SellerAPI product_info failed for %s: %s", product_id, exc)
+
+        paths = ("/v1/product/info", "/v2/product/info")
         for path in paths:
             try:
                 data = await self.post(path, payload)
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 404:
-                    if product_id not in _product_not_found_warned:
-                        logger.warning("Product %s not found on %s (404)", product_id, path)
-                        _product_not_found_warned.add(product_id)
-                    _product_name_cache[product_id] = None
-                    return None
+                    logger.info("Product %s returned 404 at %s, trying next", product_id, path)
+                    continue
                 logger.warning(
                     "Product info HTTP %s for %s at %s",
                     exc.response.status_code,
@@ -457,29 +595,14 @@ class OzonClient:
                 continue
 
             res = data.get("result") if isinstance(data.get("result"), dict) else data
-            if isinstance(res, dict):
-                name = res.get("name") or res.get("title") or res.get("offer_id")
-                if name:
-                    _product_name_cache[product_id] = str(name)
-                    return str(name)
-            logger.warning("Product name missing for %s at %s", product_id, path)
-
-        api = self._get_seller_api()
-        if api and hasattr(api, "product_info"):
-            try:
-                res = await api.product_info(product_id=payload["product_id"])  # type: ignore[arg-type]
-                if hasattr(res, "model_dump"):
-                    res = res.model_dump()
-                if isinstance(res, dict):
-                    name = res.get("name") or res.get("title") or res.get("offer_id")
-                    if name:
-                        _product_name_cache[product_id] = str(name)
-                        return str(name)
-            except Exception as exc:
-                logger.warning("SellerAPI product_info failed for %s: %s", product_id, exc)
+            name = _extract_name(res if isinstance(res, dict) else None)
+            if name:
+                _product_name_cache[product_id] = name
+                return name
+            logger.info("Product name missing for %s at %s, trying next", product_id, path)
 
         if product_id not in _product_not_found_warned:
-            logger.warning("Product %s not found on Ozon (cached miss)", product_id)
+            logger.warning("Product %s not found in Ozon catalog (cached miss)", product_id)
             _product_not_found_warned.add(product_id)
         _product_name_cache[product_id] = None
         return None
