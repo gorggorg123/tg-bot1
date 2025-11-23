@@ -43,6 +43,7 @@ from botapp.reviews import (
     resolve_review_id,
     refresh_reviews,
     trim_for_telegram,
+    build_reviews_preview,
 )
 
 load_dotenv()
@@ -619,6 +620,13 @@ async def on_shutdown() -> None:
 @app.get("/")
 async def root() -> dict:
     return {"status": "ok", "detail": "Ozon bot is running"}
+
+
+@app.get("/reviews")
+async def reviews(days: int = 30) -> dict:
+    """HTTP-эндпоинт для выборки отзывов и названий товаров по SKU."""
+
+    return await build_reviews_preview(days=days)
 
 
 __all__ = ["app", "bot", "dp", "router"]

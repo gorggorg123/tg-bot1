@@ -188,6 +188,30 @@ class OzonClient:
             self._seller_api = SellerAPI(client_id=self.client_id, api_key=self.api_key)
         return self._seller_api
 
+    async def _post_with_status(
+        self, path: str, json: Dict[str, Any]
+    ) -> tuple[int, Dict[str, Any] | None]:
+        """Отправить POST-запрос и вернуть статус + JSON без raise_for_status."""
+
+        suffix = path if path.startswith("/") else f"/{path}"
+        url = f"{BASE_URL}{suffix}"
+        r = await self._http_client.post(url, json=json)
+        status = r.status_code
+        try:
+            data = r.json()
+        except Exception:
+            try:
+                raw = await r.aread()
+            except Exception:
+                raw = b""
+            logger.error("Ozon %s -> JSON decode failed: %s", url, raw[:500])
+            return status, None
+
+        if status >= 400:
+            logger.warning("Ozon %s -> HTTP %s: %s", url, status, data)
+
+        return status, data if isinstance(data, dict) else None
+
     async def post(self, path: str, json: Dict[str, Any]) -> Dict[str, Any]:
         # Формируем абсолютный URL вручную, чтобы в логах всегда была явная точка входа
         # (на Render фиксировали 404 на https://api-seller.ozon.ru/ без пути).
@@ -411,6 +435,40 @@ class OzonClient:
             max_count,
         )
         return reviews[:max_reviews]
+
+    async def get_reviews_page(
+        self, date_start_iso: str, date_end_iso: str, *, limit: int = 100, page: int = 1
+    ) -> tuple[int, Dict[str, Any] | None]:
+        """
+        Получить страницу отзывов через /v1/review/list без исключений.
+
+        Возвращает (HTTP статус, JSON или None).
+        """
+
+        body = {
+            "page": max(1, page),
+            "limit": max(1, min(limit, 100)),
+            "date_start": date_start_iso,
+            "date_end": date_end_iso,
+        }
+        return await self._post_with_status("/v1/review/list", body)
+
+    async def get_analytics_by_sku(
+        self, date_from: str, date_to: str, *, limit: int = 1000, offset: int = 0
+    ) -> tuple[int, Dict[str, Any] | None]:
+        """Вызов /v3/analytics/data для получения метаданных по SKU."""
+
+        body = {
+            "date_from": date_from,
+            "date_to": date_to,
+            "dimension": ["sku"],
+            "metrics": ["revenue"],
+            "filters": [],
+            "sort": [{"key": "revenue", "order": "DESC"}],
+            "limit": max(1, min(limit, 1000)),
+            "offset": max(0, offset),
+        }
+        return await self._post_with_status("/v3/analytics/data", body)
 
     async def get_product_name(self, product_id: str) -> str | None:
         """Получить название товара по product_id с кэшем и мягкими фолбэками."""

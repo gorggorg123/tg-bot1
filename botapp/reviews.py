@@ -27,6 +27,8 @@ _sessions: dict[int, "ReviewSession"] = {}
 _review_id_to_token: dict[int, dict[str, str]] = {}
 _token_to_review_id: dict[int, dict[str, str]] = {}
 
+API_ANALYTICS_SAMPLE_LIMIT = 5
+
 
 @dataclass
 class ReviewCard:
@@ -608,6 +610,22 @@ def trim_for_telegram(text: str, max_len: int = TELEGRAM_SOFT_LIMIT) -> str:
     return text[: max_len - len(suffix)] + suffix
 
 
+def _iso_no_ms(dt: datetime) -> str:
+    """ISO-строка без миллисекунд с суффиксом Z для UTC."""
+
+    if dt.tzinfo:
+        dt = dt.astimezone(timezone.utc)
+    else:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _iso_date(dt: datetime) -> str:
+    if dt.tzinfo:
+        dt = dt.astimezone(timezone.utc)
+    return dt.date().isoformat()
+
+
 async def _resolve_product_names(
     cards: List[ReviewCard], client: OzonClient, product_cache: Dict[str, str | None] | None = None
 ) -> None:
@@ -977,6 +995,163 @@ async def get_reviews_menu_text() -> str:
     )
 
 
+def _collect_review_sku(
+    review: Dict[str, Any]
+) -> tuple[str | None, Any, Dict[str, Any], Any]:
+    product_block_raw = review.get("product") or review.get("product_info") or {}
+    product_block = product_block_raw if isinstance(product_block_raw, dict) else {}
+    raw_fields = review.get("raw_fields") if isinstance(review.get("raw_fields"), dict) else {}
+
+    sku_candidates = [
+        review.get("sku"),
+        product_block.get("sku"),
+        product_block.get("offer_id"),
+        product_block.get("offerId"),
+        review.get("product_id"),
+        review.get("productId"),
+        raw_fields.get("sku"),
+    ]
+    sku_raw = next((v for v in sku_candidates if v not in (None, "")), None)
+    sku = str(sku_raw).strip() if sku_raw is not None else None
+
+    product_id_orig = review.get("product_id") or product_block.get("product_id") or raw_fields.get("product_id")
+
+    return sku, product_id_orig, product_block, sku_raw
+
+
+def _build_sku_title_map(payload: Dict[str, Any] | None) -> tuple[Dict[str, str], list[Any]]:
+    """Построить мапу sku -> title из ответа /v3/analytics/data."""
+
+    if not isinstance(payload, dict):
+        return {}, []
+
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+    data_rows = result.get("data") if isinstance(result, dict) else []
+    if not isinstance(data_rows, list):
+        return {}, []
+
+    sku_title_map: Dict[str, str] = {}
+    for row in data_rows:
+        if not isinstance(row, dict):
+            continue
+        dimensions = row.get("dimensions") if isinstance(row.get("dimensions"), list) else []
+        for dim in dimensions:
+            if not isinstance(dim, dict):
+                continue
+            if dim.get("id") != "sku":
+                continue
+            sku_val = dim.get("value") or dim.get("id_value") or dim.get("sku")
+            title_val = dim.get("name") or dim.get("title") or dim.get("description")
+            if sku_val in (None, ""):
+                continue
+            sku_key = str(sku_val).strip()
+            if not sku_key:
+                continue
+            if title_val not in (None, ""):
+                sku_title_map[sku_key] = str(title_val).strip()
+
+    return sku_title_map, data_rows[:API_ANALYTICS_SAMPLE_LIMIT]
+
+
+async def build_reviews_preview(
+    *, days: int = DEFAULT_RECENT_DAYS, client: OzonClient | None = None
+) -> Dict[str, Any]:
+    """Построить JSON-ответ по отзывам и аналитике, аналогичный Cloudflare Worker."""
+
+    safe_days = max(1, days)
+    client = client or get_client()
+
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    date_start = now - timedelta(days=safe_days)
+    date_end = now
+
+    date_start_iso = _iso_no_ms(date_start)
+    date_end_iso = _iso_no_ms(date_end)
+    analytics_from = _iso_date(date_start)
+    analytics_to = _iso_date(date_end)
+
+    ozon_status, reviews_payload = await client.get_reviews_page(
+        date_start_iso, date_end_iso, limit=100, page=1
+    )
+
+    response: Dict[str, Any] = {
+        "date_from": date_start_iso,
+        "date_to": date_end_iso,
+        "ozon_status": ozon_status,
+        "reviews_count": 0,
+        "product_titles_count": 0,
+        "reviews_preview": [],
+        "analytics_status": None,
+        "analytics_error": None,
+        "analytics_sample": [],
+    }
+
+    if ozon_status != 200 or not isinstance(reviews_payload, dict):
+        response["ozon_status"] = f"HTTP {ozon_status}"
+        response["analytics_error"] = "Отзывы недоступны"
+        return response
+
+    reviews_root = reviews_payload.get("result") if isinstance(reviews_payload.get("result"), dict) else reviews_payload
+    items = reviews_root.get("reviews") or reviews_root.get("feedbacks") or reviews_root.get("items") or []
+    reviews_list = [r for r in items if isinstance(r, dict)] if isinstance(items, list) else []
+
+    previews: list[Dict[str, Any]] = []
+    sku_set: set[str] = set()
+
+    for rev in reviews_list:
+        review_id = rev.get("review_id") or rev.get("id") or rev.get("uuid")
+        rating = int(rev.get("rating") or 0)
+        text = str(rev.get("text") or rev.get("comment") or "")
+
+        sku, product_id_raw, raw_product, raw_sku = _collect_review_sku(rev)
+        if sku:
+            sku_set.add(sku)
+
+        previews.append(
+            {
+                "review_id": str(review_id) if review_id is not None else None,
+                "rating": rating,
+                "text": text,
+                "product_id": sku,
+                "product_name": None,
+                "raw_product": raw_product if raw_product else None,
+                "raw_fields": {"product_id": product_id_raw, "sku": raw_sku},
+            }
+        )
+
+    response["reviews_preview"] = previews
+    response["reviews_count"] = len(previews)
+
+    analytics_status: int | None = None
+    analytics_error: str | None = None
+    sku_title_map: Dict[str, str] = {}
+    analytics_sample: list[Any] = []
+
+    if sku_set:
+        try:
+            analytics_status, analytics_payload = await client.get_analytics_by_sku(
+                analytics_from, analytics_to, limit=1000, offset=0
+            )
+            sku_title_map, analytics_sample = _build_sku_title_map(analytics_payload)
+            if analytics_status != 200:
+                analytics_error = f"Analytics HTTP {analytics_status}"
+        except Exception as exc:  # pragma: no cover - сетевые ошибки
+            analytics_error = str(exc)
+
+    if sku_title_map:
+        for item in previews:
+            pid = item.get("product_id")
+            if pid and pid in sku_title_map:
+                item["product_name"] = sku_title_map.get(pid)
+
+    response["product_titles_count"] = len(sku_title_map)
+    response["analytics_status"] = analytics_status
+    response["analytics_error"] = analytics_error
+    response["analytics_sample"] = analytics_sample
+
+    return response
+
+
 __all__ = [
     "ReviewCard",
     "ReviewView",
@@ -995,5 +1170,6 @@ __all__ = [
     "encode_review_id",
     "resolve_review_id",
     "format_review_card_text",
+    "build_reviews_preview",
 ]
 
