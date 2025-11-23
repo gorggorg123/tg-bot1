@@ -57,6 +57,7 @@ logger = logging.getLogger("main")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID", "").strip()
 OZON_API_KEY = os.getenv("OZON_API_KEY", "").strip()
+ENABLE_TG_POLLING = os.getenv("ENABLE_TG_POLLING", "1") == "1"
 
 if not TG_BOT_TOKEN:
     raise RuntimeError("TG_BOT_TOKEN is not set")
@@ -596,8 +597,16 @@ async def start_bot() -> None:
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    logger.info("Startup: validating Ozon credentials and creating polling task")
+    logger.info("Startup: validating Ozon credentials")
     get_client()
+
+    if not ENABLE_TG_POLLING:
+        # Локально ставим ENABLE_TG_POLLING=0, чтобы не лезть в Telegram,
+        # пока прод на Render работает с ENABLE_TG_POLLING=1.
+        logger.info("Telegram polling is disabled by ENABLE_TG_POLLING=0")
+        return
+
+    logger.info("Startup: creating polling task")
     asyncio.create_task(start_bot())
 
 
