@@ -27,14 +27,7 @@ from botapp.keyboards import (
     reviews_list_keyboard,
 )
 from botapp.orders import get_orders_today_text
-from botapp.db import (
-    get_last_answer,
-    init_db,
-    save_draft_answer,
-    save_error_answer,
-    save_sent_answer,
-)
-from botapp.ozon_client import get_client, has_write_credentials
+from botapp.ozon_client import get_client, get_write_client, has_write_credentials
 from botapp.ai_client import generate_review_reply
 from botapp.reviews import (
     ReviewCard,
@@ -72,6 +65,8 @@ _polling_lock = asyncio.Lock()
 _last_service_messages: Dict[int, int] = {}
 _reviews_list_messages: Dict[int, Tuple[int, int]] = {}
 _review_card_messages: Dict[int, Tuple[int, int]] = {}
+_local_answers: Dict[Tuple[int, str], str] = {}
+_local_answer_status: Dict[Tuple[int, str], str] = {}
 
 
 class ReviewAnswerStates(StatesGroup):
@@ -330,10 +325,8 @@ async def _get_local_answer(user_id: int, review_id: str | None) -> str | None:
 async def _remember_local_answer(user_id: int, review_id: str | None, text: str) -> None:
     if not review_id:
         return
-    try:
-        await save_draft_answer(user_id, review_id, text)
-    except Exception as exc:
-        logger.warning("Failed to store draft for %s: %s", review_id, exc)
+    _local_answers[(user_id, review_id)] = text
+    _local_answer_status[(user_id, review_id)] = "draft"
 
 
 async def _delete_card_message(user_id: int, bot: Bot) -> None:
@@ -530,12 +523,10 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
             )
             return
 
-        try:
-            client = get_client(write=True)
-        except Exception as exc:
-            logger.warning("Write client unavailable: %s", exc)
+        client = get_write_client()
+        if not client:
             await callback.message.answer(
-                "Отправка в Ozon недоступна: отсутствует write-ключ или некорректные креденшалы."
+                "Отправка в Ozon недоступна: отсутствует write-ключ."
             )
             return
 
@@ -543,15 +534,15 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
             await client.create_review_comment(review.id, final_answer)
         except Exception as exc:
             logger.warning("Failed to send review %s to Ozon: %s", review.id, exc)
-            with suppress(Exception):
-                await save_error_answer(user_id, review.id, final_answer)
+            _local_answers[(user_id, review.id)] = final_answer
+            _local_answer_status[(user_id, review.id)] = "error"
             await callback.message.answer(
                 "Не удалось отправить ответ в Ozon. Проверьте права write-ключа или попробуйте позже."
             )
             return
 
-        with suppress(Exception):
-            await save_sent_answer(user_id, review.id, final_answer)
+        _local_answers[(user_id, review.id)] = final_answer
+        _local_answer_status[(user_id, review.id)] = "sent"
         mark_review_answered(review.id, user_id, final_answer)
         await callback.message.answer("Ответ отправлен в Ozon ✅")
         await _send_review_card(
@@ -668,9 +659,6 @@ async def start_bot() -> None:
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    logger.info("Startup: initializing database")
-    await init_db()
-
     logger.info("Startup: validating Ozon credentials")
     get_client()
 

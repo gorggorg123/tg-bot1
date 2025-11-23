@@ -185,31 +185,14 @@ def s_num(x: Any) -> float:
         return 0.0
 
 
-def _env_credentials(*, write: bool = False) -> tuple[str, str]:
-    """Выбрать пару Client-Id/Api-Key для чтения или записи."""
+def _env_read_credentials() -> tuple[str, str]:
+    """Прочитать пару Client-Id/Api-Key для чтения."""
 
-    if write:
-        client_id = (
-            os.getenv("OZON_CLIENT_ID_WRITE")
-            or os.getenv("OZON_CLIENT_ID")
-            or ""
-        ).strip()
-        api_key = (
-            os.getenv("OZON_API_KEY_WRITE") or os.getenv("OZON_API_KEY") or ""
-        ).strip()
-    else:
-        client_id = (
-            os.getenv("OZON_CLIENT_ID_READ")
-            or os.getenv("OZON_CLIENT_ID")
-            or ""
-        ).strip()
-        api_key = (
-            os.getenv("OZON_API_KEY_READ") or os.getenv("OZON_API_KEY") or ""
-        ).strip()
+    client_id = (os.getenv("OZON_CLIENT_ID") or "").strip()
+    api_key = (os.getenv("OZON_API_KEY") or "").strip()
 
     if not client_id or not api_key:
-        scope = "WRITE" if write else "READ"
-        raise RuntimeError(f"Не заданы креденшалы OZON_CLIENT_ID_{scope} / OZON_API_KEY_{scope}")
+        raise RuntimeError("Не заданы креденшалы OZON_CLIENT_ID / OZON_API_KEY")
 
     return client_id, api_key
 
@@ -691,7 +674,9 @@ _client_write: OzonClient | None = None
 
 
 def has_write_credentials() -> bool:
-    """Проверить наличие write-пары ключей (с фолбэком на базовые)."""
+    """Проверить наличие write-ключа в окружении."""
+
+    return bool((os.getenv("OZON_WRITE_API_KEY") or "").strip())
 
     cid = (os.getenv("OZON_CLIENT_ID_WRITE") or os.getenv("OZON_CLIENT_ID") or "").strip()
     key = (os.getenv("OZON_API_KEY_WRITE") or os.getenv("OZON_API_KEY") or "").strip()
@@ -704,15 +689,34 @@ def get_client(*, write: bool = False) -> OzonClient:
     По умолчанию используется read-пара, для записи передайте write=True.
     """
 
-    global _client_read, _client_write
-    if write:
-        if _client_write is None:
-            client_id, api_key = _env_credentials(write=True)
-            _client_write = OzonClient(client_id=client_id, api_key=api_key)
-        return _client_write
+def get_client() -> OzonClient:
+    """Ленивая инициализация клиента для чтения."""
 
+    global _client_read
     if _client_read is None:
-        client_id, api_key = _env_credentials(write=False)
+        client_id, api_key = _env_read_credentials()
         _client_read = OzonClient(client_id=client_id, api_key=api_key)
     return _client_read
+
+
+def get_write_client() -> OzonClient | None:
+    """Получить write-клиент, если ключ в окружении задан."""
+
+    global _client_write
+    api_key = (os.getenv("OZON_WRITE_API_KEY") or "").strip()
+    if not api_key:
+        return None
+
+    client_id = (
+        os.getenv("OZON_WRITE_CLIENT_ID")
+        or os.getenv("OZON_CLIENT_ID")
+        or ""
+    ).strip()
+    if not client_id:
+        logger.warning("OZON_WRITE_API_KEY задан, но OZON_WRITE_CLIENT_ID пуст")
+        return None
+
+    if _client_write is None:
+        _client_write = OzonClient(client_id=client_id, api_key=api_key)
+    return _client_write
 
