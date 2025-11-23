@@ -28,7 +28,7 @@ _product_not_found_warned: set[str] = set()
 
 
 def _parse_sku_title_map(payload: Dict[str, Any] | None) -> tuple[Dict[str, str], list[Any]]:
-    """Построить мапу sku -> title из ответа /v3/analytics/data."""
+    """Построить мапу sku -> title из ответа /v1/analytics/data."""
 
     if not isinstance(payload, dict):
         return {}, []
@@ -490,7 +490,7 @@ class OzonClient:
     async def get_analytics_by_sku(
         self, date_from: str, date_to: str, *, limit: int = 1000, offset: int = 0
     ) -> tuple[int, Dict[str, Any] | None]:
-        """Вызов /v3/analytics/data для получения метаданных по SKU."""
+        """Вызов /v1/analytics/data для получения метаданных по SKU."""
 
         body = {
             "date_from": date_from,
@@ -502,18 +502,23 @@ class OzonClient:
             "limit": max(1, min(limit, 1000)),
             "offset": max(0, offset),
         }
-        return await self._post_with_status("/v3/analytics/data", body)
+        return await self._post_with_status("/v1/analytics/data", body)
 
     async def get_sku_title_map(
         self, date_from: str, date_to: str, *, limit: int = 1000, offset: int = 0
     ) -> tuple[int, Dict[str, str], list[Any]]:
-        """Получить мапу SKU -> название через /v3/analytics/data."""
+        """Получить мапу SKU -> название через /v1/analytics/data."""
 
         status, payload = await self.get_analytics_by_sku(
             date_from, date_to, limit=limit, offset=offset
         )
         if status >= 400:
-            logger.warning("Analytics HTTP %s for %s..%s", status, date_from, date_to)
+            logger.warning(
+                "Analytics /v1/analytics/data HTTP %s for %s..%s",
+                status,
+                date_from,
+                date_to,
+            )
         if not isinstance(payload, dict):
             return status, {}, []
 
