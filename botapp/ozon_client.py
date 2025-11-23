@@ -185,11 +185,32 @@ def s_num(x: Any) -> float:
         return 0.0
 
 
-def _env_credentials() -> tuple[str, str]:
-    client_id = (os.getenv("OZON_CLIENT_ID") or "").strip()
-    api_key = (os.getenv("OZON_API_KEY") or "").strip()
+def _env_credentials(*, write: bool = False) -> tuple[str, str]:
+    """Выбрать пару Client-Id/Api-Key для чтения или записи."""
+
+    if write:
+        client_id = (
+            os.getenv("OZON_CLIENT_ID_WRITE")
+            or os.getenv("OZON_CLIENT_ID")
+            or ""
+        ).strip()
+        api_key = (
+            os.getenv("OZON_API_KEY_WRITE") or os.getenv("OZON_API_KEY") or ""
+        ).strip()
+    else:
+        client_id = (
+            os.getenv("OZON_CLIENT_ID_READ")
+            or os.getenv("OZON_CLIENT_ID")
+            or ""
+        ).strip()
+        api_key = (
+            os.getenv("OZON_API_KEY_READ") or os.getenv("OZON_API_KEY") or ""
+        ).strip()
+
     if not client_id or not api_key:
-        raise RuntimeError("Не заданы OZON_CLIENT_ID / OZON_API_KEY")
+        scope = "WRITE" if write else "READ"
+        raise RuntimeError(f"Не заданы креденшалы OZON_CLIENT_ID_{scope} / OZON_API_KEY_{scope}")
+
     return client_id, api_key
 
 
@@ -500,6 +521,42 @@ class OzonClient:
         }
         return await self._post_with_status("/v1/review/list", body)
 
+    async def create_review_comment(
+        self,
+        review_id: str,
+        text: str,
+        mark_as_processed: bool = True,
+        parent_comment_id: str | None = None,
+    ) -> dict:
+        body: dict[str, Any] = {
+            "review_id": review_id,
+            "text": text,
+            "mark_review_as_processed": mark_as_processed,
+        }
+        if parent_comment_id:
+            body["parent_comment_id"] = parent_comment_id
+
+        try:
+            res = await self.post("/v1/review/comment/create", body)
+        except httpx.HTTPStatusError as exc:
+            logger.warning(
+                "Failed to create review comment %s HTTP %s: %s",
+                review_id,
+                exc.response.status_code,
+                exc,
+            )
+            raise
+        except Exception as exc:
+            logger.warning("Failed to create review comment %s: %s", review_id, exc)
+            raise
+
+        logger.info(
+            "Review %s comment created via /v1/review/comment/create: %s",
+            review_id,
+            res,
+        )
+        return res
+
     async def get_analytics_by_sku(
         self, date_from: str, date_to: str, *, limit: int = 1000, offset: int = 0
     ) -> tuple[int, Dict[str, Any] | None]:
@@ -629,14 +686,33 @@ class OzonClient:
     get_account_info = get_seller_info
 
 
-_client: OzonClient | None = None
+_client_read: OzonClient | None = None
+_client_write: OzonClient | None = None
 
 
-def get_client() -> OzonClient:
-    """Ленивая инициализация клиента с учётом .env."""
-    global _client
-    if _client is None:
-        client_id, api_key = _env_credentials()
-        _client = OzonClient(client_id=client_id, api_key=api_key)
-    return _client
+def has_write_credentials() -> bool:
+    """Проверить наличие write-пары ключей (с фолбэком на базовые)."""
+
+    cid = (os.getenv("OZON_CLIENT_ID_WRITE") or os.getenv("OZON_CLIENT_ID") or "").strip()
+    key = (os.getenv("OZON_API_KEY_WRITE") or os.getenv("OZON_API_KEY") or "").strip()
+    return bool(cid and key)
+
+
+def get_client(*, write: bool = False) -> OzonClient:
+    """Ленивая инициализация клиента с учётом .env.
+
+    По умолчанию используется read-пара, для записи передайте write=True.
+    """
+
+    global _client_read, _client_write
+    if write:
+        if _client_write is None:
+            client_id, api_key = _env_credentials(write=True)
+            _client_write = OzonClient(client_id=client_id, api_key=api_key)
+        return _client_write
+
+    if _client_read is None:
+        client_id, api_key = _env_credentials(write=False)
+        _client_read = OzonClient(client_id=client_id, api_key=api_key)
+    return _client_read
 
