@@ -69,6 +69,18 @@ _local_answers: Dict[Tuple[int, str], str] = {}
 _local_answer_status: Dict[Tuple[int, str], str] = {}
 
 
+def get_last_answer(user_id: int, review_id: str | None) -> str | None:
+    """Вернуть последний сохранённый ответ (final или draft)."""
+
+    if not review_id:
+        return None
+    try:
+        return _local_answers.get((user_id, review_id))
+    except Exception as exc:  # pragma: no cover - аварийная защита от порчи стейта
+        logger.warning("Failed to read local answer for %s: %s", review_id, exc)
+        return None
+
+
 class ReviewAnswerStates(StatesGroup):
     reprompt = State()
     manual = State()
@@ -315,11 +327,7 @@ async def _send_review_card(
 async def _get_local_answer(user_id: int, review_id: str | None) -> str | None:
     if not review_id:
         return None
-    try:
-        return await get_last_answer(user_id, review_id)
-    except Exception as exc:
-        logger.warning("Failed to load saved answer for %s: %s", review_id, exc)
-        return None
+    return get_last_answer(user_id, review_id)
 
 
 async def _remember_local_answer(user_id: int, review_id: str | None, text: str) -> None:
@@ -642,6 +650,9 @@ async def start_bot() -> None:
         if _polling_task and _polling_task.done():
             _polling_task = None
 
+        # На Render запускается только один web-инстанс с ENABLE_TG_POLLING=1.
+        # Второй инстанс/воркер должен выставлять ENABLE_TG_POLLING=0, иначе Telegram
+        # вернёт TelegramConflictError из-за параллельного polling.
         logger.info("Telegram bot polling started (single instance)")
         _polling_task = asyncio.create_task(
             dp.start_polling(

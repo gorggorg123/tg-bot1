@@ -25,6 +25,9 @@ MSK_TZ = timezone(MSK_SHIFT)
 
 _product_name_cache: dict[str, str | None] = {}
 _product_not_found_warned: set[str] = set()
+_product_info_miss_cache: set[str] = set()
+_analytics_forbidden: bool = False
+_analytics_forbidden_logged: bool = False
 
 
 def _parse_sku_title_map(payload: Dict[str, Any] | None) -> tuple[Dict[str, str], list[Any]]:
@@ -545,6 +548,9 @@ class OzonClient:
     ) -> tuple[int, Dict[str, Any] | None]:
         """Вызов /v1/analytics/data для получения метаданных по SKU."""
 
+        if _analytics_forbidden:
+            return 403, None
+
         body = {
             "date_from": date_from,
             "date_to": date_to,
@@ -565,7 +571,20 @@ class OzonClient:
         status, payload = await self.get_analytics_by_sku(
             date_from, date_to, limit=limit, offset=offset
         )
-        if status >= 400:
+        if status == 403 and isinstance(payload, dict):
+            code = payload.get("code")
+            message = str(payload.get("message") or "").lower()
+            if code == 7 or "required role" in message:
+                global _analytics_forbidden, _analytics_forbidden_logged
+                _analytics_forbidden = True
+                if not _analytics_forbidden_logged:
+                    logger.warning(
+                        "Analytics /v1/analytics/data is forbidden for the current key: %s",
+                        payload,
+                    )
+                    _analytics_forbidden_logged = True
+                return status, {}, []
+        if status >= 400 and not _analytics_forbidden:
             logger.warning(
                 "Analytics /v1/analytics/data HTTP %s for %s..%s",
                 status,
@@ -586,6 +605,8 @@ class OzonClient:
 
         if product_id in _product_name_cache:
             return _product_name_cache[product_id]
+        if product_id in _product_info_miss_cache:
+            return None
 
         normalized_id = str(product_id).strip()
         payload_id: int | str = normalized_id
@@ -630,16 +651,18 @@ class OzonClient:
                 logger.warning("SellerAPI product_info failed for %s: %s", product_id, exc)
 
         paths = ("/v1/product/info", "/v2/product/info")
+        last_status: int | None = None
         for path in paths:
             try:
                 data = await self.post(path, payload)
+                last_status = 200
             except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 404:
-                    logger.info("Product %s returned 404 at %s, trying next", product_id, path)
+                last_status = exc.response.status_code
+                if last_status == 404:
                     continue
                 logger.warning(
                     "Product info HTTP %s for %s at %s",
-                    exc.response.status_code,
+                    last_status,
                     product_id,
                     path,
                 )
@@ -657,12 +680,12 @@ class OzonClient:
             if name:
                 _product_name_cache[product_id] = name
                 return name
-            logger.info("Product name missing for %s at %s, trying next", product_id, path)
 
-        if product_id not in _product_not_found_warned:
+        if last_status == 404 or product_id not in _product_not_found_warned:
             logger.warning("Product %s not found in Ozon catalog (cached miss)", product_id)
             _product_not_found_warned.add(product_id)
         _product_name_cache[product_id] = None
+        _product_info_miss_cache.add(product_id)
         return None
 
     # back-compat
@@ -672,6 +695,13 @@ class OzonClient:
 _client_read: OzonClient | None = None
 _client_write: OzonClient | None = None
 
+
+def has_write_credentials() -> bool:
+    """Проверить наличие write-ключа в окружении."""
+
+    client_id = (os.getenv("OZON_CLIENT_ID") or "").strip()
+    api_key = (os.getenv("OZON_API_KEY_WRITE") or "").strip()
+    return bool(client_id and api_key)
 
 def has_write_credentials() -> bool:
     """Проверить наличие write-ключа в окружении."""
