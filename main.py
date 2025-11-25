@@ -534,7 +534,7 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
         client = get_write_client()
         if not client:
             await callback.message.answer(
-                "Отправка на Ozon недоступна: не задан OZON_API_KEY_WRITE."
+                "Отправка на Ozon недоступна: не задан OZON_API_KEY."
             )
             return
 
@@ -545,7 +545,7 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
             _local_answers[(user_id, review.id)] = final_answer
             _local_answer_status[(user_id, review.id)] = "error"
             await callback.message.answer(
-                "Не удалось отправить ответ в Ozon. Проверьте права write-ключа или попробуйте позже."
+                "Не удалось отправить ответ в Ozon. Проверьте права API‑ключа OZON_API_KEY в личном кабинете Ozon или попробуйте позже."
             )
             return
 
