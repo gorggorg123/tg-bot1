@@ -693,32 +693,26 @@ class OzonClient:
 
 
 _client_read: OzonClient | None = None
-_client_write: OzonClient | None = None
 
 
 def has_write_credentials() -> bool:
-    """Проверить наличие write-ключа в окружении."""
-
-    client_id = (os.getenv("OZON_CLIENT_ID") or "").strip()
-    api_key = (os.getenv("OZON_API_KEY_WRITE") or "").strip()
-    return bool(client_id and api_key)
-
-def has_write_credentials() -> bool:
-    """Проверить наличие write-ключа в окружении."""
-
-    client_id = (os.getenv("OZON_CLIENT_ID") or "").strip()
-    api_key = (os.getenv("OZON_API_KEY_WRITE") or "").strip()
-    return bool(client_id and api_key)
-
-def get_client(*, write: bool = False) -> OzonClient:
-    """Ленивая инициализация клиента с учётом .env.
-
-    По умолчанию используется read-пара, для записи передайте write=True.
     """
+    Проверить, можно ли отправлять ответы на отзывы.
+
+    Теперь используется тот же самый ключ OZON_API_KEY, что и для чтения.
+    Главное — чтобы в личном кабинете Ozon у этого ключа были права
+    на работу с отзывами (просмотр и ответы продавца).
+    """
+    client_id = (os.getenv("OZON_CLIENT_ID") or "").strip()
+    api_key = (os.getenv("OZON_API_KEY") or "").strip()
+    return bool(client_id and api_key)
+
 
 def get_client() -> OzonClient:
-    """Ленивая инициализация клиента для чтения."""
-
+    """
+    Ленивая инициализация клиента Ozon для всех операций (чтение, аналитика, ответы).
+    Используется один ключ OZON_API_KEY.
+    """
     global _client_read
     if _client_read is None:
         client_id, api_key = _env_read_credentials()
@@ -727,17 +721,14 @@ def get_client() -> OzonClient:
 
 
 def get_write_client() -> OzonClient | None:
-    """Получить write-клиент, если ключ в окружении задан."""
+    """
+    Совместимый с прежним кодом «write‑клиент».
 
-    global _client_write
-
-    client_id = (os.getenv("OZON_CLIENT_ID") or "").strip()
-    api_key = (os.getenv("OZON_API_KEY_WRITE") or "").strip()
-
-    if not client_id or not api_key:
+    Сейчас используется тот же клиент, что и для чтения.
+    Если переменные окружения не заданы, вернёт None.
+    """
+    if not has_write_credentials():
         return None
+    return get_client()
 
-    if _client_write is None:
-        _client_write = OzonClient(client_id=client_id, api_key=api_key)
-    return _client_write
 
