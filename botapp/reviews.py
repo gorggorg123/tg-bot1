@@ -21,7 +21,6 @@ REVIEWS_PAGE_SIZE = 10
 SESSION_TTL = timedelta(minutes=2)
 
 _product_name_cache: dict[str, str | None] = {}
-_review_answered_cache: dict[int, set[str]] = {}
 _sessions: dict[int, "ReviewSession"] = {}
 # NEW: Короткие токены для review_id, чтобы callback_data помещалась в лимит Telegram
 _review_id_to_token: dict[int, dict[str, str]] = {}
@@ -44,6 +43,8 @@ class ReviewCard:
     raw_created_at: Any | None = None
     answered: bool = False
     answer_text: str | None = None
+    answer_created_at: datetime | None = None
+    status: str | None = None
 
 
 @dataclass
@@ -202,28 +203,40 @@ def _msk_range_last_days(days: int = DEFAULT_RECENT_DAYS) -> Tuple[datetime, dat
     return start_msk, end_msk, pretty
 
 
-def _answered_for_user(user_id: int) -> set[str]:
-    """Вернуть (и при необходимости восстановить) кэш отвеченных отзывов для пользователя."""
-
-    global _review_answered_cache
-    if not isinstance(_review_answered_cache, dict):
-        logger.warning("Answered cache corrupted, resetting it")
-        _review_answered_cache = {}
-
-    bucket = _review_answered_cache.get(user_id)
-    if not isinstance(bucket, set):
-        bucket = set(bucket or [])
-        _review_answered_cache[user_id] = bucket
-    return bucket
-
-
 def _has_answer_payload(review: ReviewCard) -> bool:
     return bool((review.answer_text or "").strip() or review.answered)
 
 
-def is_answered(review: ReviewCard, user_id: int | None = None) -> bool:
-    user_cache = _answered_for_user(user_id or 0)
-    if review.id and review.id in user_cache:
+def _status_badge(review: ReviewCard) -> tuple[str, str]:
+    """Вернуть (иконку, текст) для статуса ответа."""
+
+    if is_answered(review):
+        return "✅", "Ответ есть"
+    status = (review.status or "").strip()
+    if status:
+        return "✏️", status
+    return "✏️", "Без ответа"
+
+
+def _status_answered(status: str | None) -> bool:
+    if not status:
+        return False
+    norm = status.strip().upper()
+    if not norm:
+        return False
+    if norm.startswith("UNANSWER") or "NOT_ANSWER" in norm or norm.startswith("NO_ANSWER"):
+        return False
+    if norm in {"ANSWERED", "HAS_ANSWER", "ANSWER", "REPLIED", "REPLIED_SELLER", "PROCESSED", "CLOSED"}:
+        return True
+    if "ANSWERED" in norm or "REPLIED" in norm:
+        return True
+    if norm.endswith("ANSWER") or norm.endswith("COMMENTED"):
+        return True
+    return False
+
+
+def is_answered(review: ReviewCard, user_id: int | None = None) -> bool:  # noqa: ARG001
+    if _status_answered(review.status):
         return True
     return _has_answer_payload(review)
 
@@ -290,9 +303,6 @@ def encode_review_id(user_id: int, review_id: str | None) -> str | None:
 
 
 def mark_review_answered(review_id: str | None, user_id: int, answer_text: str | None = None) -> None:
-    if review_id:
-        _answered_for_user(user_id).add(review_id)
-
     session = _sessions.get(user_id)
     if not session:
         return
@@ -302,6 +312,8 @@ def mark_review_answered(review_id: str | None, user_id: int, answer_text: str |
             card.answered = True
             if answer_text is not None:
                 card.answer_text = answer_text
+            card.answer_created_at = card.answer_created_at or datetime.utcnow().replace(tzinfo=timezone.utc)
+            card.status = card.status or "ANSWERED"
 
     session.rebuild_unanswered(user_id)
 
@@ -369,14 +381,14 @@ def _filter_reviews_and_stats(
 
             collected_dates.append(created_msk)
 
-        if answer_filter == "unanswered" and _has_answer_payload(review):
+        if answer_filter == "unanswered" and is_answered(review):
             continue
-        if answer_filter == "answered" and not _has_answer_payload(review):
+        if answer_filter == "answered" and not is_answered(review):
             continue
 
         filtered.append(review)
 
-    stats["answered"] = sum(1 for r in filtered if _has_answer_payload(r))
+    stats["answered"] = sum(1 for r in filtered if is_answered(r))
     stats["unanswered"] = len(filtered) - stats["answered"]
 
     if (safe_from_msk or safe_to_msk) and collected_dates:
@@ -428,6 +440,26 @@ def _range_summary_msk(values: list[datetime]) -> str:
     return f"{earliest} — {latest}"
 
 
+def _merge_review_payload(card: ReviewCard, payload: Dict[str, Any]) -> None:
+    """Обновить карточку данными из свежего payload Ozon API."""
+
+    normalized = _normalize_review(payload)
+    card.status = normalized.status or card.status
+    if normalized.answer_text:
+        card.answer_text = normalized.answer_text
+    if normalized.answer_created_at:
+        card.answer_created_at = normalized.answer_created_at
+    if normalized.created_at:
+        card.created_at = normalized.created_at
+    if normalized.product_name:
+        card.product_name = normalized.product_name
+    if normalized.product_id:
+        card.product_id = normalized.product_id
+    if normalized.offer_id:
+        card.offer_id = normalized.offer_id
+    card.answered = normalized.answered or card.answered
+
+
 def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
     rating = int(raw.get("rating") or raw.get("grade") or 0)
     text = (raw.get("text") or raw.get("comment") or "").strip()
@@ -440,16 +472,29 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
         or raw.get("reply")
         or raw.get("response")
         or raw.get("seller_answer")
+        or raw.get("seller_comment")
         or {}
     )
     answer_text = ""
+    answer_created_at = None
     if isinstance(answer_payload, dict):
         answer_text = str(answer_payload.get("text") or answer_payload.get("comment") or "").strip()
+        answer_created_at = _parse_date(
+            answer_payload.get("created_at")
+            or answer_payload.get("createdAt")
+            or answer_payload.get("date")
+        )
     elif isinstance(answer_payload, str):
         answer_text = answer_payload.strip()
 
     answered_flag = raw.get("answered") or raw.get("has_answer") or raw.get("is_answered")
-    answered = bool(answer_payload or answered_flag)
+    status_field = (
+        raw.get("status")
+        or raw.get("state")
+        or raw.get("review_status")
+        or raw.get("answer_status")
+    )
+    answered = bool(answer_payload or answered_flag or _status_answered(status_field))
 
     product_block_raw = raw.get("product") or raw.get("product_info") or {}
     product_block = product_block_raw if isinstance(product_block_raw, dict) else {}
@@ -519,7 +564,68 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
         raw_created_at=raw_created_at,
         answered=answered,
         answer_text=answer_text or None,
+        answer_created_at=answer_created_at,
+        status=str(status_field).strip() if status_field not in (None, "") else None,
     )
+
+
+async def refresh_review_from_api(card: ReviewCard, client: OzonClient) -> None:
+    """Дополнить карточку свежими данными и ответом продавца из Ozon API."""
+
+    if not card.id:
+        return
+
+    try:
+        payload = await client.review_info(card.id)
+        if isinstance(payload, dict):
+            data = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+            if isinstance(data, dict):
+                _merge_review_payload(card, data)
+    except Exception as exc:
+        logger.warning("Failed to refresh review %s info: %s", card.id, exc)
+
+    try:
+        comments = await client.review_comment_list(card.id)
+    except Exception as exc:
+        logger.warning("Failed to load review %s comments: %s", card.id, exc)
+        return
+
+    if not isinstance(comments, dict):
+        return
+
+    payload = comments.get("result") if isinstance(comments.get("result"), dict) else comments
+    raw_comments = payload.get("comments") or payload.get("items") or payload.get("result")
+
+    if not isinstance(raw_comments, list):
+        return
+
+    seller_comments: list[tuple[datetime | None, str]] = []
+    for comment in raw_comments:
+        if not isinstance(comment, dict):
+            continue
+        author = comment.get("author") or {}
+        role = (author.get("role") or author.get("type") or comment.get("author_role") or "").strip().lower()
+        if role and "seller" not in role and role not in {"merchant", "store"}:
+            continue
+        text = str(comment.get("text") or comment.get("comment") or "").strip()
+        created = _parse_date(
+            comment.get("created_at")
+            or comment.get("createdAt")
+            or comment.get("date")
+            or comment.get("comment_date")
+        )
+        if text:
+            seller_comments.append((created, text))
+
+    if not seller_comments:
+        return
+
+    seller_comments.sort(key=lambda x: x[0] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    latest_dt, latest_text = seller_comments[0]
+    card.answer_text = latest_text
+    card.answer_created_at = latest_dt or card.answer_created_at
+    card.status = card.status or "ANSWERED"
+    card.answered = True
 
 
 def _calc_stats(cards: List[ReviewCard]) -> Tuple[int, float, Dict[int, int]]:
@@ -593,8 +699,9 @@ def format_review_card_text(
     date_line = _fmt_dt_msk(card.created_at)
     stars = f"{card.rating}★" if card.rating else "—"
     product_line = _pick_product_label(card)
-    status = "Есть ответ" if is_answered(card, user_id) else "Без ответа"
-    answer_text = current_answer or card.answer_text or "(ответа пока нет)"
+    status_icon, status_label = _status_badge(card)
+    answer_text = current_answer or card.answer_text
+    answer_dt = _fmt_dt_msk(card.answer_created_at)
 
     title_parts = [f"{stars}"]
     if date_line:
@@ -602,6 +709,15 @@ def format_review_card_text(
     title = " • ".join(title_parts) if title_parts else "Отзыв"
 
     text_body = card.text or "(пустой отзыв)"
+    answer_lines: list[str] = []
+    if answer_text:
+        header = "Ответ продавца"
+        if answer_dt:
+            header = f"Ответ продавца от {answer_dt}"
+        answer_lines.extend([header + ":", answer_text])
+    else:
+        answer_lines.append("Ответа продавца пока нет.")
+
     lines = [
         f"{title} • {period_title}",
         "",
@@ -610,10 +726,9 @@ def format_review_card_text(
         "Текст отзыва:",
         text_body,
         "",
-        f"Статус: {status}",
+        f"Статус: {status_icon} {status_label}",
         "",
-        "Текущий ответ:",
-        answer_text,
+        *answer_lines,
     ]
     if card.id:
         lines.insert(3, f"ID отзыва: {card.id}")
@@ -762,12 +877,40 @@ async def fetch_recent_reviews(
     fetch_to_utc = _to_utc(to_msk)
     analytics_from = _iso_date(fetch_from_utc or fetch_since_msk)
     analytics_to = _iso_date(fetch_to_utc or to_msk)
-    raw = await client.get_reviews(
-        fetch_from_utc or fetch_since_msk,
-        fetch_to_utc or to_msk,
-        limit_per_page=limit_per_page,
-        max_count=max_reviews,
-    )
+    raw: list[Dict[str, Any]] = []
+    last_id: str | None = None
+    page = 1
+
+    while len(raw) < max_reviews:
+        res = await client.review_list(
+            date_start=_iso_no_ms(fetch_from_utc or fetch_since_msk),
+            date_end=_iso_no_ms(fetch_to_utc or to_msk),
+            limit=limit_per_page,
+            last_id=last_id,
+            page=page if last_id is None else None,
+        )
+        if not isinstance(res, dict):
+            break
+        items = res.get("reviews") or res.get("feedbacks") or res.get("items") or []
+        has_next = bool(res.get("has_next") or res.get("hasNext"))
+        next_last_id = res.get("last_id") or res.get("lastId")
+
+        if isinstance(items, list):
+            raw.extend([x for x in items if isinstance(x, dict)])
+        else:
+            break
+
+        if len(raw) >= max_reviews:
+            break
+
+        if has_next and next_last_id:
+            last_id = str(next_last_id)
+            continue
+
+        if has_next:
+            page += 1
+            continue
+        break
     if raw:
         # DEBUG: один пример для сверки схемы ReviewAPI, чтобы не спамить логи
         logger.debug("Sample review payload: %r", raw[0])
@@ -885,8 +1028,7 @@ def build_reviews_table(
 
     for idx, card in enumerate(slice_items):
         global_index = safe_page * page_size + idx
-        status_icon = "✅" if is_answered(card, user_id) else "✏️"
-        status_text = "Есть ответ" if is_answered(card, user_id) else "Без ответа"
+        status_icon, status_text = _status_badge(card)
         stars = f"{card.rating}★" if card.rating else "—"
         product_short = _pick_short_product_label(card)
         snippet = (card.text or "").strip()
@@ -895,9 +1037,10 @@ def build_reviews_table(
         date_part = _fmt_dt_msk(card.created_at) or "дата неизвестна"
         age = _human_age(card.created_at)
         age_part = f" ({age})" if age else ""
+        status_label = status_text.upper() if status_text else ""
         label = (
             f"{status_icon} {stars} | {date_part}{age_part} | "
-            f"Товар: {product_short} | {status_text}"
+            f"Товар: {product_short} | {status_label or 'СТАТУС НЕИЗВЕСТЕН'}"
         )
         if snippet:
             label = f"{label} | {snippet}"
@@ -1222,5 +1365,6 @@ __all__ = [
     "resolve_review_id",
     "format_review_card_text",
     "build_reviews_preview",
+    "refresh_review_from_api",
 ]
 
