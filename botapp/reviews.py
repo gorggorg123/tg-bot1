@@ -27,6 +27,8 @@ _sessions: dict[int, "ReviewSession"] = {}
 _review_id_to_token: dict[int, dict[str, str]] = {}
 _token_to_review_id: dict[int, dict[str, str]] = {}
 
+_normalize_debug_logged = 0
+
 API_ANALYTICS_SAMPLE_LIMIT = 5
 
 
@@ -479,8 +481,8 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
     product_name = next((str(v).strip() for v in product_name_fields if v not in (None, "")), None)
 
     # NEW: приводим идентификаторы к строкам, чтобы избежать ошибок .strip() для int
-    offer_id = str(offer_id_raw) if offer_id_raw is not None else None
-    product_id = str(product_id_raw) if product_id_raw is not None else None
+    offer_id = str(offer_id_raw).strip() if offer_id_raw is not None else None
+    product_id = str(product_id_raw).strip() if product_id_raw is not None else None
 
     created_candidates = [
         raw.get("created_at"),
@@ -493,6 +495,18 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
     ]
     raw_created_at = next((v for v in created_candidates if v not in (None, "")), None)
     created_at = next((dt for dt in (_parse_date(v) for v in created_candidates) if dt), None)
+
+    global _normalize_debug_logged
+    if _normalize_debug_logged < 3:
+        logger.debug(
+            "Normalize review id=%s product_raw=%r product_name=%r product_id=%r offer_id=%r",
+            raw.get("id") or raw.get("review_id") or raw.get("uuid"),
+            product_block_raw,
+            product_name,
+            product_id,
+            offer_id,
+        )
+        _normalize_debug_logged += 1
 
     return ReviewCard(
         id=str(raw.get("id") or raw.get("review_id") or raw.get("uuid") or "") or None,
@@ -646,7 +660,7 @@ async def _resolve_product_names(
         if not card.product_id and card.offer_id:
             card.product_id = card.offer_id
 
-        sku = next((v for v in (card.offer_id, card.product_id) if v), None)
+        sku = card.product_id
         if not sku:
             continue
 
@@ -681,13 +695,52 @@ async def _resolve_product_names(
             logger.warning("Failed to fetch SKU analytics: %s", exc)
 
     for sku, title in fetched_map.items():
-        cache[sku] = title
-        _product_name_cache[sku] = title
+        if title:
+            cache[sku] = title
+            _product_name_cache[sku] = title
 
     for card in cards:
-        sku = next((v for v in (card.offer_id, card.product_id) if v), None)
-        if sku and not card.product_name:
-            card.product_name = cache.get(sku) or _product_name_cache.get(sku) or card.product_name
+        if card.product_name:
+            continue
+
+        sku = card.product_id or card.offer_id
+        if not sku:
+            continue
+
+        cached_name = cache.get(sku)
+        if cached_name is None and sku in _product_name_cache:
+            cached_name = _product_name_cache.get(sku)
+            cache.setdefault(sku, cached_name)
+
+        if cached_name:
+            card.product_name = cached_name
+
+    missing_ids: set[str] = set()
+    for card in cards:
+        sku = card.product_id
+        if not sku or card.product_name:
+            continue
+        cached_val = cache.get(sku)
+        if cached_val:
+            continue
+        if sku in _product_name_cache:
+            continue
+        missing_ids.add(sku)
+
+    for product_id in missing_ids:
+        name: str | None = None
+        try:
+            name = await client.get_product_name(product_id)
+        except Exception as exc:
+            logger.warning("Failed to fetch product name for %s: %s", product_id, exc)
+
+        cache[product_id] = name
+        _product_name_cache[product_id] = name
+
+        if name:
+            for card in cards:
+                if card.product_id == product_id and not card.product_name:
+                    card.product_name = name
 
 
 async def fetch_recent_reviews(
