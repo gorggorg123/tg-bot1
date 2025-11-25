@@ -676,12 +676,9 @@ _client_write: OzonClient | None = None
 def has_write_credentials() -> bool:
     """Проверить наличие write-ключа в окружении."""
 
-    return bool((os.getenv("OZON_WRITE_API_KEY") or "").strip())
-
-    cid = (os.getenv("OZON_CLIENT_ID_WRITE") or os.getenv("OZON_CLIENT_ID") or "").strip()
-    key = (os.getenv("OZON_API_KEY_WRITE") or os.getenv("OZON_API_KEY") or "").strip()
-    return bool(cid and key)
-
+    client_id = (os.getenv("OZON_CLIENT_ID") or "").strip()
+    api_key = (os.getenv("OZON_API_KEY_WRITE") or "").strip()
+    return bool(client_id and api_key)
 
 def get_client(*, write: bool = False) -> OzonClient:
     """Ленивая инициализация клиента с учётом .env.
@@ -703,17 +700,11 @@ def get_write_client() -> OzonClient | None:
     """Получить write-клиент, если ключ в окружении задан."""
 
     global _client_write
-    api_key = (os.getenv("OZON_WRITE_API_KEY") or "").strip()
-    if not api_key:
-        return None
 
-    client_id = (
-        os.getenv("OZON_WRITE_CLIENT_ID")
-        or os.getenv("OZON_CLIENT_ID")
-        or ""
-    ).strip()
-    if not client_id:
-        logger.warning("OZON_WRITE_API_KEY задан, но OZON_WRITE_CLIENT_ID пуст")
+    client_id = (os.getenv("OZON_CLIENT_ID") or "").strip()
+    api_key = (os.getenv("OZON_API_KEY_WRITE") or "").strip()
+
+    if not client_id or not api_key:
         return None
 
     if _client_write is None:

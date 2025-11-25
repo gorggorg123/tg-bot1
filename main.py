@@ -526,7 +526,7 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
         client = get_write_client()
         if not client:
             await callback.message.answer(
-                "Отправка в Ozon недоступна: отсутствует write-ключ."
+                "Отправка на Ozon недоступна: не задан OZON_API_KEY_WRITE."
             )
             return
 
