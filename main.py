@@ -39,6 +39,7 @@ from botapp.reviews import (
     get_review_view,
     get_reviews_table,
     mark_review_answered,
+    refresh_review_from_api,
     encode_review_id,
     resolve_review_id,
     refresh_reviews,
@@ -255,6 +256,9 @@ async def _send_review_card(
         text = trim_for_telegram(view.text)
         markup = main_menu_keyboard()
     else:
+        client = get_client()
+        if client:
+            await refresh_review_from_api(card, client)
         current_answer = answer_override or await _get_local_answer(user_id, card.id)
         text = format_review_card_text(
             card=card,
@@ -552,6 +556,7 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
         _local_answers[(user_id, review.id)] = final_answer
         _local_answer_status[(user_id, review.id)] = "sent"
         mark_review_answered(review.id, user_id, final_answer)
+        await refresh_reviews(user_id)
         await callback.message.answer("Ответ отправлен в Ozon ✅")
         await _send_review_card(
             user_id=user_id,
@@ -608,7 +613,6 @@ async def handle_manual_answer(message: Message, state: FSMContext) -> None:
         return
 
     await _remember_local_answer(user_id, review_id, text)
-    mark_review_answered(review_id, user_id, text)
     await _send_review_card(
         user_id=user_id,
         category=category,
