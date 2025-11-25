@@ -315,7 +315,11 @@ async def _send_review_card(
 async def _get_local_answer(user_id: int, review_id: str | None) -> str | None:
     if not review_id:
         return None
-    return _local_answers.get((user_id, review_id))
+    try:
+        return await get_last_answer(user_id, review_id)
+    except Exception as exc:
+        logger.warning("Failed to load saved answer for %s: %s", review_id, exc)
+        return None
 
 
 async def _remember_local_answer(user_id: int, review_id: str | None, text: str) -> None:
