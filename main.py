@@ -39,6 +39,7 @@ from botapp.reviews import (
     get_review_view,
     get_reviews_table,
     mark_review_answered,
+    refresh_review_from_api,
     encode_review_id,
     resolve_review_id,
     refresh_reviews,
@@ -63,6 +64,7 @@ router = Router()
 _polling_task: asyncio.Task | None = None
 _polling_lock = asyncio.Lock()
 _last_service_messages: Dict[int, int] = {}
+_ephemeral_messages: Dict[int, Tuple[int, int, asyncio.Task]] = {}
 _reviews_list_messages: Dict[int, Tuple[int, int]] = {}
 _review_card_messages: Dict[int, Tuple[int, int]] = {}
 _local_answers: Dict[Tuple[int, str], str] = {}
@@ -95,6 +97,51 @@ async def delete_message_safe(bot: Bot, chat_id: int, message_id: int) -> None:
         if "message can't be deleted" in str(exc):
             return
         logger.debug("Skip delete message: %s", exc)
+
+
+async def _delete_later(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    delay: int,
+    user_id: int | None = None,
+) -> None:
+    try:
+        await asyncio.sleep(delay)
+        await delete_message_safe(bot, chat_id, message_id)
+    finally:
+        if user_id is not None:
+            tracked = _ephemeral_messages.get(user_id)
+            if tracked and tracked[1] == message_id:
+                _ephemeral_messages.pop(user_id, None)
+
+
+async def send_ephemeral_message(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    delay: int = 15,
+    user_id: int | None = None,
+    **kwargs,
+) -> Message:
+    """Отправляет служебное сообщение и удаляет его через ``delay`` секунд."""
+
+    if user_id is not None:
+        prev = _ephemeral_messages.pop(user_id, None)
+        if prev:
+            prev_chat_id, prev_msg_id, prev_task = prev
+            if prev_task and not prev_task.done():
+                prev_task.cancel()
+            with suppress(Exception):
+                await delete_message_safe(bot, prev_chat_id, prev_msg_id)
+
+    msg = await bot.send_message(chat_id, text, **kwargs)
+    delete_task = asyncio.create_task(
+        _delete_later(bot, chat_id, msg.message_id, delay, user_id)
+    )
+    if user_id is not None:
+        _ephemeral_messages[user_id] = (chat_id, msg.message_id, delete_task)
+    return msg
 
 
 async def send_service_message(
@@ -255,6 +302,9 @@ async def _send_review_card(
         text = trim_for_telegram(view.text)
         markup = main_menu_keyboard()
     else:
+        client = get_client()
+        if client:
+            await refresh_review_from_api(card, client)
         current_answer = answer_override or await _get_local_answer(user_id, card.id)
         text = format_review_card_text(
             card=card,
@@ -509,14 +559,22 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
     if action == "send":
         await callback.answer()
         if not review_id:
-            await callback.message.answer(
-                "Не удалось определить ID отзыва, попробуйте обновить список."
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Не удалось определить ID отзыва, попробуйте обновить список.",
+                user_id=user_id,
             )
             return
 
         review, _ = await get_review_by_id(user_id, category, review_id)
         if not review:
-            await callback.message.answer("Отзыв не найден, обновите список.")
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Отзыв не найден, обновите список.",
+                user_id=user_id,
+            )
             return
 
         final_answer = await _get_local_answer(user_id, review.id)
@@ -526,15 +584,21 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
             final_answer = final_answer.strip()
 
         if not final_answer:
-            await callback.message.answer(
-                "Нет сохранённого текста ответа. Сначала сгенерируйте или введите ответ."
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Нет сохранённого текста ответа. Сначала сгенерируйте или введите ответ.",
+                user_id=user_id,
             )
             return
 
         client = get_write_client()
         if not client:
-            await callback.message.answer(
-                "Отправка на Ozon недоступна: не задан OZON_API_KEY."
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Отправка на Ozon недоступна: не задан OZON_API_KEY.",
+                user_id=user_id,
             )
             return
 
@@ -544,15 +608,24 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
             logger.warning("Failed to send review %s to Ozon: %s", review.id, exc)
             _local_answers[(user_id, review.id)] = final_answer
             _local_answer_status[(user_id, review.id)] = "error"
-            await callback.message.answer(
-                "Не удалось отправить ответ в Ozon. Проверьте права API‑ключа OZON_API_KEY в личном кабинете Ozon или попробуйте позже."
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Не удалось отправить ответ в Ozon. Проверьте права API‑ключа OZON_API_KEY в личном кабинете Ozon или попробуйте позже.",
+                user_id=user_id,
             )
             return
 
         _local_answers[(user_id, review.id)] = final_answer
         _local_answer_status[(user_id, review.id)] = "sent"
         mark_review_answered(review.id, user_id, final_answer)
-        await callback.message.answer("Ответ отправлен в Ozon ✅")
+        await refresh_reviews(user_id)
+        await send_ephemeral_message(
+            callback.message.bot,
+            callback.message.chat.id,
+            "Ответ отправлен в Ozon ✅",
+            user_id=user_id,
+        )
         await _send_review_card(
             user_id=user_id,
             category=category,
@@ -581,7 +654,12 @@ async def handle_reprompt(message: Message, state: FSMContext) -> None:
 
     review, _ = await get_review_by_id(user_id, category, review_id)
     if not review:
-        await message.answer("Не удалось найти отзыв для пересборки.")
+        await send_ephemeral_message(
+            message.bot,
+            message.chat.id,
+            "Не удалось найти отзыв для пересборки.",
+            user_id=user_id,
+        )
         return
 
     await _handle_ai_reply(
@@ -604,11 +682,15 @@ async def handle_manual_answer(message: Message, state: FSMContext) -> None:
 
     text = (message.text or message.caption or "").strip()
     if not text:
-        await message.answer("Ответ пустой, пришлите текст.")
+        await send_ephemeral_message(
+            message.bot,
+            message.chat.id,
+            "Ответ пустой, пришлите текст.",
+            user_id=user_id,
+        )
         return
 
     await _remember_local_answer(user_id, review_id, text)
-    mark_review_answered(review_id, user_id, text)
     await _send_review_card(
         user_id=user_id,
         category=category,
