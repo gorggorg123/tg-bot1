@@ -43,12 +43,28 @@ def _pop_section(user_id: int, section: str) -> Tuple[int, int] | None:
     return _section_messages.get(user_id, {}).pop(section, None)
 
 
-async def delete_section_message(user_id: int, section: str, bot: Bot) -> None:
-    """Remove stored message for section if it exists."""
+async def delete_section_message(
+    user_id: int, section: str, bot: Bot, preserve_message_id: int | None = None
+) -> None:
+    """Remove stored message for section if it exists.
+
+    If ``preserve_message_id`` equals the stored message id, we only forget the
+    section without deleting the Telegram message (useful when the message was
+    reused via ``edit_text`` for another section).
+    """
 
     stored = _pop_section(user_id, section)
     if stored:
         chat_id, message_id = stored
+        if preserve_message_id is not None and preserve_message_id == message_id:
+            logger.debug(
+                "Skip deleting section '%s' message %s for user %s (preserved)",
+                section,
+                message_id,
+                user_id,
+            )
+            return
+
         logger.info(
             "Deleting previous section '%s' message %s for user %s", section, message_id, user_id
         )

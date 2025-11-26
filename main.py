@@ -167,7 +167,7 @@ async def _send_reviews_list(
     if not active_bot or active_chat is None:
         return
 
-    await send_section_message(
+    sent = await send_section_message(
         SECTION_REVIEWS_LIST,
         text=text,
         reply_markup=markup,
@@ -177,7 +177,12 @@ async def _send_reviews_list(
         chat_id=chat_id,
         user_id=user_id,
     )
-    await delete_section_message(user_id, SECTION_REVIEW_CARD, active_bot)
+    await delete_section_message(
+        user_id,
+        SECTION_REVIEW_CARD,
+        active_bot,
+        preserve_message_id=sent.message_id if sent else None,
+    )
 
 
 @router.message(CommandStart())
