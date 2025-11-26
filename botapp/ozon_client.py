@@ -242,6 +242,51 @@ class OzonClient:
             self._seller_api = SellerAPI(client_id=self.client_id, api_key=self.api_key)
         return self._seller_api
 
+
+@dataclass
+class Question:
+    id: str
+    created_at: str | None
+    sku: int | None
+    product_id: str | None
+    product_name: str | None
+    question_text: str
+    answer_text: str | None
+    status: str | None
+
+
+def _parse_question_item(item: Dict[str, Any]) -> Question | None:
+    try:
+        question_id_raw = item.get("question_id") or item.get("id")
+        question_id = str(question_id_raw or "").strip()
+        if not question_id:
+            return None
+
+        created = item.get("created_at") or item.get("createdAt") or item.get("date")
+        product_name = item.get("product_name") or item.get("item_name") or item.get("title")
+        question_text = item.get("question_text") or item.get("question") or item.get("text")
+        answer_text = item.get("answer_text") or item.get("answer")
+
+        sku_val = item.get("sku") or item.get("product_id") or item.get("productId")
+        try:
+            sku_int = int(sku_val) if sku_val is not None else None
+        except Exception:
+            sku_int = None
+
+        return Question(
+            id=question_id,
+            created_at=str(created) if created is not None else None,
+            sku=sku_int,
+            product_id=str(sku_val) if sku_val is not None else None,
+            product_name=str(product_name) if product_name not in (None, "") else None,
+            question_text=str(question_text) if question_text not in (None, "") else "",
+            answer_text=str(answer_text) if answer_text not in (None, "") else None,
+            status=str(item.get("status") or "").strip() or None,
+        )
+    except Exception as exc:  # pragma: no cover - защита от неожиданных данных
+        logger.warning("Failed to parse question item %s: %s", item, exc)
+        return None
+
     async def _post_with_status(
         self, path: str, json: Dict[str, Any]
     ) -> tuple[int, Dict[str, Any] | None]:
@@ -777,5 +822,72 @@ def get_write_client() -> OzonClient | None:
     if not has_write_credentials():
         return None
     return get_client()
+
+
+# ---------- Questions ----------
+
+
+async def get_questions_list(
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[Question]:
+    """Fetch list of customer questions via Seller API."""
+
+    client = get_client()
+    status_filter = None
+    if status in {"unanswered", "awaiting_seller"}:
+        status_filter = "awaiting_seller"
+    elif status == "answered":
+        status_filter = "answered"
+
+    body: Dict[str, Any] = {
+        "limit": max(1, min(limit, 200)),
+        "offset": max(0, offset),
+    }
+    if status_filter:
+        body["status"] = status_filter
+        body["filter"] = {"status": status_filter}
+
+    status_code, data = await client._post_with_status("/v1/question/list", body)
+    if status_code >= 400 or not isinstance(data, dict):
+        logger.warning("Failed to fetch questions: HTTP %s", status_code)
+        return []
+
+    payload = data.get("result") if isinstance(data.get("result"), dict) else data
+    arr = payload.get("questions") if isinstance(payload, dict) else []
+    if not isinstance(arr, list):
+        arr = payload.get("items") if isinstance(payload, dict) else []
+    if not isinstance(arr, list):
+        logger.warning("Unexpected questions payload: %r", data)
+        return []
+
+    result: list[Question] = []
+    for raw in arr:
+        if not isinstance(raw, dict):
+            continue
+        parsed = _parse_question_item(raw)
+        if parsed:
+            result.append(parsed)
+    return result
+
+
+async def send_question_answer(question_id: str, text: str) -> None:
+    client = get_write_client()
+    if client is None:
+        raise OzonAPIError("Нет прав на отправку ответов в Ozon")
+
+    body = {"question_id": question_id, "answer": text, "text": text}
+    status_code, data = await client._post_with_status("/v1/question/answer", body)
+    if status_code >= 400:
+        raise OzonAPIError(f"Ошибка Ozon API: HTTP {status_code} {data}")
+
+
+async def get_question_by_id(question_id: str) -> Question | None:
+    questions = await get_questions_list(status=None, limit=200, offset=0)
+    for q in questions:
+        if q.id == question_id:
+            return q
+    return None
 
 
