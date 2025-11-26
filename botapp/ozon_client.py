@@ -507,6 +507,53 @@ class OzonClient:
         }
         return await self._post_with_status("/v1/review/list", body)
 
+    async def review_list(
+        self,
+        *,
+        date_start: str | None = None,
+        date_end: str | None = None,
+        limit: int = 100,
+        page: int | None = None,
+        last_id: str | None = None,
+    ) -> dict | None:
+        """Обёртка над /v1/review/list для новых бета-методов отзывов."""
+
+        body: Dict[str, Any] = {"limit": max(1, min(limit, 100))}
+        if page is not None:
+            body["page"] = max(1, page)
+        if last_id:
+            body["last_id"] = last_id
+        if date_start:
+            body["date_start"] = date_start
+        if date_end:
+            body["date_end"] = date_end
+
+        data = await self.post("/v1/review/list", body)
+        if not isinstance(data, dict):
+            logger.warning("Unexpected /v1/review/list response: %r", data)
+            return None
+        return data.get("result") if isinstance(data.get("result"), dict) else data
+
+    async def review_info(self, review_id: str) -> dict | None:
+        """Получить детали конкретного отзыва через /v1/review/info."""
+
+        payload = {"review_id": review_id}
+        data = await self.post("/v1/review/info", payload)
+        if not isinstance(data, dict):
+            logger.warning("Unexpected /v1/review/info response: %r", data)
+            return None
+        return data.get("result") if isinstance(data.get("result"), dict) else data
+
+    async def review_comment_list(self, review_id: str, *, limit: int = 50) -> dict | None:
+        """Получить комментарии/ответы продавца через /v1/review/comment/list."""
+
+        body = {"review_id": review_id, "limit": max(1, min(limit, 50))}
+        data = await self.post("/v1/review/comment/list", body)
+        if not isinstance(data, dict):
+            logger.warning("Unexpected /v1/review/comment/list response: %r", data)
+            return None
+        return data.get("result") if isinstance(data.get("result"), dict) else data
+
     async def create_review_comment(
         self,
         review_id: str,
