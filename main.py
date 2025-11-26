@@ -8,7 +8,6 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -46,6 +45,17 @@ from botapp.reviews import (
     trim_for_telegram,
     build_reviews_preview,
 )
+from botapp.message_gc import (
+    SECTION_ACCOUNT,
+    SECTION_FBO,
+    SECTION_FINANCE_TODAY,
+    SECTION_MENU,
+    SECTION_REVIEW_CARD,
+    SECTION_REVIEWS_LIST,
+    delete_message_safe,
+    delete_section_message,
+    send_section_message,
+)
 
 load_dotenv()
 
@@ -63,10 +73,7 @@ if not TG_BOT_TOKEN:
 router = Router()
 _polling_task: asyncio.Task | None = None
 _polling_lock = asyncio.Lock()
-_last_service_messages: Dict[int, int] = {}
 _ephemeral_messages: Dict[int, Tuple[int, int, asyncio.Task]] = {}
-_reviews_list_messages: Dict[int, Tuple[int, int]] = {}
-_review_card_messages: Dict[int, Tuple[int, int]] = {}
 _local_answers: Dict[Tuple[int, str], str] = {}
 _local_answer_status: Dict[Tuple[int, str], str] = {}
 
@@ -86,17 +93,6 @@ def get_last_answer(user_id: int, review_id: str | None) -> str | None:
 class ReviewAnswerStates(StatesGroup):
     reprompt = State()
     manual = State()
-
-
-async def delete_message_safe(bot: Bot, chat_id: int, message_id: int) -> None:
-    try:
-        await bot.delete_message(chat_id, message_id)
-    except TelegramBadRequest as exc:
-        if "message to delete not found" in str(exc):
-            return
-        if "message can't be deleted" in str(exc):
-            return
-        logger.debug("Skip delete message: %s", exc)
 
 
 async def _delete_later(
@@ -123,7 +119,7 @@ async def send_ephemeral_message(
     delay: int = 15,
     user_id: int | None = None,
     **kwargs,
-) -> Message:
+    ) -> Message:
     """Отправляет служебное сообщение и удаляет его через ``delay`` секунд."""
 
     if user_id is not None:
@@ -144,27 +140,9 @@ async def send_ephemeral_message(
     return msg
 
 
-async def send_service_message(
-    bot: Bot, chat_id: int, user_id: int, text: str, reply_markup=None
-) -> Message:
-    """Отправить служебное сообщение, удалив предыдущее для пользователя."""
-
-    prev = _last_service_messages.get(user_id)
-    if prev:
-        await delete_message_safe(bot, chat_id, prev)
-
-    sent = await bot.send_message(chat_id, text, reply_markup=reply_markup)
-    _last_service_messages[user_id] = sent.message_id
-    return sent
-
-
-def _remember_list_message(user_id: int, chat_id: int, message_id: int) -> None:
-    _reviews_list_messages[user_id] = (chat_id, message_id)
-    remember_service_message(user_id, message_id)
-
-
-def _remember_card_message(user_id: int, chat_id: int, message_id: int) -> None:
-    _review_card_messages[user_id] = (chat_id, message_id)
+async def _clear_sections(bot: Bot, user_id: int, sections: list[str]) -> None:
+    for section in sections:
+        await delete_section_message(user_id, section, bot)
 
 
 async def _send_reviews_list(
@@ -183,42 +161,23 @@ async def _send_reviews_list(
     markup = reviews_list_keyboard(
         category=category, page=safe_page, total_pages=total_pages, items=items
     )
-
     target = callback.message if callback else message
     active_bot = bot or (target.bot if target else None)
     active_chat = chat_id or (target.chat.id if target else None)
     if not active_bot or active_chat is None:
         return
 
-    stored = _reviews_list_messages.get(user_id)
-    preferred_id = stored[1] if stored else None
-    target_msg_id = None
-    if target and target.message_id == preferred_id:
-        target_msg_id = target.message_id
-    elif preferred_id:
-        target_msg_id = preferred_id
-
-    # Стараемся переиспользовать одно сообщение списка
-    if target_msg_id:
-        try:
-            edited = await active_bot.edit_message_text(
-                text=text,
-                chat_id=active_chat,
-                message_id=target_msg_id,
-                reply_markup=markup,
-            )
-            _remember_list_message(user_id, active_chat, edited.message_id)
-            return
-        except TelegramBadRequest:
-            with suppress(Exception):
-                await delete_message_safe(active_bot, active_chat, target_msg_id)
-
-    sent = await send_service_message(active_bot, active_chat, user_id, text, reply_markup=markup)
-    _remember_list_message(user_id, active_chat, sent.message_id)
-
-
-def remember_service_message(user_id: int, message_id: int) -> None:
-    _last_service_messages[user_id] = message_id
+    await send_section_message(
+        SECTION_REVIEWS_LIST,
+        text=text,
+        reply_markup=markup,
+        message=message,
+        callback=callback,
+        bot=bot,
+        chat_id=chat_id,
+        user_id=user_id,
+    )
+    await delete_section_message(user_id, SECTION_REVIEW_CARD, active_bot)
 
 
 @router.message(CommandStart())
@@ -227,54 +186,75 @@ async def cmd_start(message: Message) -> None:
         "Привет! Я помогу быстро смотреть финансы, заказы и отзывы Ozon.\n"
         "Выберите раздел через кнопки ниже."
     )
-    await send_service_message(
+    await _clear_sections(
         message.bot,
-        message.chat.id,
         message.from_user.id,
-        text,
+        [SECTION_FBO, SECTION_FINANCE_TODAY, SECTION_ACCOUNT, SECTION_REVIEWS_LIST, SECTION_REVIEW_CARD],
+    )
+    await send_section_message(
+        SECTION_MENU,
+        text=text,
         reply_markup=main_menu_keyboard(),
+        message=message,
     )
 
 
 @router.message(Command("fin_today"))
 async def cmd_fin_today(message: Message) -> None:
     text = await get_finance_today_text()
-    await send_service_message(
+    await _clear_sections(
         message.bot,
-        message.chat.id,
         message.from_user.id,
-        text,
+        [SECTION_FBO, SECTION_ACCOUNT, SECTION_REVIEWS_LIST, SECTION_REVIEW_CARD],
+    )
+    await send_section_message(
+        SECTION_FINANCE_TODAY,
+        text=text,
         reply_markup=main_menu_keyboard(),
+        message=message,
     )
 
 
 @router.message(Command("account"))
 async def cmd_account(message: Message) -> None:
     text = await get_account_info_text()
-    await send_service_message(
+    await _clear_sections(
         message.bot,
-        message.chat.id,
         message.from_user.id,
-        text,
+        [SECTION_FBO, SECTION_FINANCE_TODAY, SECTION_REVIEWS_LIST, SECTION_REVIEW_CARD],
+    )
+    await send_section_message(
+        SECTION_ACCOUNT,
+        text=text,
         reply_markup=account_keyboard(),
+        message=message,
     )
 
 
 @router.message(Command("fbo"))
 async def cmd_fbo(message: Message) -> None:
     text = await get_orders_today_text()
-    await send_service_message(
+    await _clear_sections(
         message.bot,
-        message.chat.id,
         message.from_user.id,
-        text,
+        [SECTION_FINANCE_TODAY, SECTION_ACCOUNT, SECTION_REVIEWS_LIST, SECTION_REVIEW_CARD],
+    )
+    await send_section_message(
+        SECTION_FBO,
+        text=text,
         reply_markup=fbo_menu_keyboard(),
+        message=message,
     )
 
 
 @router.message(Command("reviews"))
 async def cmd_reviews(message: Message) -> None:
     user_id = message.from_user.id
+    await _clear_sections(
+        message.bot,
+        user_id,
+        [SECTION_FBO, SECTION_FINANCE_TODAY, SECTION_ACCOUNT],
+    )
     await refresh_reviews(user_id)
     await _send_reviews_list(
         user_id=user_id,
@@ -322,9 +302,6 @@ async def _send_review_card(
         )
 
     target = callback.message if callback else message
-    list_msg = _reviews_list_messages.get(user_id)
-    if list_msg and target and target.message_id == list_msg[1]:
-        target = None  # Не трогаем сообщение-таблицу
 
     active_bot = None
     active_chat = None
@@ -338,40 +315,16 @@ async def _send_review_card(
     if not active_bot or active_chat is None:
         return
 
-    stored = _review_card_messages.get(user_id)
-    preferred_chat_id, preferred_msg_id = stored if stored else (None, None)
-
-    if preferred_msg_id and preferred_chat_id == active_chat:
-        try:
-            edited = await active_bot.edit_message_text(
-                text=text,
-                chat_id=preferred_chat_id,
-                message_id=preferred_msg_id,
-                reply_markup=markup,
-            )
-            _remember_card_message(user_id, preferred_chat_id, edited.message_id)
-            return
-        except TelegramBadRequest:
-            with suppress(Exception):
-                await delete_message_safe(active_bot, preferred_chat_id, preferred_msg_id)
-
-    if target:
-        try:
-            edited = await target.edit_text(text, reply_markup=markup)
-            _remember_card_message(user_id, active_chat, edited.message_id)
-            if preferred_msg_id and preferred_msg_id != edited.message_id:
-                with suppress(Exception):
-                    await delete_message_safe(active_bot, active_chat, preferred_msg_id)
-            return
-        except TelegramBadRequest:
-            with suppress(Exception):
-                await delete_message_safe(active_bot, active_chat, target.message_id)
-
-    sent = await active_bot.send_message(active_chat, text, reply_markup=markup)
-    _remember_card_message(user_id, active_chat, sent.message_id)
-    if preferred_msg_id and preferred_msg_id != sent.message_id:
-        with suppress(Exception):
-            await delete_message_safe(active_bot, active_chat, preferred_msg_id)
+    await send_section_message(
+        SECTION_REVIEW_CARD,
+        text=text,
+        reply_markup=markup,
+        message=message,
+        callback=callback,
+        bot=active_bot,
+        chat_id=active_chat,
+        user_id=user_id,
+    )
 
 
 async def _get_local_answer(user_id: int, review_id: str | None) -> str | None:
@@ -385,13 +338,6 @@ async def _remember_local_answer(user_id: int, review_id: str | None, text: str)
         return
     _local_answers[(user_id, review_id)] = text
     _local_answer_status[(user_id, review_id)] = "draft"
-
-
-async def _delete_card_message(user_id: int, bot: Bot) -> None:
-    card = _review_card_messages.pop(user_id, None)
-    if card:
-        chat_id, msg_id = card
-        await delete_message_safe(bot, chat_id, msg_id)
 
 
 async def _handle_ai_reply(
@@ -441,45 +387,123 @@ async def _handle_ai_reply(
 @router.callback_query(MenuCallbackData.filter(F.section == "home"))
 async def cb_home(callback: CallbackQuery, callback_data: MenuCallbackData) -> None:
     await callback.answer()
-    await callback.message.answer("Главное меню", reply_markup=main_menu_keyboard())
+    user_id = callback.from_user.id
+    await _clear_sections(
+        callback.message.bot,
+        user_id,
+        [
+            SECTION_FBO,
+            SECTION_FINANCE_TODAY,
+            SECTION_ACCOUNT,
+            SECTION_REVIEWS_LIST,
+            SECTION_REVIEW_CARD,
+        ],
+    )
+    await send_section_message(
+        SECTION_MENU,
+        text="Главное меню",
+        reply_markup=main_menu_keyboard(),
+        callback=callback,
+        user_id=user_id,
+    )
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "fbo"))
 async def cb_fbo(callback: CallbackQuery, callback_data: MenuCallbackData) -> None:
     await callback.answer()
     action = callback_data.action
+    user_id = callback.from_user.id
     if action == "summary":
         text = await get_orders_today_text()
-        try:
-            await callback.message.edit_text(text, reply_markup=fbo_menu_keyboard())
-        except TelegramBadRequest:
-            await callback.message.answer(text, reply_markup=fbo_menu_keyboard())
-    elif action == "month":
-        await callback.message.answer(
-            "Месячная сводка пока в разработке, покажем как только будет готово.",
+        await send_section_message(
+            SECTION_FBO,
+            text=text,
             reply_markup=fbo_menu_keyboard(),
+            callback=callback,
+            user_id=user_id,
+        )
+    elif action == "month":
+        await send_section_message(
+            SECTION_FBO,
+            text="Месячная сводка пока в разработке, покажем как только будет готово.",
+            reply_markup=fbo_menu_keyboard(),
+            callback=callback,
+            user_id=user_id,
         )
     elif action == "filter":
-        await callback.message.answer("Фильтр скоро", reply_markup=fbo_menu_keyboard())
+        await send_section_message(
+            SECTION_FBO,
+            text="Фильтр скоро",
+            reply_markup=fbo_menu_keyboard(),
+            callback=callback,
+            user_id=user_id,
+        )
     elif action == "open":
         text = await get_orders_today_text()
-        await callback.message.answer(text, reply_markup=fbo_menu_keyboard())
+        await send_section_message(
+            SECTION_FBO,
+            text=text,
+            reply_markup=fbo_menu_keyboard(),
+            callback=callback,
+            user_id=user_id,
+        )
     elif action == "home":
-        await callback.message.answer("Главное меню", reply_markup=main_menu_keyboard())
+        await _clear_sections(
+            callback.message.bot,
+            user_id,
+            [
+                SECTION_FBO,
+                SECTION_FINANCE_TODAY,
+                SECTION_ACCOUNT,
+                SECTION_REVIEWS_LIST,
+                SECTION_REVIEW_CARD,
+            ],
+        )
+        await send_section_message(
+            SECTION_MENU,
+            text="Главное меню",
+            reply_markup=main_menu_keyboard(),
+            callback=callback,
+            user_id=user_id,
+        )
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "account"))
 async def cb_account(callback: CallbackQuery, callback_data: MenuCallbackData) -> None:
     await callback.answer()
     text = await get_account_info_text()
-    await callback.message.answer(text, reply_markup=account_keyboard())
+    user_id = callback.from_user.id
+    await _clear_sections(
+        callback.message.bot,
+        user_id,
+        [SECTION_FBO, SECTION_FINANCE_TODAY, SECTION_REVIEWS_LIST, SECTION_REVIEW_CARD],
+    )
+    await send_section_message(
+        SECTION_ACCOUNT,
+        text=text,
+        reply_markup=account_keyboard(),
+        callback=callback,
+        user_id=user_id,
+    )
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "fin_today"))
 async def cb_fin_today(callback: CallbackQuery, callback_data: MenuCallbackData) -> None:
     await callback.answer()
     text = await get_finance_today_text()
-    await callback.message.answer(text, reply_markup=main_menu_keyboard())
+    user_id = callback.from_user.id
+    await _clear_sections(
+        callback.message.bot,
+        user_id,
+        [SECTION_FBO, SECTION_ACCOUNT, SECTION_REVIEWS_LIST, SECTION_REVIEW_CARD],
+    )
+    await send_section_message(
+        SECTION_FINANCE_TODAY,
+        text=text,
+        reply_markup=main_menu_keyboard(),
+        callback=callback,
+        user_id=user_id,
+    )
 
 
 @router.callback_query(ReviewsCallbackData.filter())
@@ -504,7 +528,7 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
             bot=callback.message.bot,
             chat_id=callback.message.chat.id,
         )
-        await _delete_card_message(user_id, callback.message.bot)
+        await delete_section_message(user_id, SECTION_REVIEW_CARD, callback.message.bot)
         return
 
     if action == "open_card":
@@ -704,7 +728,17 @@ async def handle_manual_answer(message: Message, state: FSMContext) -> None:
 
 @router.message()
 async def handle_any(message: Message) -> None:
-    await message.answer("Выберите действие в меню ниже", reply_markup=main_menu_keyboard())
+    await _clear_sections(
+        message.bot,
+        message.from_user.id,
+        [SECTION_FBO, SECTION_FINANCE_TODAY, SECTION_ACCOUNT, SECTION_REVIEWS_LIST, SECTION_REVIEW_CARD],
+    )
+    await send_section_message(
+        SECTION_MENU,
+        text="Выберите действие в меню ниже",
+        reply_markup=main_menu_keyboard(),
+        message=message,
+    )
 
 
 def build_dispatcher() -> Dispatcher:
