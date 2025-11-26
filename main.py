@@ -64,6 +64,7 @@ router = Router()
 _polling_task: asyncio.Task | None = None
 _polling_lock = asyncio.Lock()
 _last_service_messages: Dict[int, int] = {}
+_ephemeral_messages: Dict[int, Tuple[int, int, asyncio.Task]] = {}
 _reviews_list_messages: Dict[int, Tuple[int, int]] = {}
 _review_card_messages: Dict[int, Tuple[int, int]] = {}
 _local_answers: Dict[Tuple[int, str], str] = {}
@@ -98,23 +99,48 @@ async def delete_message_safe(bot: Bot, chat_id: int, message_id: int) -> None:
         logger.debug("Skip delete message: %s", exc)
 
 
-async def _delete_later(bot: Bot, chat_id: int, message_id: int, delay: int) -> None:
+async def _delete_later(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    delay: int,
+    user_id: int | None = None,
+) -> None:
     try:
         await asyncio.sleep(delay)
-        await bot.delete_message(chat_id, message_id)
-    except TelegramBadRequest:
-        return
-    except Exception:
-        logger.debug("Skip delayed delete for %s", message_id, exc_info=True)
+        await delete_message_safe(bot, chat_id, message_id)
+    finally:
+        if user_id is not None:
+            tracked = _ephemeral_messages.get(user_id)
+            if tracked and tracked[1] == message_id:
+                _ephemeral_messages.pop(user_id, None)
 
 
 async def send_ephemeral_message(
-    bot: Bot, chat_id: int, text: str, delay: int = 15, **kwargs
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    delay: int = 15,
+    user_id: int | None = None,
+    **kwargs,
 ) -> Message:
     """Отправляет служебное сообщение и удаляет его через ``delay`` секунд."""
 
+    if user_id is not None:
+        prev = _ephemeral_messages.pop(user_id, None)
+        if prev:
+            prev_chat_id, prev_msg_id, prev_task = prev
+            if prev_task and not prev_task.done():
+                prev_task.cancel()
+            with suppress(Exception):
+                await delete_message_safe(bot, prev_chat_id, prev_msg_id)
+
     msg = await bot.send_message(chat_id, text, **kwargs)
-    asyncio.create_task(_delete_later(bot, chat_id, msg.message_id, delay))
+    delete_task = asyncio.create_task(
+        _delete_later(bot, chat_id, msg.message_id, delay, user_id)
+    )
+    if user_id is not None:
+        _ephemeral_messages[user_id] = (chat_id, msg.message_id, delete_task)
     return msg
 
 
@@ -537,6 +563,7 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
                 callback.message.bot,
                 callback.message.chat.id,
                 "Не удалось определить ID отзыва, попробуйте обновить список.",
+                user_id=user_id,
             )
             return
 
@@ -546,6 +573,7 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
                 callback.message.bot,
                 callback.message.chat.id,
                 "Отзыв не найден, обновите список.",
+                user_id=user_id,
             )
             return
 
@@ -560,6 +588,7 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
                 callback.message.bot,
                 callback.message.chat.id,
                 "Нет сохранённого текста ответа. Сначала сгенерируйте или введите ответ.",
+                user_id=user_id,
             )
             return
 
@@ -569,6 +598,7 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
                 callback.message.bot,
                 callback.message.chat.id,
                 "Отправка на Ozon недоступна: не задан OZON_API_KEY.",
+                user_id=user_id,
             )
             return
 
@@ -582,6 +612,7 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
                 callback.message.bot,
                 callback.message.chat.id,
                 "Не удалось отправить ответ в Ozon. Проверьте права API‑ключа OZON_API_KEY в личном кабинете Ozon или попробуйте позже.",
+                user_id=user_id,
             )
             return
 
@@ -593,6 +624,7 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
             callback.message.bot,
             callback.message.chat.id,
             "Ответ отправлен в Ozon ✅",
+            user_id=user_id,
         )
         await _send_review_card(
             user_id=user_id,
@@ -626,6 +658,7 @@ async def handle_reprompt(message: Message, state: FSMContext) -> None:
             message.bot,
             message.chat.id,
             "Не удалось найти отзыв для пересборки.",
+            user_id=user_id,
         )
         return
 
@@ -653,6 +686,7 @@ async def handle_manual_answer(message: Message, state: FSMContext) -> None:
             message.bot,
             message.chat.id,
             "Ответ пустой, пришлите текст.",
+            user_id=user_id,
         )
         return
 
