@@ -243,50 +243,6 @@ class OzonClient:
         return self._seller_api
 
 
-@dataclass
-class Question:
-    id: str
-    created_at: str | None
-    sku: int | None
-    product_id: str | None
-    product_name: str | None
-    question_text: str
-    answer_text: str | None
-    status: str | None
-
-
-def _parse_question_item(item: Dict[str, Any]) -> Question | None:
-    try:
-        question_id_raw = item.get("question_id") or item.get("id")
-        question_id = str(question_id_raw or "").strip()
-        if not question_id:
-            return None
-
-        created = item.get("created_at") or item.get("createdAt") or item.get("date")
-        product_name = item.get("product_name") or item.get("item_name") or item.get("title")
-        question_text = item.get("question_text") or item.get("question") or item.get("text")
-        answer_text = item.get("answer_text") or item.get("answer")
-
-        sku_val = item.get("sku") or item.get("product_id") or item.get("productId")
-        try:
-            sku_int = int(sku_val) if sku_val is not None else None
-        except Exception:
-            sku_int = None
-
-        return Question(
-            id=question_id,
-            created_at=str(created) if created is not None else None,
-            sku=sku_int,
-            product_id=str(sku_val) if sku_val is not None else None,
-            product_name=str(product_name) if product_name not in (None, "") else None,
-            question_text=str(question_text) if question_text not in (None, "") else "",
-            answer_text=str(answer_text) if answer_text not in (None, "") else None,
-            status=str(item.get("status") or "").strip() or None,
-        )
-    except Exception as exc:  # pragma: no cover - защита от неожиданных данных
-        logger.warning("Failed to parse question item %s: %s", item, exc)
-        return None
-
     async def _post_with_status(
         self, path: str, json: Dict[str, Any]
     ) -> tuple[int, Dict[str, Any] | None]:
@@ -822,6 +778,54 @@ def get_write_client() -> OzonClient | None:
     if not has_write_credentials():
         return None
     return get_client()
+
+
+# ---------- Questions helpers ----------
+
+
+@dataclass
+class Question:
+    id: str
+    created_at: str | None
+    sku: int | None
+    product_id: str | None
+    product_name: str | None
+    question_text: str
+    answer_text: str | None
+    status: str | None
+
+
+def _parse_question_item(item: Dict[str, Any]) -> Question | None:
+    try:
+        question_id_raw = item.get("question_id") or item.get("id")
+        question_id = str(question_id_raw or "").strip()
+        if not question_id:
+            return None
+
+        created = item.get("created_at") or item.get("createdAt") or item.get("date")
+        product_name = item.get("product_name") or item.get("item_name") or item.get("title")
+        question_text = item.get("question_text") or item.get("question") or item.get("text")
+        answer_text = item.get("answer_text") or item.get("answer")
+
+        sku_val = item.get("sku") or item.get("product_id") or item.get("productId")
+        try:
+            sku_int = int(sku_val) if sku_val is not None else None
+        except Exception:
+            sku_int = None
+
+        return Question(
+            id=question_id,
+            created_at=str(created) if created is not None else None,
+            sku=sku_int,
+            product_id=str(sku_val) if sku_val is not None else None,
+            product_name=str(product_name) if product_name not in (None, "") else None,
+            question_text=str(question_text) if question_text not in (None, "") else "",
+            answer_text=str(answer_text) if answer_text not in (None, "") else None,
+            status=str(item.get("status") or "").strip() or None,
+        )
+    except Exception as exc:  # pragma: no cover - защита от неожиданных данных
+        logger.warning("Failed to parse question item %s: %s", item, exc)
+        return None
 
 
 # ---------- Questions ----------
