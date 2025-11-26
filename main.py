@@ -31,6 +31,7 @@ from botapp.keyboards import (
 )
 from botapp.orders import get_orders_today_text
 from botapp.ozon_client import (
+    OzonAPIError,
     get_client,
     get_write_client,
     has_write_credentials,
@@ -198,9 +199,23 @@ async def _send_question_card(
     if question_id:
         question = find_question(user_id, question_id)
         if question is None:
-            question = await api_get_question_by_id(question_id)
+            try:
+                question = await api_get_question_by_id(question_id)
+            except OzonAPIError as exc:
+                target = callback.message if callback else message
+                if target:
+                    await send_ephemeral_message(
+                        target.bot,
+                        target.chat.id,
+                        f"⚠️ Не удалось получить вопрос. Ошибка: {exc}",
+                        user_id=user_id,
+                    )
+                return
             if question:
-                await refresh_questions(user_id, category)
+                try:
+                    await refresh_questions(user_id, category)
+                except Exception:
+                    logger.exception("Failed to refresh questions cache after fetch")
 
     if not question:
         target = callback.message if callback else message
@@ -279,9 +294,32 @@ async def _send_questions_list(
     bot: Bot | None = None,
     chat_id: int | None = None,
 ) -> None:
-    text, items, safe_page, total_pages = await get_questions_table(
-        user_id=user_id, category=category, page=page
-    )
+    try:
+        text, items, safe_page, total_pages = await get_questions_table(
+            user_id=user_id, category=category, page=page
+        )
+    except OzonAPIError as exc:
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                target.chat.id,
+                f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
+                user_id=user_id,
+            )
+        logger.warning("Unable to load questions list: %s", exc)
+        return
+    except Exception:
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                target.chat.id,
+                "⚠️ Не удалось получить список вопросов. Попробуйте позже.",
+                user_id=user_id,
+            )
+        logger.exception("Unexpected error while loading questions list")
+        return
     markup = questions_list_keyboard(
         category=category, page=safe_page, total_pages=total_pages, items=items
     )
@@ -813,7 +851,26 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
     question_id = callback_data.question_id
 
     if action == "list":
-        await refresh_questions(user_id, category)
+        try:
+            await refresh_questions(user_id, category)
+        except OzonAPIError as exc:
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
+                user_id=user_id,
+            )
+            return
+        except Exception:
+            logger.exception("Unexpected error while refreshing questions")
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "⚠️ Не удалось получить список вопросов. Попробуйте позже.",
+                user_id=user_id,
+            )
+            return
+
         await _send_questions_list(
             user_id=user_id, category=category, page=page, callback=callback
         )
@@ -1261,5 +1318,9 @@ async def reviews(days: int = 30) -> dict:
 
     return await build_reviews_preview(days=days)
 
+
+# Summary of latest changes:
+# - Updated questions section to use correct Ozon status mapping and robust error handling.
+# - Added Pydantic-backed parsing and user-facing warnings for question list failures.
 
 __all__ = ["app", "bot", "dp", "router"]

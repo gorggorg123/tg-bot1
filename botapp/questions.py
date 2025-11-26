@@ -74,22 +74,18 @@ _sessions: Dict[int, QuestionsSession] = {}
 
 def _filter_by_category(items: List[Question], category: str) -> List[Question]:
     if category == "unanswered":
-        return [q for q in items if not q.answer_text]
+        return [q for q in items if (q.status or "").upper() != "PROCESSED" and not q.answer_text]
     if category == "answered":
-        return [q for q in items if q.answer_text]
+        return [q for q in items if (q.status or "").upper() == "PROCESSED" or q.answer_text]
     return items
 
 
 async def refresh_questions(user_id: int, category: str) -> List[Question]:
-    try:
-        questions = await get_questions_list(
-            status=None if category == "all" else category,
-            limit=200,
-            offset=0,
-        )
-    except Exception:
-        logger.exception("Failed to load questions list")
-        return []
+    questions = await get_questions_list(
+        status=None if category == "all" else category,
+        limit=200,
+        offset=0,
+    )
 
     session = _sessions.setdefault(user_id, QuestionsSession())
     session.all = questions
