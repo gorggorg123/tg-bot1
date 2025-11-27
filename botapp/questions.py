@@ -207,6 +207,12 @@ def find_question(user_id: int, question_id: str) -> Question | None:
     return None
 
 
+def resolve_question_id(user_id: int, question_id: str) -> Question | None:
+    """Backward-compatible helper to resolve a question by its Ozon ID."""
+
+    return find_question(user_id, question_id)
+
+
 def format_question_card_text(question: Question, answer_override: str | None = None) -> str:
     """Build a readable card text for Telegram messages."""
 
@@ -252,6 +258,7 @@ __all__ = [
     "get_question_by_index",
     "get_question_index",
     "find_question",
+    "resolve_question_id",
     "format_question_card_text",
     "register_question_token",
     "resolve_question_token",
