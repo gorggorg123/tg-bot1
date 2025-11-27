@@ -186,6 +186,16 @@ def get_question_by_index(user_id: int, category: str, index: int) -> Question |
     return None
 
 
+def get_question_index(user_id: int, category: str, question_id: str) -> int | None:
+    """Return absolute index of question in cached list if present."""
+
+    questions = _get_cached_questions(user_id, category)
+    for idx, q in enumerate(questions):
+        if q.id == question_id:
+            return idx
+    return None
+
+
 def find_question(user_id: int, question_id: str) -> Question | None:
     """Find question by its Ozon identifier across cached categories."""
 
@@ -240,6 +250,7 @@ __all__ = [
     "refresh_questions",
     "get_questions_table",
     "get_question_by_index",
+    "get_question_index",
     "find_question",
     "format_question_card_text",
     "register_question_token",

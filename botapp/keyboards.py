@@ -445,83 +445,6 @@ def question_card_keyboard(
                     callback_data=MenuCallbackData(section="home", action="open").pack(),
                 )
             ],
-        ]
-    )
-
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def question_card_keyboard(
-    *,
-    category: str,
-    page: int,
-    question_id: str | None,
-    can_send: bool = True,
-) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = [
-        [
-            InlineKeyboardButton(
-                text="✉️ Ответ через ИИ",
-                callback_data=QuestionsCallbackData(
-                    action="card_ai",
-                    category=category,
-                    page=page,
-                    question_id=question_id,
-                ).pack(),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="✏️ Ввести ответ вручную",
-                callback_data=QuestionsCallbackData(
-                    action="card_manual",
-                    category=category,
-                    page=page,
-                    question_id=question_id,
-                ).pack(),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="🔁 Пересобрать по моему промту",
-                callback_data=QuestionsCallbackData(
-                    action="card_reprompt",
-                    category=category,
-                    page=page,
-                    question_id=question_id,
-                ).pack(),
-            )
-        ],
-    ]
-
-    if can_send and has_write_credentials():
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="✅ Отправить на Ozon",
-                    callback_data=QuestionsCallbackData(
-                        action="send",
-                        category=category,
-                        page=page,
-                        question_id=question_id,
-                    ).pack(),
-                )
-            ]
-        )
-
-    rows.extend(
-        [
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад к списку",
-                    callback_data=QuestionsCallbackData(
-                        action="list_page",
-                        category=category,
-                        page=page,
-                        question_id=question_id,
-                    ).pack(),
-                )
-            ],
             [
                 InlineKeyboardButton(
                     text="⬅️ В главное меню",
@@ -674,14 +597,6 @@ def questions_list_keyboard(
             text=f"Стр. {page + 1}/{safe_total_pages}",
             callback_data=QuestionsCallbackData(action="noop", category=category, page=page).pack(),
         ),
-        InlineKeyboardButton(
-            text="Вперёд ▶️" if page + 1 < total_pages else "⏭️",
-            callback_data=QuestionsCallbackData(
-                action="page",
-                category=category,
-                page=min(page + 1, max(total_pages - 1, 0)),
-            ).pack(),
-        ),
     ]
 
     rows.append(filter_row)
@@ -754,7 +669,7 @@ def questions_list_keyboard(
         InlineKeyboardButton(
             text="Вперёд ▶️" if page + 1 < total_pages else "⏭️",
             callback_data=QuestionsCallbackData(
-                action="list_page",
+                action="page",
                 category=category,
                 page=min(page + 1, max(total_pages - 1, 0)),
             ).pack(),

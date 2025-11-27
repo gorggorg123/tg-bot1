@@ -62,8 +62,10 @@ from botapp.questions import (
     find_question,
     format_question_card_text,
     get_question_by_index,
+    get_question_index,
     get_questions_table,
     refresh_questions,
+    register_question_token,
     resolve_question_token,
 )
 from botapp.storage import append_question_record, upsert_question_answer
@@ -87,6 +89,13 @@ from botapp.questions import (
     refresh_questions,
     resolve_question_id,
 )
+
+try:
+    from botapp.states import QuestionAnswerStates
+except Exception:  # pragma: no cover - fallback for import issues during deploy
+    class QuestionAnswerStates(StatesGroup):
+        manual = State()
+        reprompt = State()
 
 try:
     from botapp.states import QuestionAnswerStates
@@ -265,6 +274,14 @@ async def _send_question_card(
 
     draft = answer_override or get_last_question_answer(user_id, question.id)
     text = format_question_card_text(question, answer_override=draft)
+    if not question_token:
+        idx = get_question_index(user_id, category, question.id)
+        if idx is None:
+            idx = get_question_index(user_id, "all", question.id)
+            if idx is not None:
+                category = "all"
+        if idx is not None:
+            question_token = register_question_token(user_id=user_id, category=category, index=idx)
     markup = question_card_keyboard(
         category=category,
         page=page,
@@ -1104,6 +1121,15 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
                         question = get_question_by_index(user_id, cat, idx_int)
                         if question:
                             question_id = question.id
+
+        if question and not token:
+            idx = get_question_index(user_id, category, question.id)
+            if idx is None:
+                idx = get_question_index(user_id, "all", question.id)
+                if idx is not None:
+                    category = "all"
+            if idx is not None:
+                token = register_question_token(user_id=user_id, category=category, index=idx)
 
         if question is None:
             await callback.answer(
