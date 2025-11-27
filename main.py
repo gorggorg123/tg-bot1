@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 from contextlib import suppress
+from datetime import datetime, timezone
 from typing import Dict, Tuple
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -19,15 +20,26 @@ from botapp.finance import get_finance_today_text
 from botapp.keyboards import (
     MenuCallbackData,
     ReviewsCallbackData,
+    QuestionsCallbackData,
     account_keyboard,
     fbo_menu_keyboard,
     main_menu_keyboard,
+    question_card_keyboard,
+    questions_list_keyboard,
     review_card_keyboard,
     reviews_list_keyboard,
 )
 from botapp.orders import get_orders_today_text
-from botapp.ozon_client import get_client, get_write_client, has_write_credentials
-from botapp.ai_client import generate_review_reply
+from botapp.ozon_client import (
+    OzonAPIError,
+    get_client,
+    get_write_client,
+    has_write_credentials,
+    get_question_by_id as api_get_question_by_id,
+    get_questions_list,
+    send_question_answer,
+)
+from botapp.ai_client import generate_review_reply, generate_answer_for_question
 from botapp.reviews import (
     ReviewCard,
     format_review_card_text,
@@ -45,17 +57,37 @@ from botapp.reviews import (
     trim_for_telegram,
     build_reviews_preview,
 )
+from botapp.questions import (
+    find_question,
+    format_question_card_text,
+    get_question_by_index,
+    get_question_index,
+    get_questions_table,
+    refresh_questions,
+    register_question_token,
+    resolve_question_token,
+)
+from botapp.storage import append_question_record, upsert_question_answer
 from botapp.message_gc import (
     SECTION_ACCOUNT,
     SECTION_FBO,
     SECTION_FINANCE_TODAY,
     SECTION_MENU,
+    SECTION_QUESTION_CARD,
+    SECTION_QUESTIONS_LIST,
     SECTION_REVIEW_CARD,
     SECTION_REVIEWS_LIST,
     delete_message_safe,
     delete_section_message,
     send_section_message,
 )
+
+try:
+    from botapp.states import QuestionAnswerStates
+except Exception:  # pragma: no cover - fallback for import issues during deploy
+    class QuestionAnswerStates(StatesGroup):
+        manual = State()
+        reprompt = State()
 
 load_dotenv()
 
@@ -76,6 +108,8 @@ _polling_lock = asyncio.Lock()
 _ephemeral_messages: Dict[int, Tuple[int, int, asyncio.Task]] = {}
 _local_answers: Dict[Tuple[int, str], str] = {}
 _local_answer_status: Dict[Tuple[int, str], str] = {}
+_question_answers: Dict[Tuple[int, str], str] = {}
+_question_answer_status: Dict[Tuple[int, str], str] = {}
 
 
 def get_last_answer(user_id: int, review_id: str | None) -> str | None:
@@ -87,6 +121,16 @@ def get_last_answer(user_id: int, review_id: str | None) -> str | None:
         return _local_answers.get((user_id, review_id))
     except Exception as exc:  # pragma: no cover - аварийная защита от порчи стейта
         logger.warning("Failed to read local answer for %s: %s", review_id, exc)
+        return None
+
+
+def get_last_question_answer(user_id: int, question_id: str | None) -> str | None:
+    if not question_id:
+        return None
+    try:
+        return _question_answers.get((user_id, question_id))
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Failed to read local question answer for %s: %s", question_id, exc)
         return None
 
 
@@ -145,6 +189,83 @@ async def _clear_sections(bot: Bot, user_id: int, sections: list[str]) -> None:
         await delete_section_message(user_id, section, bot)
 
 
+def _remember_question_answer(user_id: int, question_id: str, text: str, status: str = "draft") -> None:
+    _question_answers[(user_id, question_id)] = text
+    _question_answer_status[(user_id, question_id)] = status
+
+
+async def _send_question_card(
+    *,
+    user_id: int,
+    category: str,
+    question_id: str | None,
+    page: int,
+    callback: CallbackQuery | None = None,
+    message: Message | None = None,
+    answer_override: str | None = None,
+    question_token: str | None = None,
+) -> None:
+    question = None
+    if question_id:
+        question = find_question(user_id, question_id)
+        if question is None:
+            try:
+                question = await api_get_question_by_id(question_id)
+            except OzonAPIError as exc:
+                target = callback.message if callback else message
+                if target:
+                    await send_ephemeral_message(
+                        target.bot,
+                        target.chat.id,
+                        f"⚠️ Не удалось получить вопрос. Ошибка: {exc}",
+                        user_id=user_id,
+                    )
+                return
+            if question:
+                try:
+                    await refresh_questions(user_id, category)
+                except Exception:
+                    logger.exception("Failed to refresh questions cache after fetch")
+
+    if not question:
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                target.chat.id,
+                "Вопрос не найден или уже недоступен.",
+                user_id=user_id,
+            )
+        return
+
+    draft = answer_override or get_last_question_answer(user_id, question.id)
+    text = format_question_card_text(question, answer_override=draft)
+    if not question_token:
+        idx = get_question_index(user_id, category, question.id)
+        if idx is None:
+            idx = get_question_index(user_id, "all", question.id)
+            if idx is not None:
+                category = "all"
+        if idx is not None:
+            question_token = register_question_token(user_id=user_id, category=category, index=idx)
+    markup = question_card_keyboard(
+        category=category,
+        page=page,
+        question_id=question.id,
+        question_token=question_token,
+        can_send=True,
+    )
+
+    await send_section_message(
+        SECTION_QUESTION_CARD,
+        text=text,
+        reply_markup=markup,
+        message=message,
+        callback=callback,
+        user_id=user_id,
+    )
+
+
 async def _send_reviews_list(
     *,
     user_id: int,
@@ -185,6 +306,73 @@ async def _send_reviews_list(
     )
 
 
+async def _send_questions_list(
+    *,
+    user_id: int,
+    category: str,
+    page: int = 0,
+    message: Message | None = None,
+    callback: CallbackQuery | None = None,
+    bot: Bot | None = None,
+    chat_id: int | None = None,
+) -> None:
+    try:
+        text, items, safe_page, total_pages = await get_questions_table(
+            user_id=user_id, category=category, page=page
+        )
+    except OzonAPIError as exc:
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                target.chat.id,
+                f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
+                user_id=user_id,
+            )
+        logger.warning("Unable to load questions list: %s", exc)
+        return
+    except Exception:
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                target.chat.id,
+                "⚠️ Не удалось получить список вопросов. Попробуйте позже.",
+                user_id=user_id,
+            )
+        logger.exception("Unexpected error while loading questions list")
+        return
+    markup = questions_list_keyboard(
+        user_id=user_id,
+        category=category,
+        page=safe_page,
+        total_pages=total_pages,
+        items=items,
+    )
+    target = callback.message if callback else message
+    active_bot = bot or (target.bot if target else None)
+    active_chat = chat_id or (target.chat.id if target else None)
+    if not active_bot or active_chat is None:
+        return
+
+    sent = await send_section_message(
+        SECTION_QUESTIONS_LIST,
+        text=text,
+        reply_markup=markup,
+        message=message,
+        callback=callback,
+        bot=bot,
+        chat_id=chat_id,
+        user_id=user_id,
+    )
+    await delete_section_message(
+        user_id,
+        SECTION_QUESTION_CARD,
+        active_bot,
+        preserve_message_id=sent.message_id if sent else None,
+    )
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     text = (
@@ -194,7 +382,15 @@ async def cmd_start(message: Message) -> None:
     await _clear_sections(
         message.bot,
         message.from_user.id,
-        [SECTION_FBO, SECTION_FINANCE_TODAY, SECTION_ACCOUNT, SECTION_REVIEWS_LIST, SECTION_REVIEW_CARD],
+        [
+            SECTION_FBO,
+            SECTION_FINANCE_TODAY,
+            SECTION_ACCOUNT,
+            SECTION_REVIEWS_LIST,
+            SECTION_REVIEW_CARD,
+            SECTION_QUESTIONS_LIST,
+            SECTION_QUESTION_CARD,
+        ],
     )
     await send_section_message(
         SECTION_MENU,
@@ -672,6 +868,253 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
     )
 
 
+@router.callback_query(QuestionsCallbackData.filter())
+async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallbackData, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    action = callback_data.action
+    category = callback_data.category or "all"
+    page = int(callback_data.page or 0)
+    question_id = callback_data.question_id
+    question_token = getattr(callback_data, "question_token", None)
+
+    if action == "list":
+        try:
+            await refresh_questions(user_id, category)
+        except OzonAPIError as exc:
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
+                user_id=user_id,
+            )
+            return
+        except Exception:
+            logger.exception("Unexpected error while refreshing questions")
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "⚠️ Не удалось получить список вопросов. Попробуйте позже.",
+                user_id=user_id,
+            )
+            return
+
+        await _send_questions_list(
+            user_id=user_id, category=category, page=page, callback=callback
+        )
+        return
+
+    if action in {"list_page", "page"}:
+        await _send_questions_list(
+            user_id=user_id, category=category, page=page, callback=callback
+        )
+        return
+
+    if action in {"open", "open_card"}:
+        token = getattr(callback_data, "question_token", None)
+        question = None
+        if token:
+            question = resolve_question_token(user_id, token)
+            if question:
+                question_id = question.id
+
+        if question is None:
+            data = callback_data.model_dump()
+            q_id = data.get("question_id") or data.get("id")
+            if q_id:
+                question = find_question(user_id, q_id)
+                question_id = q_id
+            else:
+                idx = data.get("index") or data.get("question_index")
+                if idx is not None:
+                    try:
+                        idx_int = int(idx)
+                    except Exception:
+                        idx_int = None
+                    if idx_int is not None:
+                        cat = data.get("category") or category
+                        question = get_question_by_index(user_id, cat, idx_int)
+                        if question:
+                            question_id = question.id
+
+        if question and not token:
+            idx = get_question_index(user_id, category, question.id)
+            if idx is None:
+                idx = get_question_index(user_id, "all", question.id)
+                if idx is not None:
+                    category = "all"
+            if idx is not None:
+                token = register_question_token(user_id=user_id, category=category, index=idx)
+
+        if question is None:
+            await callback.answer(
+                "Не удалось найти этот вопрос. Обновите список и попробуйте ещё раз.",
+                show_alert=True,
+            )
+            return
+
+        text = format_question_card_text(question)
+        await send_section_message(
+            SECTION_QUESTION_CARD,
+            text=text,
+            reply_markup=question_card_keyboard(
+                category=category,
+                page=page,
+                question_id=question.id,
+                question_token=token,
+                can_send=True,
+            ),
+            callback=callback,
+            user_id=user_id,
+        )
+        return
+
+    if action == "card_ai":
+        question = None
+        if question_id:
+            question = find_question(user_id, question_id) or await api_get_question_by_id(
+                question_id
+            )
+        if not question:
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Не удалось найти вопрос для генерации ответа.",
+                user_id=user_id,
+            )
+            return
+        ai_answer = await generate_answer_for_question(
+            question_text=question.question_text,
+            product_name=question.product_name,
+            existing_answer=question.answer_text or get_last_question_answer(user_id, question.id),
+        )
+        if not ai_answer:
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Не удалось сгенерировать ответ, попробуйте ещё раз позже.",
+                user_id=user_id,
+            )
+            return
+
+        _remember_question_answer(user_id, question.id, ai_answer, status="ai")
+        upsert_question_answer(
+            question.id,
+            question_id=question.id,
+            created_at=question.created_at,
+            sku=question.sku,
+            product_name=question.product_name,
+            question=question.question_text,
+            answer=ai_answer,
+            answer_source="ai",
+            answer_sent_to_ozon=False,
+            meta={"chat_id": callback.message.chat.id, "message_id": callback.message.message_id},
+        )
+        await _send_question_card(
+            user_id=user_id,
+            category=category,
+            question_id=question.id,
+            page=page,
+            callback=callback,
+            answer_override=ai_answer,
+            question_token=question_token,
+        )
+        return
+
+    if action == "card_manual":
+        await state.set_state(QuestionAnswerStates.manual)
+        await state.update_data(question_id=question_id, category=category, page=page)
+        await send_ephemeral_message(
+            callback.message.bot,
+            callback.message.chat.id,
+            "Пришлите текст ответа для покупателя.",
+            user_id=user_id,
+        )
+        return
+
+    if action == "card_reprompt":
+        await state.set_state(QuestionAnswerStates.reprompt)
+        await state.update_data(question_id=question_id, category=category, page=page)
+        await send_ephemeral_message(
+            callback.message.bot,
+            callback.message.chat.id,
+            "Опишите, что изменить или добавить к ответу.",
+            user_id=user_id,
+        )
+        return
+
+    if action == "send":
+        question = None
+        if question_id:
+            question = find_question(user_id, question_id) or await api_get_question_by_id(
+                question_id
+            )
+        if not question:
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Вопрос не найден. Обновите список и попробуйте снова.",
+                user_id=user_id,
+            )
+            return
+
+        answer = get_last_question_answer(user_id, question.id) or question.answer_text
+        if not answer:
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Ответ пока не подготовлен.",
+                user_id=user_id,
+            )
+            return
+        try:
+            await send_question_answer(question.id, answer)
+        except Exception as exc:
+            logger.warning("Failed to send question answer %s: %s", question.id, exc)
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Не удалось отправить ответ в Ozon. Проверьте права API‑ключа OZON_API_KEY.",
+                user_id=user_id,
+            )
+            return
+
+        _remember_question_answer(user_id, question.id, answer, status="sent")
+        upsert_question_answer(
+            question.id,
+            question_id=question.id,
+            created_at=question.created_at,
+            sku=question.sku,
+            product_name=question.product_name,
+            question=question.question_text,
+            answer=answer,
+            answer_source=_question_answer_status.get((user_id, question.id), "manual"),
+            answer_sent_to_ozon=True,
+            answer_sent_at=datetime.now(timezone.utc).isoformat(),
+            meta={"chat_id": callback.message.chat.id, "message_id": callback.message.message_id},
+        )
+        await refresh_questions(user_id, category)
+        await send_ephemeral_message(
+            callback.message.bot,
+            callback.message.chat.id,
+            "Ответ отправлен в Ozon ✅",
+            user_id=user_id,
+        )
+        await _send_question_card(
+            user_id=user_id,
+            category=category,
+            question_id=question.id,
+            page=page,
+            callback=callback,
+            answer_override=answer,
+            question_token=question_token,
+        )
+        return
+
+    await callback.message.answer(
+        "Выберите действие в меню ниже", reply_markup=main_menu_keyboard()
+    )
+
+
 @router.message(ReviewAnswerStates.reprompt)
 async def handle_reprompt(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
@@ -731,12 +1174,130 @@ async def handle_manual_answer(message: Message, state: FSMContext) -> None:
     )
 
 
+@router.message(QuestionAnswerStates.reprompt)
+async def handle_question_reprompt(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.clear()
+    question_id = data.get("question_id")
+    category = data.get("category") or "all"
+    page = int(data.get("page") or 0)
+    user_id = message.from_user.id
+
+    question = None
+    if question_id:
+        question = find_question(user_id, question_id) or await api_get_question_by_id(
+            question_id
+        )
+    if not question:
+        await send_ephemeral_message(
+            message.bot,
+            message.chat.id,
+            "Не удалось найти вопрос для пересборки.",
+            user_id=user_id,
+        )
+        return
+
+    previous = get_last_question_answer(user_id, question.id) or question.answer_text
+    prompt = (message.text or message.caption or "").strip()
+    ai_answer = await generate_answer_for_question(
+        question_text=question.question_text,
+        product_name=question.product_name,
+        existing_answer=previous,
+        user_prompt=prompt,
+    )
+    _remember_question_answer(user_id, question.id, ai_answer, status="ai_edited")
+    upsert_question_answer(
+        question.id,
+        question_id=question.id,
+        created_at=question.created_at,
+        sku=question.sku,
+        product_name=question.product_name,
+        question=question.question_text,
+        answer=ai_answer,
+        answer_source="ai_edited",
+        answer_sent_to_ozon=False,
+        meta={"chat_id": message.chat.id, "message_id": message.message_id},
+    )
+    await _send_question_card(
+        user_id=user_id,
+        category=category,
+        question_id=question.id,
+        page=page,
+        message=message,
+        answer_override=ai_answer,
+    )
+
+
+@router.message(QuestionAnswerStates.manual)
+async def handle_question_manual(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.clear()
+    question_id = data.get("question_id")
+    category = data.get("category") or "all"
+    page = int(data.get("page") or 0)
+    user_id = message.from_user.id
+
+    text = (message.text or message.caption or "").strip()
+    if not text:
+        await send_ephemeral_message(
+            message.bot,
+            message.chat.id,
+            "Ответ пустой, пришлите текст.",
+            user_id=user_id,
+        )
+        return
+
+    question = None
+    if question_id:
+        question = find_question(user_id, question_id) or await api_get_question_by_id(
+            question_id
+        )
+    if not question:
+        await send_ephemeral_message(
+            message.bot,
+            message.chat.id,
+            "Не удалось найти вопрос.",
+            user_id=user_id,
+        )
+        return
+
+    _remember_question_answer(user_id, question.id, text, status="manual")
+    upsert_question_answer(
+        question.id,
+        question_id=question.id,
+        created_at=question.created_at,
+        sku=question.sku,
+        product_name=question.product_name,
+        question=question.question_text,
+        answer=text,
+        answer_source="manual",
+        answer_sent_to_ozon=False,
+        meta={"chat_id": message.chat.id, "message_id": message.message_id},
+    )
+    await _send_question_card(
+        user_id=user_id,
+        category=category,
+        question_id=question.id,
+        page=page,
+        message=message,
+        answer_override=text,
+    )
+
+
 @router.message()
 async def handle_any(message: Message) -> None:
     await _clear_sections(
         message.bot,
         message.from_user.id,
-        [SECTION_FBO, SECTION_FINANCE_TODAY, SECTION_ACCOUNT, SECTION_REVIEWS_LIST, SECTION_REVIEW_CARD],
+        [
+            SECTION_FBO,
+            SECTION_FINANCE_TODAY,
+            SECTION_ACCOUNT,
+            SECTION_REVIEWS_LIST,
+            SECTION_REVIEW_CARD,
+            SECTION_QUESTIONS_LIST,
+            SECTION_QUESTION_CARD,
+        ],
     )
     await send_section_message(
         SECTION_MENU,
@@ -831,5 +1392,9 @@ async def reviews(days: int = 30) -> dict:
 
     return await build_reviews_preview(days=days)
 
+
+# Summary of latest changes:
+# - Added a safe fallback for QuestionAnswerStates import to prevent FSM NameErrors on deploy.
+# - Kept question list handling on Ozon-approved statuses with Pydantic parsing and user-facing warnings.
 
 __all__ = ["app", "bot", "dp", "router"]
