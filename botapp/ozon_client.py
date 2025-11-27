@@ -872,17 +872,26 @@ class GetQuestionListRequest(BaseModel):
 
 
 class QuestionListItem(BaseModel):
-    question_id: str = Field(..., alias="question_id")
-    created_at: str | None = Field(default=None, alias="created_at")
-    updated_at: str | None = Field(default=None, alias="updated_at")
-    sku: int | None = Field(default=None, alias="sku")
-    product_id: int | None = Field(default=None, alias="product_id")
-    product_name: str | None = Field(default=None, alias="product_name")
-    text: str | None = Field(default=None, alias="text")
-    question_text: str | None = Field(default=None, alias="question_text")
-    answer_text: str | None = Field(default=None, alias="answer_text")
-    answer: str | None = Field(default=None, alias="answer")
-    status: str | None = Field(default=None, alias="status")
+    """Гибкая модель элемента из /v1/question/list.
+
+    Ozon иногда меняет схему, поэтому:
+    * все поля опциональные,
+    * extra-поля разрешены,
+    * id можно получить и из ``id``, и из ``question_id``.
+    """
+
+    id: str | None = None
+    question_id: str | None = None
+    created_at: Any | None = None
+    updated_at: Any | None = None
+    sku: Any | None = None
+    product_id: Any | None = None
+    product_name: str | None = None
+    text: str | None = None
+    question_text: str | None = None
+    answer_text: str | None = None
+    answer: str | None = None
+    status: str | None = None
 
     model_config = ConfigDict(extra="allow", protected_namespaces=())
 
@@ -902,6 +911,15 @@ class GetQuestionListResult(BaseModel):
 
 
 class GetQuestionListResponse(BaseModel):
+    """Нормализованный ответ /v1/question/list.
+
+    Возможные варианты структуры:
+      * {"result": {"questions": [...]}}
+      * {"result": {"items": [...]}}
+      * {"questions": [...]}
+      * {"items": [...]}
+    """
+
     result: GetQuestionListResult | None = None
     questions: list[QuestionListItem] = Field(default_factory=list)
     items: list[QuestionListItem] = Field(default_factory=list)
@@ -933,9 +951,14 @@ class Question:
 
 
 def _parse_question_item(item: Dict[str, Any]) -> Question | None:
+    """Приводим "сырой" элемент ответа к dataclass Question.
+
+    Принимает либо dict, либо QuestionListItem.
+    """
+
     try:
         if isinstance(item, QuestionListItem):
-            question_id_raw = item.question_id
+            question_id_raw = item.question_id or item.id
             created = item.created_at
             product_name = item.product_name
             question_text = item.question_text or item.text
@@ -945,11 +968,24 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
         else:
             question_id_raw = item.get("question_id") or item.get("id")
             created = item.get("created_at") or item.get("createdAt") or item.get("date")
-            product_name = item.get("product_name") or item.get("item_name") or item.get("title")
-            question_text = item.get("question_text") or item.get("question") or item.get("text")
+            product_name = (
+                item.get("product_name")
+                or item.get("item_name")
+                or item.get("title")
+            )
+            question_text = (
+                item.get("question_text")
+                or item.get("question")
+                or item.get("text")
+            )
             answer_text = item.get("answer_text") or item.get("answer")
-            sku_val = item.get("sku") or item.get("product_id") or item.get("productId")
+            sku_val = (
+                item.get("sku")
+                or item.get("product_id")
+                or item.get("productId")
+            )
             status = item.get("status")
+
         question_id = str(question_id_raw or "").strip()
         if not question_id:
             return None
@@ -992,7 +1028,12 @@ async def get_questions_list(
     limit: int = 50,
     offset: int = 0,
 ) -> list[Question]:
-    """Fetch list of customer questions via Seller API."""
+    """Получить список вопросов покупателей через Seller API.
+
+    Устойчиво к неожиданным форматам ответа:
+    при ошибке валидации возвращает список (может быть пустой),
+    а не падает с исключением.
+    """
 
     client = get_client()
     ozon_status = _map_question_status(status)
@@ -1010,28 +1051,28 @@ async def get_questions_list(
         if isinstance(data, dict):
             message = data.get("message") or data.get("error")
         logger.warning("Failed to fetch questions: HTTP %s %s", status_code, data)
-        raise OzonAPIError(
-            f"Ошибка Ozon API: HTTP {status_code} {message or data}")
+        raise OzonAPIError(f"Ошибка Ozon API: HTTP {status_code} {message or data}")
 
+    # Аккуратно парсим ответ
     try:
-        resp = GetQuestionListResponse.model_validate(data)
+        resp = GetQuestionListResponse.model_validate(
+            data.get("result") if isinstance(data.get("result"), dict) else data
+        )
+        raw_items: list[QuestionListItem | Dict[str, Any]] = resp.collect()
     except ValidationError as exc:
+        # Если схема изменилась — логируем и пробуем работать как с "сырым" dict
         logger.warning("Failed to parse questions response: %s", exc)
         payload = data.get("result") if isinstance(data.get("result"), dict) else data
         arr = payload.get("questions") if isinstance(payload, dict) else []
         if not isinstance(arr, list):
             arr = payload.get("items") if isinstance(payload, dict) else []
-    else:
-        arr = resp.collect()
-
-    if not isinstance(arr, list):
-        logger.warning("Unexpected questions payload: %r", data)
-        return []
+        if not isinstance(arr, list):
+            logger.warning("Unexpected questions payload: %r", data)
+            return []
+        raw_items = arr  # type: ignore[assignment]
 
     result: list[Question] = []
-    for raw in arr:
-        if not isinstance(raw, (dict, QuestionListItem)):
-            continue
+    for raw in raw_items:
         parsed = _parse_question_item(raw)
         if parsed:
             result.append(parsed)
@@ -1055,5 +1096,6 @@ async def get_question_by_id(question_id: str) -> Question | None:
         if q.id == question_id:
             return q
     return None
+
 
 
