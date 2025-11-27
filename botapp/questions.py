@@ -1,49 +1,77 @@
+# botapp/questions.py
 """Helpers for loading and formatting customer questions from Ozon.
 
-This module mirrors the reviews helper design: it caches per-user question lists
-in memory, supports pagination, and offers helpers to format question cards.
-Functions exported here are intentionally stable because other modules import
-them directly (e.g., :mod:`main`, :mod:`botapp.keyboards`).
+Логика максимально похожа на модуль с отзывами:
+- кешируем вопросы по user_id,
+- поддерживаем категории (all / unanswered / answered),
+- даём удобные функции для main.py и keyboards.py.
 """
+
 from __future__ import annotations
 
 import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from botapp.ozon_client import Question, get_questions_list
 
 logger = logging.getLogger(__name__)
 
+# МСК: Ozon все даты отдаёт в UTC, но интерфейс — под МСК
 MSK_SHIFT = timedelta(hours=3)
 MSK_TZ = timezone(MSK_SHIFT)
+
+# Сколько вопросов на странице списка
 QUESTIONS_PAGE_SIZE = 10
+
+# Время жизни кеша списка вопросов
 SESSION_TTL = timedelta(minutes=2)
+
+
+# ---------------------------------------------------------------------------
+# Модель сессии вопросов на одного Telegram-пользователя
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class QuestionsSession:
-    """Cached state for a single Telegram user."""
+    """Кеш состояния по вопросам для одного пользователя Telegram."""
 
+    # Полный список вопросов, как пришёл от API
     all: List[Question] = field(default_factory=list)
+    # Быстрые предфильтры
     unanswered: List[Question] = field(default_factory=list)
     answered: List[Question] = field(default_factory=list)
+
+    # Текущие страницы по категориям (для возможной навигации)
     page: Dict[str, int] = field(
         default_factory=lambda: {"all": 0, "unanswered": 0, "answered": 0}
     )
+
+    # Время загрузки кеша
     loaded_at: datetime = field(default_factory=datetime.utcnow)
+
+    # Токены -> (category, index) для компактных callback_data
     tokens: Dict[str, Tuple[str, int]] = field(default_factory=dict)
 
 
+# user_id -> QuestionsSession
 _sessions: Dict[int, QuestionsSession] = {}
 
 
-def _parse_date(value: str | None) -> datetime | None:
+# ---------------------------------------------------------------------------
+# Вспомогательные функции для дат и человекочитаемых меток
+# ---------------------------------------------------------------------------
+
+
+def _parse_date(value: Optional[str]) -> Optional[datetime]:
+    """Аккуратно парсим ISO-дату из API Ozon, возвращаем UTC-datetime."""
     if not value:
         return None
     try:
+        # Ozon часто отдаёт "2025-11-27T09:07:33.288Z"
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except Exception:
         return None
@@ -52,132 +80,203 @@ def _parse_date(value: str | None) -> datetime | None:
     return dt.replace(tzinfo=timezone.utc)
 
 
-def _to_msk(dt: datetime | None) -> datetime | None:
+def _to_msk(dt: Optional[datetime]) -> Optional[datetime]:
+    """Переводим datetime в МСК."""
     if not dt:
         return None
     base = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     return base.astimezone(MSK_TZ)
 
 
-def _fmt_dt_msk(dt: datetime | None) -> str:
+def _fmt_dt_msk(dt: Optional[datetime]) -> str:
+    """Форматируем дату в строку МСК вида 27.11.2025 12:34."""
     if not dt:
         return ""
     msk = _to_msk(dt)
     return msk.strftime("%d.%m.%Y %H:%M") if msk else ""
 
 
-def _human_age(dt: datetime | None) -> str:
+def _human_age(dt: Optional[datetime]) -> str:
+    """Человекочитаемый возраст даты: "сегодня", "вчера", "N дн. назад"."""
     if not dt:
         return ""
     msk = _to_msk(dt)
     if not msk:
         return ""
     today = datetime.now(MSK_TZ).date()
-    delta = (today - msk.date()).days
-    if delta < 0:
+    delta_days = (today - msk.date()).days
+    if delta_days < 0:
         return "из будущего"
-    if delta == 0:
+    if delta_days == 0:
         return "сегодня"
-    if delta == 1:
+    if delta_days == 1:
         return "вчера"
-    return f"{delta} дн. назад"
+    return f"{delta_days} дн. назад"
+
+
+# ---------------------------------------------------------------------------
+# Фильтрация и кеширование списков вопросов
+# ---------------------------------------------------------------------------
 
 
 def _filter_by_category(items: List[Question], category: str) -> List[Question]:
-    """Filter questions list by UI category."""
+    """Фильтруем вопросы по UI-категории.
 
-    if category == "unanswered":
-        return [q for q in items if (q.status or "").upper() != "PROCESSED" and not q.answer_text]
-    if category == "answered":
-        return [q for q in items if (q.status or "").upper() == "PROCESSED" or q.answer_text]
+    category:
+      - "all"         — без фильтра
+      - "unanswered"  — без ответа / не обработанные
+      - "answered"    — есть ответ / обработанные
+    """
+    cat = (category or "all").lower()
+
+    if cat == "unanswered":
+        # Ориентируемся на отсутствие текста ответа и статус != PROCESSED
+        return [
+            q
+            for q in items
+            if (getattr(q, "status", "") or "").upper() != "PROCESSED"
+            and not (getattr(q, "answer_text", None) or "").strip()
+        ]
+
+    if cat == "answered":
+        return [
+            q
+            for q in items
+            if (getattr(q, "status", "") or "").upper() == "PROCESSED"
+            or (getattr(q, "answer_text", None) or "").strip()
+        ]
+
+    # "all" — без фильтра
     return items
 
 
 async def refresh_questions(user_id: int, category: str) -> List[Question]:
-    """Fetch questions from Ozon and refresh user cache.
+    """Запрашиваем список вопросов с Ozon и обновляем кеш для пользователя.
 
-    Returns the list filtered by category for convenience.
+    Возвращаем список уже отфильтрованный по категории.
     """
+    # Внешний статус API Ozon: our "all" = status=None
+    status = None if category == "all" else category
 
     questions = await get_questions_list(
-        status=None if category == "all" else category,
+        status=status,
         limit=200,
         offset=0,
     )
 
     session = _sessions.setdefault(user_id, QuestionsSession())
     session.all = questions
-    session.unanswered = [q for q in questions if not q.answer_text]
-    session.answered = [q for q in questions if q.answer_text]
+    session.unanswered = _filter_by_category(questions, "unanswered")
+    session.answered = _filter_by_category(questions, "answered")
     session.loaded_at = datetime.utcnow()
     session.tokens.clear()
+
     return _filter_by_category(questions, category)
 
 
 def _get_session(user_id: int) -> QuestionsSession:
+    """Берём (или создаём) сессию по user_id."""
     return _sessions.setdefault(user_id, QuestionsSession())
 
 
 def _get_cached_questions(user_id: int, category: str) -> List[Question]:
+    """Возвращаем кешированный список вопросов, если TTL не истёк."""
     session = _get_session(user_id)
     if datetime.utcnow() - session.loaded_at > SESSION_TTL:
         return []
-    if category == "unanswered":
+
+    cat = (category or "all").lower()
+    if cat == "unanswered":
         return session.unanswered
-    if category == "answered":
+    if cat == "answered":
         return session.answered
     return session.all
 
 
-async def get_questions_table(
-    *, user_id: int, category: str, page: int = 0
-) -> tuple[str, list[tuple[str, str, int]], int, int]:
-    """Return formatted table text and keyboard items for a questions list page."""
+# ---------------------------------------------------------------------------
+# Пагинация и таблица списка вопросов
+# ---------------------------------------------------------------------------
 
+
+async def get_questions_table(
+    *,
+    user_id: int,
+    category: str,
+    page: int = 0,
+) -> tuple[str, List[tuple[str, str, int]], int, int]:
+    """Вернуть (text, items, current_page, total_pages) для списка вопросов.
+
+    text  — многострочный текст для сообщения.
+    items — список (label, question_id, absolute_index) для клавиатуры.
+    """
     questions = _get_cached_questions(user_id, category)
     if not questions:
         questions = await refresh_questions(user_id, category)
 
     total = len(questions)
     total_pages = max((total - 1) // QUESTIONS_PAGE_SIZE + 1, 1)
+
     safe_page = max(0, min(page, total_pages - 1))
     start = safe_page * QUESTIONS_PAGE_SIZE
     end = start + QUESTIONS_PAGE_SIZE
     page_items = questions[start:end]
 
-    lines = ["❓ Вопросы покупателей"]
+    lines: List[str] = ["❓ Вопросы покупателей"]
+
     pretty_category = {
         "all": "Все",
         "unanswered": "Без ответа",
         "answered": "С ответом",
-    }.get(category, category)
+    }.get((category or "all").lower(), category)
+
     lines.append(f"Категория: {pretty_category}")
 
     if not page_items:
+        lines.append("")
         lines.append("Нет вопросов в этой категории.")
     else:
+        lines.append("")
         for idx, q in enumerate(page_items, start=start + 1):
-            status_icon = "✅" if q.answer_text else "⏳"
+            created = _parse_date(getattr(q, "created_at", None))
+            status_icon = "✅" if (getattr(q, "answer_text", None) or "").strip() else "⏳"
+            product_name = (getattr(q, "product_name", None) or "").strip() or "—"
+
             lines.append(
-                f"{status_icon} | {_fmt_dt_msk(_parse_date(q.created_at))} ({_human_age(_parse_date(q.created_at))}) | "
-                f"Товар: {(q.product_name or '').strip()[:70] or '—'}"
+                f"{idx}. {status_icon} "
+                f"{_fmt_dt_msk(created)} ({_human_age(created)}) | "
+                f"Товар: {product_name[:70]}"
             )
 
-    items = [
-        (
-            f"{'✅' if q.answer_text else '⏳'}  | {_fmt_dt_msk(_parse_date(q.created_at))} ({_human_age(_parse_date(q.created_at))}) | "
-            f"Товар: {(q.product_name or '').strip()[:40] or '—'}",
-            q.id,
-            start + idx,
+    # Для клавиатуры: label, question_id, абсолютный индекс
+    items: List[tuple[str, str, int]] = []
+
+    for rel_idx, q in enumerate(page_items):
+        created = _parse_date(getattr(q, "created_at", None))
+        status_icon = "✅" if (getattr(q, "answer_text", None) or "").strip() else "⏳"
+        product_name = (getattr(q, "product_name", None) or "").strip() or "—"
+
+        label = (
+            f"{status_icon} {_fmt_dt_msk(created)} "
+            f"({_human_age(created)}) | Товар: {product_name[:40]}"
         )
-        for idx, q in enumerate(page_items)
-    ]
+
+        question_id = getattr(q, "id", None)
+        if not question_id:
+            # На всякий случай, если вдруг нет id
+            continue
+
+        items.append((label, str(question_id), start + rel_idx))
+
     return "\n".join(lines), items, safe_page, total_pages
 
 
-def get_question_by_index(user_id: int, category: str, index: int) -> Question | None:
-    """Return question by absolute index in cached list for the category."""
+# ---------------------------------------------------------------------------
+# Поиск вопроса по индексу / ID
+# ---------------------------------------------------------------------------
 
+
+def get_question_by_index(user_id: int, category: str, index: int) -> Optional[Question]:
+    """Вернуть вопрос по абсолютному индексу в кешированном списке категории."""
     questions = _get_cached_questions(user_id, category)
     if not questions:
         return None
@@ -186,64 +285,91 @@ def get_question_by_index(user_id: int, category: str, index: int) -> Question |
     return None
 
 
-def get_question_index(user_id: int, category: str, question_id: str) -> int | None:
-    """Return absolute index of question in cached list if present."""
-
+def get_question_index(user_id: int, category: str, question_id: str) -> Optional[int]:
+    """Найти абсолютный индекс вопроса по его Ozon ID в кешированном списке."""
     questions = _get_cached_questions(user_id, category)
     for idx, q in enumerate(questions):
-        if q.id == question_id:
+        if str(getattr(q, "id", "")) == str(question_id):
             return idx
     return None
 
 
-def find_question(user_id: int, question_id: str) -> Question | None:
-    """Find question by its Ozon identifier across cached categories."""
-
+def find_question(user_id: int, question_id: str) -> Optional[Question]:
+    """Поиск вопроса по его Ozon ID во всех кешированных списках сессии."""
     session = _get_session(user_id)
     for pool in (session.all, session.unanswered, session.answered):
         for q in pool:
-            if q.id == question_id:
+            if str(getattr(q, "id", "")) == str(question_id):
                 return q
     return None
 
 
-def resolve_question_id(user_id: int, question_id: str) -> Question | None:
-    """Backward-compatible helper to resolve a question by its Ozon ID."""
-
+def resolve_question_id(user_id: int, question_id: str) -> Optional[Question]:
+    """Backward-совместимый helper: сейчас просто find_question."""
     return find_question(user_id, question_id)
 
 
-def format_question_card_text(question: Question, answer_override: str | None = None) -> str:
-    """Build a readable card text for Telegram messages."""
+# ---------------------------------------------------------------------------
+# Форматирование карточки вопроса
+# ---------------------------------------------------------------------------
 
-    created = _parse_date(question.created_at)
-    status_text = "Ответ дан" if question.answer_text else "Без ответа"
-    lines = [
+
+def format_question_card_text(
+    question: Question,
+    answer_override: Optional[str] = None,
+) -> str:
+    """Собираем человекочитаемую карточку вопроса для Telegram."""
+
+    created = _parse_date(getattr(question, "created_at", None))
+    product_name = getattr(question, "product_name", None) or "—"
+    status_text = (
+        "Ответ дан"
+        if (getattr(question, "answer_text", None) or "").strip()
+        else "Без ответа"
+    )
+
+    lines: List[str] = [
         "❓ Вопрос покупателя",
-        f"Товар: {question.product_name or '—'}",
+        f"Товар: {product_name}",
         f"Дата: {_fmt_dt_msk(created)} (МСК)",
         f"Статус: {status_text}",
         "",
         "Вопрос:",
-        question.question_text or "—",
+        getattr(question, "question_text", None) or
+        getattr(question, "text", None) or
+        getattr(question, "message", None) or
+        "—",
     ]
-    answer_text = answer_override or question.answer_text or "ответ пока не задан"
+
+    answer_text = (
+        (answer_override or "").strip()
+        or (getattr(question, "answer_text", None) or "").strip()
+        or "ответ пока не задан"
+    )
+
     lines.extend(["", "Текущий ответ:", answer_text])
+
     return "\n".join(lines)
 
 
-def register_question_token(user_id: int, category: str, index: int) -> str:
-    """Register and return a short token for callbacks referencing a question."""
+# ---------------------------------------------------------------------------
+# Токены для компактных callback_data
+# ---------------------------------------------------------------------------
 
+
+def register_question_token(user_id: int, category: str, index: int) -> str:
+    """Регистрируем короткий токен для ссылок на вопрос из callback_data.
+
+    Сохраняем в сессии отображение token -> (category, index).
+    """
     session = _get_session(user_id)
     token = uuid.uuid4().hex[:8]
     session.tokens[token] = (category, index)
     return token
 
 
-def resolve_question_token(user_id: int, token: str) -> Question | None:
-    """Resolve a token back to a question instance if still cached."""
-
+def resolve_question_token(user_id: int, token: str) -> Optional[Question]:
+    """Восстанавливаем объект Question по токену, если он ещё в кеше."""
     session = _get_session(user_id)
     category_index = session.tokens.get(token)
     if not category_index:
@@ -263,3 +389,4 @@ __all__ = [
     "register_question_token",
     "resolve_question_token",
 ]
+
