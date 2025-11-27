@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple, Optional
 
-from botapp.ozon_client import Question, get_questions_list
+from botapp.ozon_client import Question, get_client, get_questions_list
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +150,52 @@ def _filter_by_category(items: List[Question], category: str) -> List[Question]:
     return items
 
 
+async def _prefetch_question_product_names(questions: List[Question]) -> None:
+    """Попробовать дополнить названия товаров для вопросов по product_id/sku."""
+
+    try:
+        client = get_client()
+    except Exception as exc:  # pragma: no cover - защита на случай отсутствия ключей
+        logger.warning("Cannot init Ozon client for product names: %s", exc)
+        return
+
+    if not questions:
+        return
+
+    missing_ids: list[str] = []
+    for q in questions:
+        if (getattr(q, "product_name", None) or "").strip():
+            continue
+        pid = getattr(q, "product_id", None) or getattr(q, "sku", None)
+        pid_str = str(pid).strip() if pid not in (None, "") else ""
+        if pid_str:
+            missing_ids.append(pid_str)
+
+    seen: set[str] = set()
+    unique_ids = []
+    for pid in missing_ids:
+        if pid not in seen:
+            seen.add(pid)
+            unique_ids.append(pid)
+
+    for pid in unique_ids:
+        try:
+            name = await client.get_product_name(pid)
+        except Exception as exc:
+            logger.warning("Failed to fetch product name for %s: %s", pid, exc)
+            continue
+
+        if not name:
+            continue
+
+        for q in questions:
+            pid_val = getattr(q, "product_id", None) or getattr(q, "sku", None)
+            if str(pid_val).strip() != pid:
+                continue
+            if not (getattr(q, "product_name", None) or "").strip():
+                q.product_name = name
+
+
 async def refresh_questions(user_id: int, category: str) -> List[Question]:
     """Запрашиваем список вопросов с Ozon и обновляем кеш для пользователя.
 
@@ -163,6 +209,8 @@ async def refresh_questions(user_id: int, category: str) -> List[Question]:
         limit=200,
         offset=0,
     )
+
+    await _prefetch_question_product_names(questions)
 
     session = _sessions.setdefault(user_id, QuestionsSession())
     session.all = questions

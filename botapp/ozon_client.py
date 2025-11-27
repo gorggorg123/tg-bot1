@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
 from typing import Any, Dict, List, Tuple
+from urllib.parse import urlparse, unquote
 
 import httpx
 from dotenv import load_dotenv
@@ -890,6 +891,8 @@ class QuestionListItem(BaseModel):
     product_title: str | None = None
     item_name: str | None = None
     title: str | None = None
+    product_url: str | None = None
+    published_at: Any | None = None
     text: str | None = None
     question_text: str | None = None
     question: str | None = None
@@ -955,6 +958,29 @@ class Question:
     status: str | None
 
 
+def _name_from_product_url(url: str) -> str | None:
+    try:
+        path = urlparse(url).path
+    except Exception:
+        return None
+
+    parts = [p for p in path.split("/") if p]
+    if "product" not in parts:
+        return None
+
+    try:
+        slug = parts[parts.index("product") + 1]
+    except Exception:
+        return None
+
+    slug = unquote(slug)
+    tokens = slug.split("-")
+    if tokens and tokens[-1].isdigit():
+        tokens = tokens[:-1]
+    name = " ".join(tokens).strip()
+    return name or None
+
+
 def _parse_question_item(item: Dict[str, Any]) -> Question | None:
     """Приводим "сырой" элемент ответа к dataclass Question.
 
@@ -964,7 +990,7 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
     try:
         if isinstance(item, QuestionListItem):
             question_id_raw = item.question_id or item.id
-            created = item.created_at
+            created = item.created_at or item.published_at
             extras = getattr(item, "model_extra", {}) or {}
             product_name = (
                 item.product_name
@@ -993,9 +1019,16 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
             )
             sku_val = item.sku or item.product_id
             status = item.status or extras.get("status")
+            product_url = item.product_url or extras.get("product_url")
         else:
             question_id_raw = item.get("question_id") or item.get("id")
-            created = item.get("created_at") or item.get("createdAt") or item.get("date")
+            created = (
+                item.get("created_at")
+                or item.get("createdAt")
+                or item.get("date")
+                or item.get("published_at")
+                or item.get("publishedAt")
+            )
             product_name = (
                 item.get("product_name")
                 or item.get("item_name")
@@ -1019,6 +1052,7 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
                 or item.get("productId")
             )
             status = item.get("status")
+            product_url = item.get("product_url")
 
         question_id = str(question_id_raw or "").strip()
         if not question_id:
@@ -1028,6 +1062,9 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
             sku_int = int(sku_val) if sku_val is not None else None
         except Exception:
             sku_int = None
+
+        if (product_name in (None, "")) and product_url:
+            product_name = _name_from_product_url(str(product_url)) or product_name
 
         return Question(
             id=question_id,
