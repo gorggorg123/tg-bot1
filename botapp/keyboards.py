@@ -8,6 +8,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from botapp.ozon_client import has_write_credentials
+from botapp.questions import register_question_token
 
 
 class MenuCallbackData(CallbackData, prefix="menu"):
@@ -46,6 +47,16 @@ class ReviewsCallbackData(CallbackData, prefix="reviews"):
     page: Optional[int] = None
 
 
+class QuestionsCallbackData(CallbackData, prefix="q"):
+    """Callback для раздела вопросов покупателей."""
+
+    action: str
+    category: Optional[str] = None
+    index: Optional[int] = None
+    question_token: Optional[str] = None
+    page: Optional[int] = None
+
+
 # ---------------------------------------------------------------------------
 # Главное меню
 # ---------------------------------------------------------------------------
@@ -80,6 +91,16 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                     callback_data=ReviewsCallbackData(
                         action="list",
                         category="all",
+                        page=0,
+                    ).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❓ Вопросы",
+                    callback_data=QuestionsCallbackData(
+                        action="list",
+                        category="unanswered",
                         page=0,
                     ).pack(),
                 )
@@ -416,6 +437,102 @@ def reviews_list_keyboard(
     )
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------------------------------------------------------------------------
+# Вопросы
+# ---------------------------------------------------------------------------
+
+
+def questions_list_keyboard(
+    *,
+    user_id: int,
+    category: str,
+    page: int,
+    total_pages: int,
+    items: list[tuple[str, str | None, int]],
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for label, question_id, idx in items:
+        token = register_question_token(user_id, question_id)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=QuestionsCallbackData(
+                        action="open_card",
+                        category=category,
+                        index=idx,
+                        question_token=token,
+                        page=page,
+                    ).pack(),
+                )
+            ]
+        )
+
+    filter_row = [
+        InlineKeyboardButton(
+            text="Без ответа",
+            callback_data=QuestionsCallbackData(action="list", category="unanswered", page=0).pack(),
+        ),
+        InlineKeyboardButton(
+            text="Все",
+            callback_data=QuestionsCallbackData(action="list", category="all", page=0).pack(),
+        ),
+    ]
+
+    safe_total_pages = max(total_pages, 1)
+    nav_row = [
+        InlineKeyboardButton(
+            text="◀️ Назад" if page > 0 else "⏮️",
+            callback_data=QuestionsCallbackData(
+                action="list_page",
+                category=category,
+                page=max(page - 1, 0),
+            ).pack(),
+        ),
+        InlineKeyboardButton(
+            text=f"Стр. {page + 1}/{safe_total_pages}",
+            callback_data=QuestionsCallbackData(action="noop", category=category, page=page).pack(),
+        ),
+        InlineKeyboardButton(
+            text="Вперёд ▶️" if page + 1 < safe_total_pages else "⏭️",
+            callback_data=QuestionsCallbackData(
+                action="list_page",
+                category=category,
+                page=min(page + 1, safe_total_pages - 1),
+            ).pack(),
+        ),
+    ]
+
+    rows.append(filter_row)
+    rows.append(nav_row)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ В главное меню",
+                callback_data=MenuCallbackData(section="home", action="open").pack(),
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def question_card_keyboard(*, category: str, page: int, question_token: str | None) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад к списку",
+                    callback_data=QuestionsCallbackData(
+                        action="list_page", category=category, page=page, question_token=question_token
+                    ).pack(),
+                )
+            ]
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
