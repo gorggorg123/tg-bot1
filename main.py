@@ -58,6 +58,14 @@ from botapp.reviews import (
     trim_for_telegram,
     build_reviews_preview,
 )
+from botapp.questions import (
+    find_question,
+    format_question_card_text,
+    get_question_by_index,
+    get_questions_table,
+    refresh_questions,
+)
+from botapp.storage import append_question_record, upsert_question_answer
 from botapp.message_gc import (
     SECTION_ACCOUNT,
     SECTION_FBO,
@@ -78,6 +86,13 @@ from botapp.questions import (
     refresh_questions,
     resolve_question_id,
 )
+
+try:
+    from botapp.states import QuestionAnswerStates
+except Exception:  # pragma: no cover - fallback for import issues during deploy
+    class QuestionAnswerStates(StatesGroup):
+        manual = State()
+        reprompt = State()
 
 load_dotenv()
 
@@ -184,6 +199,70 @@ async def _clear_sections(bot: Bot, user_id: int, sections: list[str]) -> None:
         await delete_section_message(user_id, section, bot)
 
 
+def _remember_question_answer(user_id: int, question_id: str, text: str, status: str = "draft") -> None:
+    _question_answers[(user_id, question_id)] = text
+    _question_answer_status[(user_id, question_id)] = status
+
+
+async def _send_question_card(
+    *,
+    user_id: int,
+    category: str,
+    question_id: str | None,
+    page: int,
+    callback: CallbackQuery | None = None,
+    message: Message | None = None,
+    answer_override: str | None = None,
+) -> None:
+    question = None
+    if question_id:
+        question = find_question(user_id, question_id)
+        if question is None:
+            try:
+                question = await api_get_question_by_id(question_id)
+            except OzonAPIError as exc:
+                target = callback.message if callback else message
+                if target:
+                    await send_ephemeral_message(
+                        target.bot,
+                        target.chat.id,
+                        f"⚠️ Не удалось получить вопрос. Ошибка: {exc}",
+                        user_id=user_id,
+                    )
+                return
+            if question:
+                try:
+                    await refresh_questions(user_id, category)
+                except Exception:
+                    logger.exception("Failed to refresh questions cache after fetch")
+
+    if not question:
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                target.chat.id,
+                "Вопрос не найден или уже недоступен.",
+                user_id=user_id,
+            )
+        return
+
+    draft = answer_override or get_last_question_answer(user_id, question.id)
+    text = format_question_card_text(question, answer_override=draft)
+    markup = question_card_keyboard(
+        category=category, page=page, question_id=question.id, can_send=True
+    )
+
+    await send_section_message(
+        SECTION_QUESTION_CARD,
+        text=text,
+        reply_markup=markup,
+        message=message,
+        callback=callback,
+        user_id=user_id,
+    )
+
+
 async def _send_reviews_list(
     *,
     user_id: int,
@@ -234,11 +313,34 @@ async def _send_questions_list(
     bot: Bot | None = None,
     chat_id: int | None = None,
 ) -> None:
-    text, items, safe_page, total_pages = await get_questions_table(
-        user_id=user_id, category=category, page=page
-    )
+    try:
+        text, items, safe_page, total_pages = await get_questions_table(
+            user_id=user_id, category=category, page=page
+        )
+    except OzonAPIError as exc:
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                target.chat.id,
+                f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
+                user_id=user_id,
+            )
+        logger.warning("Unable to load questions list: %s", exc)
+        return
+    except Exception:
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                target.chat.id,
+                "⚠️ Не удалось получить список вопросов. Попробуйте позже.",
+                user_id=user_id,
+            )
+        logger.exception("Unexpected error while loading questions list")
+        return
     markup = questions_list_keyboard(
-        user_id=user_id, category=category, page=safe_page, total_pages=total_pages, items=items
+        category=category, page=safe_page, total_pages=total_pages, items=items
     )
     target = callback.message if callback else message
     active_bot = bot or (target.bot if target else None)
@@ -1284,7 +1386,15 @@ async def handle_any(message: Message) -> None:
     await _clear_sections(
         message.bot,
         message.from_user.id,
-        [SECTION_FBO, SECTION_FINANCE_TODAY, SECTION_ACCOUNT, SECTION_REVIEWS_LIST, SECTION_REVIEW_CARD],
+        [
+            SECTION_FBO,
+            SECTION_FINANCE_TODAY,
+            SECTION_ACCOUNT,
+            SECTION_REVIEWS_LIST,
+            SECTION_REVIEW_CARD,
+            SECTION_QUESTIONS_LIST,
+            SECTION_QUESTION_CARD,
+        ],
     )
     await send_section_message(
         SECTION_MENU,
@@ -1381,7 +1491,7 @@ async def reviews(days: int = 30) -> dict:
 
 
 # Summary of latest changes:
-# - Updated questions section to use correct Ozon status mapping and robust error handling.
-# - Added Pydantic-backed parsing and user-facing warnings for question list failures.
+# - Added a safe fallback for QuestionAnswerStates import to prevent FSM NameErrors on deploy.
+# - Kept question list handling on Ozon-approved statuses with Pydantic parsing and user-facing warnings.
 
 __all__ = ["app", "bot", "dp", "router"]

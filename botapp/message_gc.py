@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 SECTION_MENU = "menu"
 SECTION_REVIEWS_LIST = "reviews_list"
 SECTION_REVIEW_CARD = "review_card"
+SECTION_QUESTIONS_LIST = "questions_list"
+SECTION_QUESTION_CARD = "question_card"
 SECTION_FBO = "fbo"
 SECTION_FINANCE_TODAY = "finance_today"
 SECTION_ACCOUNT = "account"
@@ -178,6 +180,8 @@ __all__ = [
     "SECTION_MENU",
     "SECTION_REVIEWS_LIST",
     "SECTION_REVIEW_CARD",
+    "SECTION_QUESTIONS_LIST",
+    "SECTION_QUESTION_CARD",
     "SECTION_FBO",
     "SECTION_FINANCE_TODAY",
     "SECTION_ACCOUNT",
