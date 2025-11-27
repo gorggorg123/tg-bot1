@@ -445,6 +445,12 @@ def question_card_keyboard(
                     callback_data=MenuCallbackData(section="home", action="open").pack(),
                 )
             ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ В главное меню",
+                    callback_data=MenuCallbackData(section="home", action="open").pack(),
+                )
+            ],
         ]
     )
 
@@ -583,6 +589,75 @@ def questions_list_keyboard(
             text="⏮️" if page > 0 else "◀️ Назад",
             callback_data=QuestionsCallbackData(
                 action="page",
+                category=category,
+                page=max(page - 1, 0),
+            ).pack(),
+        ),
+        InlineKeyboardButton(
+            text=f"Стр. {page + 1}/{safe_total_pages}",
+            callback_data=QuestionsCallbackData(action="noop", category=category, page=page).pack(),
+        ),
+    ]
+
+    rows.append(filter_row)
+    rows.append(nav_row)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ В главное меню",
+                callback_data=MenuCallbackData(section="home", action="open").pack(),
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def questions_list_keyboard(
+    *,
+    category: str,
+    page: int,
+    total_pages: int,
+    items: list[tuple[str, str, int]],
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for label, question_id, idx in items:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=QuestionsCallbackData(
+                        action="open_card",
+                        category=category,
+                        index=idx,
+                        question_id=question_id,
+                        page=page,
+                    ).pack(),
+                )
+            ]
+        )
+
+    filter_row = [
+        InlineKeyboardButton(
+            text="Все",
+            callback_data=QuestionsCallbackData(action="list", category="all", page=0).pack(),
+        ),
+        InlineKeyboardButton(
+            text="Без ответа",
+            callback_data=QuestionsCallbackData(action="list", category="unanswered", page=0).pack(),
+        ),
+        InlineKeyboardButton(
+            text="С ответом",
+            callback_data=QuestionsCallbackData(action="list", category="answered", page=0).pack(),
+        ),
+    ]
+
+    safe_total_pages = max(total_pages, 1)
+    nav_row = [
+        InlineKeyboardButton(
+            text="⏮️" if page > 0 else "◀️ Назад",
+            callback_data=QuestionsCallbackData(
+                action="list_page",
                 category=category,
                 page=max(page - 1, 0),
             ).pack(),
