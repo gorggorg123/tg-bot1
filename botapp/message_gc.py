@@ -14,11 +14,11 @@ logger = logging.getLogger(__name__)
 SECTION_MENU = "menu"
 SECTION_REVIEWS_LIST = "reviews_list"
 SECTION_REVIEW_CARD = "review_card"
-SECTION_QUESTIONS_LIST = "questions_list"
-SECTION_QUESTION_CARD = "question_card"
 SECTION_FBO = "fbo"
 SECTION_FINANCE_TODAY = "finance_today"
 SECTION_ACCOUNT = "account"
+SECTION_QUESTIONS_LIST = "questions_list"
+SECTION_QUESTION_CARD = "question_card"
 
 _section_messages: Dict[int, Dict[str, Tuple[int, int]]] = {}
 
@@ -178,11 +178,11 @@ __all__ = [
     "SECTION_MENU",
     "SECTION_REVIEWS_LIST",
     "SECTION_REVIEW_CARD",
-    "SECTION_QUESTIONS_LIST",
-    "SECTION_QUESTION_CARD",
     "SECTION_FBO",
     "SECTION_FINANCE_TODAY",
     "SECTION_ACCOUNT",
+    "SECTION_QUESTIONS_LIST",
+    "SECTION_QUESTION_CARD",
     "delete_message_safe",
     "delete_section_message",
     "send_section_message",
