@@ -87,17 +87,9 @@ def _filter_by_category(items: List[Question], category: str) -> List[Question]:
     """Filter questions list by UI category."""
 
     if category == "unanswered":
-        return [
-            q
-            for q in items
-            if (q.status or "").upper() != "PROCESSED" and not q.answer_text
-        ]
+        return [q for q in items if (q.status or "").upper() != "PROCESSED" and not q.answer_text]
     if category == "answered":
-        return [
-            q
-            for q in items
-            if (q.status or "").upper() == "PROCESSED" or q.answer_text
-        ]
+        return [q for q in items if (q.status or "").upper() == "PROCESSED" or q.answer_text]
     return items
 
 
@@ -167,21 +159,19 @@ async def get_questions_table(
         for idx, q in enumerate(page_items, start=start + 1):
             status_icon = "✅" if q.answer_text else "⏳"
             lines.append(
-                f"{status_icon} | {_fmt_dt_msk(_parse_date(q.created_at))} "
-                f"({_human_age(_parse_date(q.created_at))}) | "
+                f"{status_icon} | {_fmt_dt_msk(_parse_date(q.created_at))} ({_human_age(_parse_date(q.created_at))}) | "
                 f"Товар: {(q.product_name or '').strip()[:70] or '—'}"
             )
 
-    items: list[tuple[str, str, int]] = []
-    for idx, q in enumerate(page_items):
-        label = (
-            f"{'✅' if q.answer_text else '⏳'}  | "
-            f"{_fmt_dt_msk(_parse_date(q.created_at))} "
-            f"({_human_age(_parse_date(q.created_at))}) | "
-            f"Товар: {(q.product_name or '').strip()[:40] or '—'}"
+    items = [
+        (
+            f"{'✅' if q.answer_text else '⏳'}  | {_fmt_dt_msk(_parse_date(q.created_at))} ({_human_age(_parse_date(q.created_at))}) | "
+            f"Товар: {(q.product_name or '').strip()[:40] or '—'}",
+            q.id,
+            start + idx,
         )
-        items.append((label, q.id, start + idx))
-
+        for idx, q in enumerate(page_items)
+    ]
     return "\n".join(lines), items, safe_page, total_pages
 
 
@@ -207,9 +197,7 @@ def find_question(user_id: int, question_id: str) -> Question | None:
     return None
 
 
-def format_question_card_text(
-    question: Question, answer_override: str | None = None
-) -> str:
+def format_question_card_text(question: Question, answer_override: str | None = None) -> str:
     """Build a readable card text for Telegram messages."""
 
     created = _parse_date(question.created_at)
@@ -248,15 +236,6 @@ def resolve_question_token(user_id: int, token: str) -> Question | None:
     return get_question_by_index(user_id, category, index)
 
 
-def resolve_question_id(user_id: int, token: str) -> Question | None:
-    """Backward-compatible alias for resolve_question_token.
-
-    main.py and other modules import `resolve_question_id`, so we provide
-    this thin wrapper to keep the public API stable.
-    """
-    return resolve_question_token(user_id, token)
-
-
 __all__ = [
     "refresh_questions",
     "get_questions_table",
@@ -265,6 +244,4 @@ __all__ = [
     "format_question_card_text",
     "register_question_token",
     "resolve_question_token",
-    "resolve_question_id",
 ]
-

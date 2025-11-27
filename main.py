@@ -64,6 +64,7 @@ from botapp.questions import (
     get_question_by_index,
     get_questions_table,
     refresh_questions,
+    resolve_question_token,
 )
 from botapp.storage import append_question_record, upsert_question_answer
 from botapp.message_gc import (
@@ -86,6 +87,13 @@ from botapp.questions import (
     refresh_questions,
     resolve_question_id,
 )
+
+try:
+    from botapp.states import QuestionAnswerStates
+except Exception:  # pragma: no cover - fallback for import issues during deploy
+    class QuestionAnswerStates(StatesGroup):
+        manual = State()
+        reprompt = State()
 
 try:
     from botapp.states import QuestionAnswerStates
@@ -220,6 +228,7 @@ async def _send_question_card(
     callback: CallbackQuery | None = None,
     message: Message | None = None,
     answer_override: str | None = None,
+    question_token: str | None = None,
 ) -> None:
     question = None
     if question_id:
@@ -257,7 +266,11 @@ async def _send_question_card(
     draft = answer_override or get_last_question_answer(user_id, question.id)
     text = format_question_card_text(question, answer_override=draft)
     markup = question_card_keyboard(
-        category=category, page=page, question_id=question.id, can_send=True
+        category=category,
+        page=page,
+        question_id=question.id,
+        question_token=question_token,
+        can_send=True,
     )
 
     await send_section_message(
@@ -347,7 +360,11 @@ async def _send_questions_list(
         logger.exception("Unexpected error while loading questions list")
         return
     markup = questions_list_keyboard(
-        category=category, page=safe_page, total_pages=total_pages, items=items
+        user_id=user_id,
+        category=category,
+        page=safe_page,
+        total_pages=total_pages,
+        items=items,
     )
     target = callback.message if callback else message
     active_bot = bot or (target.bot if target else None)
@@ -1027,6 +1044,7 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
     category = callback_data.category or "all"
     page = int(callback_data.page or 0)
     question_id = callback_data.question_id
+    question_token = getattr(callback_data, "question_token", None)
 
     if action == "list":
         try:
@@ -1054,23 +1072,59 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         )
         return
 
-    if action == "list_page":
+    if action in {"list_page", "page"}:
         await _send_questions_list(
             user_id=user_id, category=category, page=page, callback=callback
         )
         return
 
-    if action == "open_card":
-        if callback_data.index is not None:
-            question = get_question_by_index(user_id, category, callback_data.index)
+    if action in {"open", "open_card"}:
+        token = getattr(callback_data, "question_token", None)
+        question = None
+        if token:
+            question = resolve_question_token(user_id, token)
             if question:
                 question_id = question.id
-        await _send_question_card(
-            user_id=user_id,
-            category=category,
-            question_id=question_id,
-            page=page,
+
+        if question is None:
+            data = callback_data.model_dump()
+            q_id = data.get("question_id") or data.get("id")
+            if q_id:
+                question = find_question(user_id, q_id)
+                question_id = q_id
+            else:
+                idx = data.get("index") or data.get("question_index")
+                if idx is not None:
+                    try:
+                        idx_int = int(idx)
+                    except Exception:
+                        idx_int = None
+                    if idx_int is not None:
+                        cat = data.get("category") or category
+                        question = get_question_by_index(user_id, cat, idx_int)
+                        if question:
+                            question_id = question.id
+
+        if question is None:
+            await callback.answer(
+                "Не удалось найти этот вопрос. Обновите список и попробуйте ещё раз.",
+                show_alert=True,
+            )
+            return
+
+        text = format_question_card_text(question)
+        await send_section_message(
+            SECTION_QUESTION_CARD,
+            text=text,
+            reply_markup=question_card_keyboard(
+                category=category,
+                page=page,
+                question_id=question.id,
+                question_token=token,
+                can_send=True,
+            ),
             callback=callback,
+            user_id=user_id,
         )
         return
 
@@ -1122,6 +1176,7 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
             page=page,
             callback=callback,
             answer_override=ai_answer,
+            question_token=question_token,
         )
         return
 
@@ -1211,6 +1266,7 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
             page=page,
             callback=callback,
             answer_override=answer,
+            question_token=question_token,
         )
         return
 
