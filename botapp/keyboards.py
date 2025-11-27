@@ -274,7 +274,12 @@ def reviews_navigation_keyboard(
 
 
 def review_card_keyboard(
-    *, category: str, page: int, index: int, review_id: str | None
+    *,
+    category: str,
+    page: int,
+    index: int,
+    review_id: str | None,
+    can_send: bool = True,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [
@@ -315,7 +320,7 @@ def review_card_keyboard(
         ],
     ]
 
-    if has_write_credentials():
+    if can_send and has_write_credentials():
         rows.append(
             [
                 InlineKeyboardButton(

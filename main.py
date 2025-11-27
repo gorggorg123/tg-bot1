@@ -133,6 +133,13 @@ except Exception:  # pragma: no cover - fallback for import issues during deploy
         manual = State()
         reprompt = State()
 
+try:
+    from botapp.states import QuestionAnswerStates
+except Exception:  # pragma: no cover - fallback for import issues during deploy
+    class QuestionAnswerStates(StatesGroup):
+        manual = State()
+        reprompt = State()
+
 load_dotenv()
 
 logging.basicConfig(
