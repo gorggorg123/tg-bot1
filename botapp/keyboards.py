@@ -592,6 +592,10 @@ def questions_list_keyboard(
             callback_data=QuestionsCallbackData(action="noop", category=category, page=page).pack(),
         ),
         InlineKeyboardButton(
+            text=f"Стр. {page + 1}/{safe_total_pages}",
+            callback_data=QuestionsCallbackData(action="noop", category=category, page=page).pack(),
+        ),
+        InlineKeyboardButton(
             text="Вперёд ▶️" if page + 1 < total_pages else "⏭️",
             callback_data=QuestionsCallbackData(
                 action="page",
