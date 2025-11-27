@@ -279,6 +279,7 @@ class OzonClient:
             self._seller_api = SellerAPI(client_id=self.client_id, api_key=self.api_key)
         return self._seller_api
 
+
     async def _post_with_status(
         self, path: str, json: Dict[str, Any]
     ) -> tuple[int, Dict[str, Any] | None]:
@@ -844,5 +845,215 @@ def get_write_client() -> OzonClient | None:
     if not has_write_credentials():
         return None
     return get_client()
+
+
+# ---------- Questions helpers ----------
+
+
+QUESTION_STATUS_MAP: Dict[str, str] = {
+    "all": "ALL",
+    "unanswered": "UNPROCESSED",
+    "answered": "PROCESSED",
+}
+
+
+class QuestionListFilter(BaseModel):
+    status: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow", protected_namespaces=())
+
+
+class GetQuestionListRequest(BaseModel):
+    limit: int = Field(..., ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+    filter: QuestionListFilter | None = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow", protected_namespaces=())
+
+
+class QuestionListItem(BaseModel):
+    question_id: str = Field(..., alias="question_id")
+    created_at: str | None = Field(default=None, alias="created_at")
+    updated_at: str | None = Field(default=None, alias="updated_at")
+    sku: int | None = Field(default=None, alias="sku")
+    product_id: int | None = Field(default=None, alias="product_id")
+    product_name: str | None = Field(default=None, alias="product_name")
+    text: str | None = Field(default=None, alias="text")
+    question_text: str | None = Field(default=None, alias="question_text")
+    answer_text: str | None = Field(default=None, alias="answer_text")
+    answer: str | None = Field(default=None, alias="answer")
+    status: str | None = Field(default=None, alias="status")
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+
+class GetQuestionListResult(BaseModel):
+    questions: list[QuestionListItem] = Field(default_factory=list)
+    items: list[QuestionListItem] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+    def collect(self) -> list[QuestionListItem]:
+        if self.questions:
+            return self.questions
+        if self.items:
+            return self.items
+        return []
+
+
+class GetQuestionListResponse(BaseModel):
+    result: GetQuestionListResult | None = None
+    questions: list[QuestionListItem] = Field(default_factory=list)
+    items: list[QuestionListItem] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+    def collect(self) -> list[QuestionListItem]:
+        if self.result:
+            collected = self.result.collect()
+            if collected:
+                return collected
+        if self.questions:
+            return self.questions
+        if self.items:
+            return self.items
+        return []
+
+
+@dataclass
+class Question:
+    id: str
+    created_at: str | None
+    sku: int | None
+    product_id: str | None
+    product_name: str | None
+    question_text: str
+    answer_text: str | None
+    status: str | None
+
+
+def _parse_question_item(item: Dict[str, Any]) -> Question | None:
+    try:
+        if isinstance(item, QuestionListItem):
+            question_id_raw = item.question_id
+            created = item.created_at
+            product_name = item.product_name
+            question_text = item.question_text or item.text
+            answer_text = item.answer_text or item.answer
+            sku_val = item.sku or item.product_id
+            status = item.status
+        else:
+            question_id_raw = item.get("question_id") or item.get("id")
+            created = item.get("created_at") or item.get("createdAt") or item.get("date")
+            product_name = item.get("product_name") or item.get("item_name") or item.get("title")
+            question_text = item.get("question_text") or item.get("question") or item.get("text")
+            answer_text = item.get("answer_text") or item.get("answer")
+            sku_val = item.get("sku") or item.get("product_id") or item.get("productId")
+            status = item.get("status")
+        question_id = str(question_id_raw or "").strip()
+        if not question_id:
+            return None
+
+        try:
+            sku_int = int(sku_val) if sku_val is not None else None
+        except Exception:
+            sku_int = None
+
+        return Question(
+            id=question_id,
+            created_at=str(created) if created is not None else None,
+            sku=sku_int,
+            product_id=str(sku_val) if sku_val is not None else None,
+            product_name=str(product_name) if product_name not in (None, "") else None,
+            question_text=str(question_text) if question_text not in (None, "") else "",
+            answer_text=str(answer_text) if answer_text not in (None, "") else None,
+            status=str(status or "").strip() or None,
+        )
+    except Exception as exc:  # pragma: no cover - защита от неожиданных данных
+        logger.warning("Failed to parse question item %s: %s", item, exc)
+        return None
+
+
+def _map_question_status(category: str | None) -> str:
+    if not category:
+        return QUESTION_STATUS_MAP["all"]
+    mapped = QUESTION_STATUS_MAP.get(category)
+    if not mapped:
+        logger.warning("Unknown question category %s, fallback to ALL", category)
+        return QUESTION_STATUS_MAP["all"]
+    return mapped
+
+
+# ---------- Questions ----------
+
+
+async def get_questions_list(
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[Question]:
+    """Fetch list of customer questions via Seller API."""
+
+    client = get_client()
+    ozon_status = _map_question_status(status)
+
+    request = GetQuestionListRequest(
+        limit=max(1, min(limit, 200)),
+        offset=max(0, offset),
+        filter=QuestionListFilter(status=ozon_status),
+    )
+
+    body = request.model_dump(mode="json", by_alias=True, exclude_none=True)
+    status_code, data = await client._post_with_status("/v1/question/list", body)
+    if status_code >= 400 or not isinstance(data, dict):
+        message = None
+        if isinstance(data, dict):
+            message = data.get("message") or data.get("error")
+        logger.warning("Failed to fetch questions: HTTP %s %s", status_code, data)
+        raise OzonAPIError(
+            f"Ошибка Ozon API: HTTP {status_code} {message or data}")
+
+    try:
+        resp = GetQuestionListResponse.model_validate(data)
+    except ValidationError as exc:
+        logger.warning("Failed to parse questions response: %s", exc)
+        payload = data.get("result") if isinstance(data.get("result"), dict) else data
+        arr = payload.get("questions") if isinstance(payload, dict) else []
+        if not isinstance(arr, list):
+            arr = payload.get("items") if isinstance(payload, dict) else []
+    else:
+        arr = resp.collect()
+
+    if not isinstance(arr, list):
+        logger.warning("Unexpected questions payload: %r", data)
+        return []
+
+    result: list[Question] = []
+    for raw in arr:
+        if not isinstance(raw, (dict, QuestionListItem)):
+            continue
+        parsed = _parse_question_item(raw)
+        if parsed:
+            result.append(parsed)
+    return result
+
+
+async def send_question_answer(question_id: str, text: str) -> None:
+    client = get_write_client()
+    if client is None:
+        raise OzonAPIError("Нет прав на отправку ответов в Ozon")
+
+    body = {"question_id": question_id, "answer": text, "text": text}
+    status_code, data = await client._post_with_status("/v1/question/answer", body)
+    if status_code >= 400:
+        raise OzonAPIError(f"Ошибка Ozon API: HTTP {status_code} {data}")
+
+
+async def get_question_by_id(question_id: str) -> Question | None:
+    questions = await get_questions_list(status=None, limit=200, offset=0)
+    for q in questions:
+        if q.id == question_id:
+            return q
+    return None
 
 
