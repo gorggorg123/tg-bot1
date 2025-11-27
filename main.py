@@ -66,6 +66,7 @@ from botapp.questions import (
     get_questions_table,
     refresh_questions,
     register_question_token,
+    resolve_question_id,
     resolve_question_token,
 )
 from botapp.storage import append_question_record, upsert_question_answer
@@ -89,6 +90,13 @@ from botapp.questions import (
     refresh_questions,
     resolve_question_id,
 )
+
+try:
+    from botapp.states import QuestionAnswerStates
+except Exception:  # pragma: no cover - fallback for import issues during deploy
+    class QuestionAnswerStates(StatesGroup):
+        manual = State()
+        reprompt = State()
 
 try:
     from botapp.states import QuestionAnswerStates
@@ -1114,7 +1122,7 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
             data = callback_data.model_dump()
             q_id = data.get("question_id") or data.get("id")
             if q_id:
-                question = find_question(user_id, q_id)
+                question = resolve_question_id(user_id, q_id)
                 question_id = q_id
             else:
                 idx = data.get("index") or data.get("question_index")

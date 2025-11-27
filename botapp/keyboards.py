@@ -555,6 +555,7 @@ def questions_list_keyboard(
                     callback_data=QuestionsCallbackData(
                         action="open",
                         category=category,
+                        question_id=_question_id,
                         question_token=token,
                         page=page,
                     ).pack(),
@@ -586,10 +587,6 @@ def questions_list_keyboard(
                 category=category,
                 page=max(page - 1, 0),
             ).pack(),
-        ),
-        InlineKeyboardButton(
-            text=f"Стр. {page + 1}/{safe_total_pages}",
-            callback_data=QuestionsCallbackData(action="noop", category=category, page=page).pack(),
         ),
         InlineKeyboardButton(
             text=f"Стр. {page + 1}/{safe_total_pages}",
