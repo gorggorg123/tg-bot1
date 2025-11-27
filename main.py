@@ -611,7 +611,6 @@ async def _handle_ai_reply(
 
     final_answer = draft
     await _remember_local_answer(user_id, review.id, final_answer)
-    mark_review_answered(review.id, user_id, final_answer)
     await _send_review_card(
         user_id=user_id,
         category=category,

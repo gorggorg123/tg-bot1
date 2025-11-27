@@ -887,10 +887,15 @@ class QuestionListItem(BaseModel):
     sku: Any | None = None
     product_id: Any | None = None
     product_name: str | None = None
+    product_title: str | None = None
+    item_name: str | None = None
+    title: str | None = None
     text: str | None = None
     question_text: str | None = None
+    question: str | None = None
     answer_text: str | None = None
     answer: str | None = None
+    message: str | None = None
     status: str | None = None
 
     model_config = ConfigDict(extra="allow", protected_namespaces=())
@@ -960,25 +965,54 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
         if isinstance(item, QuestionListItem):
             question_id_raw = item.question_id or item.id
             created = item.created_at
-            product_name = item.product_name
-            question_text = item.question_text or item.text
-            answer_text = item.answer_text or item.answer
+            extras = getattr(item, "model_extra", {}) or {}
+            product_name = (
+                item.product_name
+                or item.product_title
+                or item.item_name
+                or item.title
+                or extras.get("product_name")
+                or extras.get("product_title")
+                or extras.get("item_name")
+                or extras.get("title")
+            )
+            question_text = (
+                item.question_text
+                or item.text
+                or item.question
+                or extras.get("question_text")
+                or extras.get("question")
+                or extras.get("text")
+            )
+            answer_text = (
+                item.answer_text
+                or item.answer
+                or extras.get("answer_text")
+                or extras.get("answer")
+                or extras.get("message")
+            )
             sku_val = item.sku or item.product_id
-            status = item.status
+            status = item.status or extras.get("status")
         else:
             question_id_raw = item.get("question_id") or item.get("id")
             created = item.get("created_at") or item.get("createdAt") or item.get("date")
             product_name = (
                 item.get("product_name")
                 or item.get("item_name")
+                or item.get("product_title")
                 or item.get("title")
             )
             question_text = (
                 item.get("question_text")
                 or item.get("question")
                 or item.get("text")
+                or item.get("message")
             )
-            answer_text = item.get("answer_text") or item.get("answer")
+            answer_text = (
+                item.get("answer_text")
+                or item.get("answer")
+                or item.get("message")
+            )
             sku_val = (
                 item.get("sku")
                 or item.get("product_id")
