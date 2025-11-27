@@ -9,3 +9,4 @@ ozonapi-async==0.1.0
 openai>=1.50.0
 SQLAlchemy>=2.0.0,<3.0.0
 asyncpg>=0.29.0
+pydantic-settings==2.12.0
