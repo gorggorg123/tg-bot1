@@ -238,12 +238,15 @@ async def get_questions_table(
         lines.append("")
         for idx, q in enumerate(page_items, start=start + 1):
             created = _parse_date(getattr(q, "created_at", None))
-            status_icon = "✅" if (getattr(q, "answer_text", None) or "").strip() else "⏳"
+            created_text = _fmt_dt_msk(created) or "—"
+            age_text = _human_age(created)
+            status_value = (getattr(q, "status", None) or "").upper()
+            status_icon = "✅" if status_value == "PROCESSED" or (getattr(q, "answer_text", None) or "").strip() else "⏳"
             product_name = (getattr(q, "product_name", None) or "").strip() or "—"
 
             lines.append(
                 f"{idx}. {status_icon} "
-                f"{_fmt_dt_msk(created)} ({_human_age(created)}) | "
+                f"{created_text} ({age_text or '—'}) | "
                 f"Товар: {product_name[:70]}"
             )
 
@@ -252,12 +255,15 @@ async def get_questions_table(
 
     for rel_idx, q in enumerate(page_items):
         created = _parse_date(getattr(q, "created_at", None))
-        status_icon = "✅" if (getattr(q, "answer_text", None) or "").strip() else "⏳"
+        created_text = _fmt_dt_msk(created) or "—"
+        age_text = _human_age(created)
+        status_value = (getattr(q, "status", None) or "").upper()
+        status_icon = "✅" if status_value == "PROCESSED" or (getattr(q, "answer_text", None) or "").strip() else "⏳"
         product_name = (getattr(q, "product_name", None) or "").strip() or "—"
 
         label = (
-            f"{status_icon} {_fmt_dt_msk(created)} "
-            f"({_human_age(created)}) | Товар: {product_name[:40]}"
+            f"{status_icon} {created_text} "
+            f"({age_text or '—'}) | Товар: {product_name[:40]}"
         )
 
         question_id = getattr(q, "id", None)
@@ -322,11 +328,8 @@ def format_question_card_text(
 
     created = _parse_date(getattr(question, "created_at", None))
     product_name = getattr(question, "product_name", None) or "—"
-    status_text = (
-        "Ответ дан"
-        if (getattr(question, "answer_text", None) or "").strip()
-        else "Без ответа"
-    )
+    status_raw = (getattr(question, "status", None) or "").upper()
+    status_text = "Ответ дан" if status_raw == "PROCESSED" else "Без ответа"
 
     lines: List[str] = [
         "❓ Вопрос покупателя",
