@@ -19,6 +19,7 @@ from botapp.account import get_account_info_text
 from botapp.finance import get_finance_today_text
 from botapp.keyboards import (
     MenuCallbackData,
+    QuestionsCallbackData,
     ReviewsCallbackData,
     QuestionsCallbackData,
     account_keyboard,
@@ -77,6 +78,13 @@ from botapp.message_gc import (
     delete_message_safe,
     delete_section_message,
     send_section_message,
+)
+from botapp.questions import (
+    format_question_card_text,
+    get_question_by_index,
+    get_questions_table,
+    refresh_questions,
+    resolve_question_id,
 )
 
 try:
@@ -180,6 +188,11 @@ async def send_ephemeral_message(
         _ephemeral_messages[user_id] = (chat_id, msg.message_id, delete_task)
     return msg
 
+    draft = answer_override or get_last_question_answer(user_id, question.id)
+    text = format_question_card_text(question, answer_override=draft)
+    markup = question_card_keyboard(
+        category=category, page=page, question_id=question.id, can_send=True
+    )
 
 async def _clear_sections(bot: Bot, user_id: int, sections: list[str]) -> None:
     for section in sections:
@@ -386,7 +399,14 @@ async def cmd_fin_today(message: Message) -> None:
     await _clear_sections(
         message.bot,
         message.from_user.id,
-        [SECTION_FBO, SECTION_ACCOUNT, SECTION_REVIEWS_LIST, SECTION_REVIEW_CARD],
+        [
+            SECTION_FBO,
+            SECTION_ACCOUNT,
+            SECTION_REVIEWS_LIST,
+            SECTION_REVIEW_CARD,
+            SECTION_QUESTIONS_LIST,
+            SECTION_QUESTION_CARD,
+        ],
     )
     await send_section_message(
         SECTION_FINANCE_TODAY,
@@ -402,7 +422,14 @@ async def cmd_account(message: Message) -> None:
     await _clear_sections(
         message.bot,
         message.from_user.id,
-        [SECTION_FBO, SECTION_FINANCE_TODAY, SECTION_REVIEWS_LIST, SECTION_REVIEW_CARD],
+        [
+            SECTION_FBO,
+            SECTION_FINANCE_TODAY,
+            SECTION_REVIEWS_LIST,
+            SECTION_REVIEW_CARD,
+            SECTION_QUESTIONS_LIST,
+            SECTION_QUESTION_CARD,
+        ],
     )
     await send_section_message(
         SECTION_ACCOUNT,
@@ -418,7 +445,14 @@ async def cmd_fbo(message: Message) -> None:
     await _clear_sections(
         message.bot,
         message.from_user.id,
-        [SECTION_FINANCE_TODAY, SECTION_ACCOUNT, SECTION_REVIEWS_LIST, SECTION_REVIEW_CARD],
+        [
+            SECTION_FINANCE_TODAY,
+            SECTION_ACCOUNT,
+            SECTION_REVIEWS_LIST,
+            SECTION_REVIEW_CARD,
+            SECTION_QUESTIONS_LIST,
+            SECTION_QUESTION_CARD,
+        ],
     )
     await send_section_message(
         SECTION_FBO,
@@ -434,12 +468,44 @@ async def cmd_reviews(message: Message) -> None:
     await _clear_sections(
         message.bot,
         user_id,
-        [SECTION_FBO, SECTION_FINANCE_TODAY, SECTION_ACCOUNT],
+        [
+            SECTION_FBO,
+            SECTION_FINANCE_TODAY,
+            SECTION_ACCOUNT,
+            SECTION_QUESTIONS_LIST,
+            SECTION_QUESTION_CARD,
+        ],
     )
     await refresh_reviews(user_id)
     await _send_reviews_list(
         user_id=user_id,
         category="all",
+        page=0,
+        message=message,
+        bot=message.bot,
+        chat_id=message.chat.id,
+    )
+
+
+@router.message(Command("questions"))
+async def cmd_questions(message: Message) -> None:
+    user_id = message.from_user.id
+    await _clear_sections(
+        message.bot,
+        user_id,
+        [
+            SECTION_FBO,
+            SECTION_FINANCE_TODAY,
+            SECTION_ACCOUNT,
+            SECTION_REVIEWS_LIST,
+            SECTION_REVIEW_CARD,
+            SECTION_QUESTION_CARD,
+        ],
+    )
+    await refresh_questions(user_id)
+    await _send_questions_list(
+        user_id=user_id,
+        category="unanswered",
         page=0,
         message=message,
         bot=message.bot,
@@ -565,6 +631,36 @@ async def _handle_ai_reply(
     )
 
 
+async def _send_question_card(
+    *,
+    user_id: int,
+    category: str,
+    index: int = 0,
+    message: Message | None = None,
+    callback: CallbackQuery | None = None,
+    page: int = 0,
+    question_token: str | None = None,
+) -> None:
+    card, _ = await get_question_by_index(user_id, category, index)
+    text = format_question_card_text(card)
+    markup = question_card_keyboard(category=category, page=page, question_token=question_token)
+    active_bot = None
+    if callback and callback.message:
+        active_bot = callback.message.bot
+    elif message:
+        active_bot = message.bot
+    await send_section_message(
+        SECTION_QUESTION_CARD,
+        text=text,
+        reply_markup=markup,
+        message=message,
+        callback=callback,
+        user_id=user_id,
+    )
+    if active_bot:
+        await delete_section_message(user_id, SECTION_QUESTIONS_LIST, active_bot)
+
+
 @router.callback_query(MenuCallbackData.filter(F.section == "home"))
 async def cb_home(callback: CallbackQuery, callback_data: MenuCallbackData) -> None:
     await callback.answer()
@@ -578,6 +674,8 @@ async def cb_home(callback: CallbackQuery, callback_data: MenuCallbackData) -> N
             SECTION_ACCOUNT,
             SECTION_REVIEWS_LIST,
             SECTION_REVIEW_CARD,
+            SECTION_QUESTIONS_LIST,
+            SECTION_QUESTION_CARD,
         ],
     )
     await send_section_message(
@@ -638,6 +736,8 @@ async def cb_fbo(callback: CallbackQuery, callback_data: MenuCallbackData) -> No
                 SECTION_ACCOUNT,
                 SECTION_REVIEWS_LIST,
                 SECTION_REVIEW_CARD,
+                SECTION_QUESTIONS_LIST,
+                SECTION_QUESTION_CARD,
             ],
         )
         await send_section_message(
@@ -657,7 +757,14 @@ async def cb_account(callback: CallbackQuery, callback_data: MenuCallbackData) -
     await _clear_sections(
         callback.message.bot,
         user_id,
-        [SECTION_FBO, SECTION_FINANCE_TODAY, SECTION_REVIEWS_LIST, SECTION_REVIEW_CARD],
+        [
+            SECTION_FBO,
+            SECTION_FINANCE_TODAY,
+            SECTION_REVIEWS_LIST,
+            SECTION_REVIEW_CARD,
+            SECTION_QUESTIONS_LIST,
+            SECTION_QUESTION_CARD,
+        ],
     )
     await send_section_message(
         SECTION_ACCOUNT,
@@ -676,7 +783,14 @@ async def cb_fin_today(callback: CallbackQuery, callback_data: MenuCallbackData)
     await _clear_sections(
         callback.message.bot,
         user_id,
-        [SECTION_FBO, SECTION_ACCOUNT, SECTION_REVIEWS_LIST, SECTION_REVIEW_CARD],
+        [
+            SECTION_FBO,
+            SECTION_ACCOUNT,
+            SECTION_REVIEWS_LIST,
+            SECTION_REVIEW_CARD,
+            SECTION_QUESTIONS_LIST,
+            SECTION_QUESTION_CARD,
+        ],
     )
     await send_section_message(
         SECTION_FINANCE_TODAY,
@@ -684,6 +798,57 @@ async def cb_fin_today(callback: CallbackQuery, callback_data: MenuCallbackData)
         reply_markup=main_menu_keyboard(),
         callback=callback,
         user_id=user_id,
+    )
+
+
+@router.callback_query(QuestionsCallbackData.filter())
+async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallbackData) -> None:
+    await callback.answer()
+    action = callback_data.action
+    category = callback_data.category or "unanswered"
+    index = callback_data.index or 0
+    page = callback_data.page or 0
+    user_id = callback.from_user.id
+    token = callback_data.question_token
+    question_id = resolve_question_id(user_id, token)
+
+    if action in {"list", "list_page"}:
+        await _send_questions_list(
+            user_id=user_id,
+            category=category,
+            page=page,
+            callback=callback,
+        )
+        return
+
+    if action == "noop":
+        return
+
+    if action == "open_card":
+        if not question_id:
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Не удалось определить ID вопроса, обновите список.",
+                user_id=user_id,
+            )
+            return
+        await _send_question_card(
+            user_id=user_id,
+            category=category,
+            index=index,
+            callback=callback,
+            page=page,
+            question_token=token,
+        )
+        return
+
+    # неизвестное действие — вернёмся к списку
+    await _send_questions_list(
+        user_id=user_id,
+        category=category,
+        page=page,
+        callback=callback,
     )
 
 

@@ -8,6 +8,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from botapp.ozon_client import has_write_credentials
+from botapp.questions import register_question_token
 
 
 class MenuCallbackData(CallbackData, prefix="menu"):

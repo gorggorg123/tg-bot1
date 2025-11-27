@@ -31,6 +31,42 @@ _analytics_forbidden: bool = False
 _analytics_forbidden_logged: bool = False
 
 
+class QuestionItem(BaseModel):
+    question_id: str | None = Field(default=None)
+    product_id: str | None = None
+    offer_id: str | None = None
+    sku: str | None = None
+    product_title: str | None = None
+    product_name: str | None = None
+    text: str | None = None
+    question: str | None = None
+    message: str | None = None
+    status: str | None = None
+    answer: str | None = None
+    last_answer: str | None = None
+    created_at: Any = None
+    updated_at: Any = None
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+
+class GetQuestionListResponse(BaseModel):
+    questions: list[QuestionItem] = Field(default_factory=list)
+    result: list[QuestionItem] | None = None
+    last_id: str | None = None
+    total: int | None = None
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+    @property
+    def items(self) -> list[QuestionItem]:
+        if self.questions:
+            return self.questions
+        if isinstance(self.result, list):
+            return self.result
+        return []
+
+
 def _parse_sku_title_map(payload: Dict[str, Any] | None) -> tuple[Dict[str, str], list[Any]]:
     """Построить мапу sku -> title из ответа /v1/analytics/data."""
 
@@ -553,6 +589,36 @@ class OzonClient:
         data = await self.post("/v1/review/comment/list", body)
         if not isinstance(data, dict):
             logger.warning("Unexpected /v1/review/comment/list response: %r", data)
+            return None
+        return data.get("result") if isinstance(data.get("result"), dict) else data
+
+    async def question_list(self, *, limit: int = 50, page: int | None = None) -> GetQuestionListResponse | dict | None:
+        """Обёртка над /v1/question/list с валидацией схемы."""
+
+        body: Dict[str, Any] = {"limit": max(1, min(limit, 100))}
+        if page is not None:
+            body["page"] = max(1, page)
+
+        raw = await self.post("/v1/question/list", body)
+        if not isinstance(raw, dict):
+            logger.warning("Unexpected /v1/question/list response: %r", raw)
+            return None
+
+        payload = raw.get("result") if isinstance(raw.get("result"), dict) else raw
+        try:
+            parsed = GetQuestionListResponse.model_validate(payload)
+            return parsed
+        except ValidationError as exc:
+            logger.warning("Failed to parse questions response: %s", exc)
+            return payload
+
+    async def question_answer(self, question_id: str, text: str) -> dict | None:
+        """Отправить ответ на вопрос через /v1/question/answer."""
+
+        body = {"question_id": question_id, "answer": text}
+        data = await self.post("/v1/question/answer", body)
+        if not isinstance(data, dict):
+            logger.warning("Unexpected /v1/question/answer response: %r", data)
             return None
         return data.get("result") if isinstance(data.get("result"), dict) else data
 
