@@ -173,49 +173,6 @@ async def send_ephemeral_message(
         _ephemeral_messages[user_id] = (chat_id, msg.message_id, delete_task)
     return msg
 
-async def _send_question_card(
-    *,
-    user_id: int,
-    category: str,
-    question_id: str | None,
-    page: int,
-    callback: CallbackQuery | None = None,
-    message: Message | None = None,
-    answer_override: str | None = None,
-) -> None:
-    question = None
-    if question_id:
-        question = find_question(user_id, question_id)
-        if question is None:
-            try:
-                question = await api_get_question_by_id(question_id)
-            except OzonAPIError as exc:
-                target = callback.message if callback else message
-                if target:
-                    await send_ephemeral_message(
-                        target.bot,
-                        target.chat.id,
-                        f"⚠️ Не удалось получить вопрос. Ошибка: {exc}",
-                        user_id=user_id,
-                    )
-                return
-            if question:
-                try:
-                    await refresh_questions(user_id, category)
-                except Exception:
-                    logger.exception("Failed to refresh questions cache after fetch")
-
-    if not question:
-        target = callback.message if callback else message
-        if target:
-            await send_ephemeral_message(
-                target.bot,
-                target.chat.id,
-                "Вопрос не найден или уже недоступен.",
-                user_id=user_id,
-            )
-        return
-
     draft = answer_override or get_last_question_answer(user_id, question.id)
     text = format_question_card_text(question, answer_override=draft)
     markup = question_card_keyboard(

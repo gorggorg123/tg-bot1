@@ -218,7 +218,16 @@ async def refresh_questions(user_id: int, client: OzonClient | None = None) -> Q
         if isinstance(maybe_items, list):
             items = [q for q in maybe_items if isinstance(q, dict)]
 
-    cards = [_normalize_question(raw) for raw in items if raw]
+    cards: list[QuestionCard] = []
+    for raw in items:
+        if not raw:
+            continue
+        card = _normalize_question(raw)
+        if not card.id:
+            logger.warning("Skip question without id for user %s: %s", user_id, raw)
+            continue
+        cards.append(card)
+
     unanswered = [c for c in cards if not c.answered]
 
     session = QuestionSession(questions=cards, unanswered=unanswered, loaded_at=datetime.utcnow())

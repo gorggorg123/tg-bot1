@@ -47,7 +47,7 @@ class QuestionItem(BaseModel):
     created_at: Any = None
     updated_at: Any = None
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
 
 
 class GetQuestionListResponse(BaseModel):
@@ -56,7 +56,7 @@ class GetQuestionListResponse(BaseModel):
     last_id: str | None = None
     total: int | None = None
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
 
     @property
     def items(self) -> list[QuestionItem]:
