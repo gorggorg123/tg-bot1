@@ -585,6 +585,7 @@ async def _handle_ai_reply(
     category: str,
     page: int,
     review: ReviewCard | None,
+    index: int = 0,
     user_prompt: str | None = None,
 ) -> None:
     if not review:
@@ -614,7 +615,7 @@ async def _handle_ai_reply(
     await _send_review_card(
         user_id=user_id,
         category=category,
-        index=new_index or 0,
+        index=index,
         callback=callback if isinstance(callback, CallbackQuery) else None,
         message=target if isinstance(target, Message) else None,
         review_id=review.id,
@@ -889,6 +890,7 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
             category=category,
             page=page,
             review=review,
+            index=new_index or 0,
         )
         return
 
@@ -1264,7 +1266,7 @@ async def handle_reprompt(message: Message, state: FSMContext) -> None:
     page = int(data.get("page") or 0)
     user_id = message.from_user.id
 
-    review, _ = await get_review_by_id(user_id, category, review_id)
+    review, resolved_index = await get_review_by_id(user_id, category, review_id)
     if not review:
         await send_ephemeral_message(
             message.bot,
@@ -1279,6 +1281,7 @@ async def handle_reprompt(message: Message, state: FSMContext) -> None:
         category=category,
         page=page,
         review=review,
+        index=resolved_index or 0,
         user_prompt=(message.text or message.caption or ""),
     )
 
