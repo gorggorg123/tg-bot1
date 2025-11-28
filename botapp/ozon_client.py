@@ -1063,6 +1063,9 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
         except Exception:
             sku_int = None
 
+        if (product_name in (None, "")) and product_url:
+            product_name = _name_from_product_url(str(product_url)) or product_name
+
         return Question(
             id=question_id,
             created_at=str(created) if created is not None else None,
