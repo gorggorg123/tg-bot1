@@ -184,7 +184,36 @@ async def _prefetch_question_product_names(questions: List[Question]) -> None:
             seen.add(pid)
             unique_ids.append(pid)
 
+    title_map: dict[str, str] = {}
+    if unique_ids:
+        date_to = datetime.utcnow().date()
+        date_from = date_to - timedelta(days=60)
+        try:
+            status, fetched_map, _ = await client.get_sku_title_map(
+                date_from.isoformat(), date_to.isoformat(), limit=1000, offset=0
+            )
+            if status == 200:
+                title_map = {str(k): v for k, v in fetched_map.items() if v}
+        except Exception as exc:
+            logger.warning("Failed to prefetch SKU titles for questions: %s", exc)
+
+    if title_map:
+        for q in questions:
+            pid_val = getattr(q, "product_id", None) or getattr(q, "sku", None)
+            pid_str = str(pid_val).strip()
+            if not pid_str:
+                continue
+            if getattr(q, "product_name", None) and _CYRILLIC_RE.search(
+                str(q.product_name)
+            ):
+                continue
+            mapped_name = title_map.get(pid_str)
+            if mapped_name:
+                q.product_name = mapped_name
+
     for pid in unique_ids:
+        if pid in title_map:
+            continue
         try:
             name = await client.get_product_name(pid)
         except Exception as exc:

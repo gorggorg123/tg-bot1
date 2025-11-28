@@ -1109,7 +1109,6 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
 
         _remember_question_answer(user_id, question.id, ai_answer, status="ai")
         upsert_question_answer(
-            question.id,
             question_id=question.id,
             created_at=question.created_at,
             sku=question.sku,
@@ -1209,7 +1208,6 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
 
         _remember_question_answer(user_id, question.id, answer, status="sent")
         upsert_question_answer(
-            question.id,
             question_id=question.id,
             created_at=question.created_at,
             sku=question.sku,
@@ -1338,7 +1336,6 @@ async def handle_question_reprompt(message: Message, state: FSMContext) -> None:
     )
     _remember_question_answer(user_id, question.id, ai_answer, status="ai_edited")
     upsert_question_answer(
-        question.id,
         question_id=question.id,
         created_at=question.created_at,
         sku=question.sku,
@@ -1396,7 +1393,6 @@ async def handle_question_manual(message: Message, state: FSMContext) -> None:
 
     _remember_question_answer(user_id, question.id, text, status="manual")
     upsert_question_answer(
-        question.id,
         question_id=question.id,
         created_at=question.created_at,
         sku=question.sku,
