@@ -10,12 +10,13 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple, Optional
 
-from botapp.ozon_client import Question, get_questions_list
+from botapp.ozon_client import Question, get_client, get_questions_list
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,9 @@ def _human_age(dt: Optional[datetime]) -> str:
 # ---------------------------------------------------------------------------
 
 
+_CYRILLIC_RE = re.compile("[А-Яа-яЁё]")
+
+
 def _filter_by_category(items: List[Question], category: str) -> List[Question]:
     """Фильтруем вопросы по UI-категории.
 
@@ -150,6 +154,84 @@ def _filter_by_category(items: List[Question], category: str) -> List[Question]:
     return items
 
 
+async def _prefetch_question_product_names(questions: List[Question]) -> None:
+    """Попробовать дополнить названия товаров для вопросов по product_id/sku."""
+
+    try:
+        client = get_client()
+    except Exception as exc:  # pragma: no cover - защита на случай отсутствия ключей
+        logger.warning("Cannot init Ozon client for product names: %s", exc)
+        return
+
+    if not questions:
+        return
+
+    missing_ids: list[str] = []
+    for q in questions:
+        existing_name = (getattr(q, "product_name", None) or "").strip()
+        has_cyrillic = bool(_CYRILLIC_RE.search(existing_name))
+        if existing_name and has_cyrillic:
+            continue
+        pid = getattr(q, "product_id", None) or getattr(q, "sku", None)
+        pid_str = str(pid).strip() if pid not in (None, "") else ""
+        if pid_str:
+            missing_ids.append(pid_str)
+
+    seen: set[str] = set()
+    unique_ids = []
+    for pid in missing_ids:
+        if pid not in seen:
+            seen.add(pid)
+            unique_ids.append(pid)
+
+    title_map: dict[str, str] = {}
+    if unique_ids:
+        date_to = datetime.utcnow().date()
+        date_from = date_to - timedelta(days=60)
+        try:
+            status, fetched_map, _ = await client.get_sku_title_map(
+                date_from.isoformat(), date_to.isoformat(), limit=1000, offset=0
+            )
+            if status == 200:
+                title_map = {str(k): v for k, v in fetched_map.items() if v}
+        except Exception as exc:
+            logger.warning("Failed to prefetch SKU titles for questions: %s", exc)
+
+    if title_map:
+        for q in questions:
+            pid_val = getattr(q, "product_id", None) or getattr(q, "sku", None)
+            pid_str = str(pid_val).strip()
+            if not pid_str:
+                continue
+            if getattr(q, "product_name", None) and _CYRILLIC_RE.search(
+                str(q.product_name)
+            ):
+                continue
+            mapped_name = title_map.get(pid_str)
+            if mapped_name:
+                q.product_name = mapped_name
+
+    for pid in unique_ids:
+        if pid in title_map:
+            continue
+        try:
+            name = await client.get_product_name(pid)
+        except Exception as exc:
+            logger.warning("Failed to fetch product name for %s: %s", pid, exc)
+            continue
+
+        if not name:
+            continue
+
+        for q in questions:
+            pid_val = getattr(q, "product_id", None) or getattr(q, "sku", None)
+            if str(pid_val).strip() != pid:
+                continue
+            existing_name = (getattr(q, "product_name", None) or "").strip()
+            if not existing_name or not _CYRILLIC_RE.search(existing_name):
+                q.product_name = name
+
+
 async def refresh_questions(user_id: int, category: str) -> List[Question]:
     """Запрашиваем список вопросов с Ozon и обновляем кеш для пользователя.
 
@@ -163,6 +245,8 @@ async def refresh_questions(user_id: int, category: str) -> List[Question]:
         limit=200,
         offset=0,
     )
+
+    await _prefetch_question_product_names(questions)
 
     session = _sessions.setdefault(user_id, QuestionsSession())
     session.all = questions
@@ -238,12 +322,15 @@ async def get_questions_table(
         lines.append("")
         for idx, q in enumerate(page_items, start=start + 1):
             created = _parse_date(getattr(q, "created_at", None))
-            status_icon = "✅" if (getattr(q, "answer_text", None) or "").strip() else "⏳"
+            created_text = _fmt_dt_msk(created) or "—"
+            age_text = _human_age(created)
+            status_value = (getattr(q, "status", None) or "").upper()
+            status_icon = "✅" if status_value == "PROCESSED" or (getattr(q, "answer_text", None) or "").strip() else "⏳"
             product_name = (getattr(q, "product_name", None) or "").strip() or "—"
 
             lines.append(
                 f"{idx}. {status_icon} "
-                f"{_fmt_dt_msk(created)} ({_human_age(created)}) | "
+                f"{created_text} ({age_text or '—'}) | "
                 f"Товар: {product_name[:70]}"
             )
 
@@ -252,12 +339,15 @@ async def get_questions_table(
 
     for rel_idx, q in enumerate(page_items):
         created = _parse_date(getattr(q, "created_at", None))
-        status_icon = "✅" if (getattr(q, "answer_text", None) or "").strip() else "⏳"
+        created_text = _fmt_dt_msk(created) or "—"
+        age_text = _human_age(created)
+        status_value = (getattr(q, "status", None) or "").upper()
+        status_icon = "✅" if status_value == "PROCESSED" or (getattr(q, "answer_text", None) or "").strip() else "⏳"
         product_name = (getattr(q, "product_name", None) or "").strip() or "—"
 
         label = (
-            f"{status_icon} {_fmt_dt_msk(created)} "
-            f"({_human_age(created)}) | Товар: {product_name[:40]}"
+            f"{status_icon} {created_text} "
+            f"({age_text or '—'}) | Товар: {product_name[:40]}"
         )
 
         question_id = getattr(q, "id", None)
@@ -322,11 +412,8 @@ def format_question_card_text(
 
     created = _parse_date(getattr(question, "created_at", None))
     product_name = getattr(question, "product_name", None) or "—"
-    status_text = (
-        "Ответ дан"
-        if (getattr(question, "answer_text", None) or "").strip()
-        else "Без ответа"
-    )
+    status_raw = (getattr(question, "status", None) or "").upper()
+    status_text = "Ответ дан" if status_raw == "PROCESSED" else "Без ответа"
 
     lines: List[str] = [
         "❓ Вопрос покупателя",

@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
 from typing import Any, Dict, List, Tuple
+from urllib.parse import urlparse, unquote
 
 import httpx
 from dotenv import load_dotenv
@@ -887,10 +888,17 @@ class QuestionListItem(BaseModel):
     sku: Any | None = None
     product_id: Any | None = None
     product_name: str | None = None
+    product_title: str | None = None
+    item_name: str | None = None
+    title: str | None = None
+    product_url: str | None = None
+    published_at: Any | None = None
     text: str | None = None
     question_text: str | None = None
+    question: str | None = None
     answer_text: str | None = None
     answer: str | None = None
+    message: str | None = None
     status: str | None = None
 
     model_config = ConfigDict(extra="allow", protected_namespaces=())
@@ -950,6 +958,29 @@ class Question:
     status: str | None
 
 
+def _name_from_product_url(url: str) -> str | None:
+    try:
+        path = urlparse(url).path
+    except Exception:
+        return None
+
+    parts = [p for p in path.split("/") if p]
+    if "product" not in parts:
+        return None
+
+    try:
+        slug = parts[parts.index("product") + 1]
+    except Exception:
+        return None
+
+    slug = unquote(slug)
+    tokens = slug.split("-")
+    if tokens and tokens[-1].isdigit():
+        tokens = tokens[:-1]
+    name = " ".join(tokens).strip()
+    return name or None
+
+
 def _parse_question_item(item: Dict[str, Any]) -> Question | None:
     """Приводим "сырой" элемент ответа к dataclass Question.
 
@@ -959,32 +990,69 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
     try:
         if isinstance(item, QuestionListItem):
             question_id_raw = item.question_id or item.id
-            created = item.created_at
-            product_name = item.product_name
-            question_text = item.question_text or item.text
-            answer_text = item.answer_text or item.answer
+            created = item.created_at or item.published_at
+            extras = getattr(item, "model_extra", {}) or {}
+            product_name = (
+                item.product_name
+                or item.product_title
+                or item.item_name
+                or item.title
+                or extras.get("product_name")
+                or extras.get("product_title")
+                or extras.get("item_name")
+                or extras.get("title")
+            )
+            question_text = (
+                item.question_text
+                or item.text
+                or item.question
+                or extras.get("question_text")
+                or extras.get("question")
+                or extras.get("text")
+            )
+            answer_text = (
+                item.answer_text
+                or item.answer
+                or extras.get("answer_text")
+                or extras.get("answer")
+                or extras.get("message")
+            )
             sku_val = item.sku or item.product_id
-            status = item.status
+            status = item.status or extras.get("status")
+            product_url = item.product_url or extras.get("product_url")
         else:
             question_id_raw = item.get("question_id") or item.get("id")
-            created = item.get("created_at") or item.get("createdAt") or item.get("date")
+            created = (
+                item.get("created_at")
+                or item.get("createdAt")
+                or item.get("date")
+                or item.get("published_at")
+                or item.get("publishedAt")
+            )
             product_name = (
                 item.get("product_name")
                 or item.get("item_name")
+                or item.get("product_title")
                 or item.get("title")
             )
             question_text = (
                 item.get("question_text")
                 or item.get("question")
                 or item.get("text")
+                or item.get("message")
             )
-            answer_text = item.get("answer_text") or item.get("answer")
+            answer_text = (
+                item.get("answer_text")
+                or item.get("answer")
+                or item.get("message")
+            )
             sku_val = (
                 item.get("sku")
                 or item.get("product_id")
                 or item.get("productId")
             )
             status = item.get("status")
+            product_url = item.get("product_url")
 
         question_id = str(question_id_raw or "").strip()
         if not question_id:
