@@ -250,78 +250,6 @@ def _remember_question_answer(user_id: int, question_id: str, text: str, status:
     _question_answer_status[(user_id, question_id)] = status
 
 
-async def _send_question_card(
-    *,
-    user_id: int,
-    category: str,
-    question_id: str | None,
-    page: int,
-    callback: CallbackQuery | None = None,
-    message: Message | None = None,
-    answer_override: str | None = None,
-    question_token: str | None = None,
-) -> None:
-    question = None
-    if question_id:
-        question = find_question(user_id, question_id)
-        if question is None:
-            try:
-                question = await api_get_question_by_id(question_id)
-            except OzonAPIError as exc:
-                target = callback.message if callback else message
-                if target:
-                    await send_ephemeral_message(
-                        target.bot,
-                        target.chat.id,
-                        f"⚠️ Не удалось получить вопрос. Ошибка: {exc}",
-                        user_id=user_id,
-                    )
-                return
-            if question:
-                try:
-                    await refresh_questions(user_id, category)
-                except Exception:
-                    logger.exception("Failed to refresh questions cache after fetch")
-
-    if not question:
-        target = callback.message if callback else message
-        if target:
-            await send_ephemeral_message(
-                target.bot,
-                target.chat.id,
-                "Вопрос не найден или уже недоступен.",
-                user_id=user_id,
-            )
-        return
-
-    draft = answer_override or get_last_question_answer(user_id, question.id)
-    text = format_question_card_text(question, answer_override=draft)
-    if not question_token:
-        idx = get_question_index(user_id, category, question.id)
-        if idx is None:
-            idx = get_question_index(user_id, "all", question.id)
-            if idx is not None:
-                category = "all"
-        if idx is not None:
-            question_token = register_question_token(user_id=user_id, category=category, index=idx)
-    markup = question_card_keyboard(
-        category=category,
-        page=page,
-        question_id=question.id,
-        question_token=question_token,
-        can_send=True,
-    )
-
-    await send_section_message(
-        SECTION_QUESTION_CARD,
-        text=text,
-        reply_markup=markup,
-        message=message,
-        callback=callback,
-        user_id=user_id,
-    )
-
-
 async def _send_reviews_list(
     *,
     user_id: int,
@@ -606,9 +534,10 @@ async def _send_review_card(
         )
         markup = review_card_keyboard(
             category=category,
-            page=page,
+            index=view.index,
             review_id=encode_review_id(user_id, card.id),
             can_send=has_write_credentials(),
+            page=page,
         )
 
     target = callback.message if callback else message
@@ -656,6 +585,7 @@ async def _handle_ai_reply(
     category: str,
     page: int,
     review: ReviewCard | None,
+    index: int = 0,
     user_prompt: str | None = None,
 ) -> None:
     if not review:
@@ -681,11 +611,10 @@ async def _handle_ai_reply(
 
     final_answer = draft
     await _remember_local_answer(user_id, review.id, final_answer)
-    mark_review_answered(review.id, user_id, final_answer)
     await _send_review_card(
         user_id=user_id,
         category=category,
-        index=0,
+        index=index,
         callback=callback if isinstance(callback, CallbackQuery) else None,
         message=target if isinstance(target, Message) else None,
         review_id=review.id,
@@ -698,20 +627,48 @@ async def _send_question_card(
     *,
     user_id: int,
     category: str,
-    index: int = 0,
+    index: int | None = 0,
     message: Message | None = None,
     callback: CallbackQuery | None = None,
     page: int = 0,
-    question_token: str | None = None,
+    token: str | None = None,
+    question=None,
+    answer_override: str | None = None,
 ) -> None:
-    card, _ = await get_question_by_index(user_id, category, index)
-    text = format_question_card_text(card)
-    markup = question_card_keyboard(category=category, page=page, question_token=question_token)
-    active_bot = None
-    if callback and callback.message:
-        active_bot = callback.message.bot
-    elif message:
-        active_bot = message.bot
+    resolved_question = question
+    if resolved_question is None:
+        if token:
+            resolved_question = resolve_question_token(user_id, token)
+        if resolved_question is None and index is not None:
+            resolved_question = get_question_by_index(user_id, category, index)
+
+    if resolved_question is None:
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                target.chat.id,
+                "Не удалось найти этот вопрос. Обновите список и попробуйте ещё раз.",
+                user_id=user_id,
+            )
+        return
+
+    effective_token = token
+    if not effective_token:
+        idx = get_question_index(user_id, category, resolved_question.id)
+        if idx is None:
+            idx = get_question_index(user_id, "all", resolved_question.id)
+            if idx is not None:
+                category = "all"
+        if idx is not None:
+            effective_token = register_question_token(
+                user_id=user_id, category=category, index=idx
+            )
+
+    text = format_question_card_text(resolved_question, answer_override=answer_override)
+    markup = question_card_keyboard(
+        category=category, page=page, token=effective_token, can_send=True
+    )
     await send_section_message(
         SECTION_QUESTION_CARD,
         text=text,
@@ -720,8 +677,7 @@ async def _send_question_card(
         callback=callback,
         user_id=user_id,
     )
-    if active_bot:
-        await delete_section_message(user_id, SECTION_QUESTIONS_LIST, active_bot)
+    # Сохраняем карточку вопроса без удаления исходного списка, чтобы экран не исчезал.
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "home"))
@@ -864,57 +820,6 @@ async def cb_fin_today(callback: CallbackQuery, callback_data: MenuCallbackData)
     )
 
 
-@router.callback_query(QuestionsCallbackData.filter())
-async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallbackData) -> None:
-    await callback.answer()
-    action = callback_data.action
-    category = callback_data.category or "unanswered"
-    index = callback_data.index or 0
-    page = callback_data.page or 0
-    user_id = callback.from_user.id
-    token = callback_data.question_token
-    question_id = resolve_question_id(user_id, token)
-
-    if action in {"list", "list_page"}:
-        await _send_questions_list(
-            user_id=user_id,
-            category=category,
-            page=page,
-            callback=callback,
-        )
-        return
-
-    if action == "noop":
-        return
-
-    if action == "open_card":
-        if not question_id:
-            await send_ephemeral_message(
-                callback.message.bot,
-                callback.message.chat.id,
-                "Не удалось определить ID вопроса, обновите список.",
-                user_id=user_id,
-            )
-            return
-        await _send_question_card(
-            user_id=user_id,
-            category=category,
-            index=index,
-            callback=callback,
-            page=page,
-            question_token=token,
-        )
-        return
-
-    # неизвестное действие — вернёмся к списку
-    await _send_questions_list(
-        user_id=user_id,
-        category=category,
-        page=page,
-        callback=callback,
-    )
-
-
 @router.callback_query(ReviewsCallbackData.filter())
 async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData, state: FSMContext) -> None:
     action = callback_data.action
@@ -972,6 +877,7 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
             category=category,
             page=page,
             review=review,
+            index=new_index or 0,
         )
         return
 
@@ -1082,10 +988,33 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
     action = callback_data.action
     category = callback_data.category or "all"
     page = int(callback_data.page or 0)
-    question_id = callback_data.question_id
-    question_token = getattr(callback_data, "question_token", None)
+    token = callback_data.token
+
+    def _resolve_question(
+        *, token_value: str | None = None, legacy_data: dict | None = None
+    ):
+        question = resolve_question_token(user_id, token_value) if token_value else None
+        if question:
+            return question
+
+        legacy = legacy_data or {}
+        q_id = legacy.get("question_id") or legacy.get("id")
+        if q_id:
+            return resolve_question_id(user_id, q_id)
+
+        idx = legacy.get("index") or legacy.get("question_index")
+        if idx is not None:
+            try:
+                idx_int = int(idx)
+            except Exception:
+                idx_int = None
+            if idx_int is not None:
+                cat = legacy.get("category") or category
+                return get_question_by_index(user_id, cat, idx_int)
+        return None
 
     if action == "list":
+        await callback.answer()
         try:
             await refresh_questions(user_id, category)
         except OzonAPIError as exc:
@@ -1112,47 +1041,14 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         return
 
     if action in {"list_page", "page"}:
+        await callback.answer()
         await _send_questions_list(
             user_id=user_id, category=category, page=page, callback=callback
         )
         return
 
     if action in {"open", "open_card"}:
-        token = getattr(callback_data, "question_token", None)
-        question = None
-        if token:
-            question = resolve_question_token(user_id, token)
-            if question:
-                question_id = question.id
-
-        if question is None:
-            data = callback_data.model_dump()
-            q_id = data.get("question_id") or data.get("id")
-            if q_id:
-                question = resolve_question_id(user_id, q_id)
-                question_id = q_id
-            else:
-                idx = data.get("index") or data.get("question_index")
-                if idx is not None:
-                    try:
-                        idx_int = int(idx)
-                    except Exception:
-                        idx_int = None
-                    if idx_int is not None:
-                        cat = data.get("category") or category
-                        question = get_question_by_index(user_id, cat, idx_int)
-                        if question:
-                            question_id = question.id
-
-        if question and not token:
-            idx = get_question_index(user_id, category, question.id)
-            if idx is None:
-                idx = get_question_index(user_id, "all", question.id)
-                if idx is not None:
-                    category = "all"
-            if idx is not None:
-                token = register_question_token(user_id=user_id, category=category, index=idx)
-
+        question = _resolve_question(token_value=token, legacy_data=callback_data.model_dump())
         if question is None:
             await callback.answer(
                 "Не удалось найти этот вопрос. Обновите список и попробуйте ещё раз.",
@@ -1160,29 +1056,35 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
             )
             return
 
-        text = format_question_card_text(question)
-        await send_section_message(
-            SECTION_QUESTION_CARD,
-            text=text,
-            reply_markup=question_card_keyboard(
-                category=category,
-                page=page,
-                question_id=question.id,
-                question_token=token,
-                can_send=True,
-            ),
-            callback=callback,
+        idx = get_question_index(user_id, category, question.id)
+        effective_token = token
+        effective_category = category
+        if idx is None:
+            idx = get_question_index(user_id, "all", question.id)
+            if idx is not None:
+                effective_category = "all"
+        if idx is not None and not effective_token:
+            effective_token = register_question_token(
+                user_id=user_id, category=effective_category, index=idx
+            )
+
+        await callback.answer()
+        await _send_question_card(
             user_id=user_id,
+            category=effective_category,
+            index=idx,
+            callback=callback,
+            page=page,
+            token=effective_token,
+            question=question,
         )
         return
 
     if action == "card_ai":
-        question = None
-        if question_id:
-            question = find_question(user_id, question_id) or await api_get_question_by_id(
-                question_id
-            )
-        if not question:
+        question = _resolve_question(
+            token_value=token, legacy_data=callback_data.model_dump()
+        )
+        if question is None:
             await send_ephemeral_message(
                 callback.message.bot,
                 callback.message.chat.id,
@@ -1193,7 +1095,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         ai_answer = await generate_answer_for_question(
             question_text=question.question_text,
             product_name=question.product_name,
-            existing_answer=question.answer_text or get_last_question_answer(user_id, question.id),
+            existing_answer=question.answer_text
+            or get_last_question_answer(user_id, question.id),
         )
         if not ai_answer:
             await send_ephemeral_message(
@@ -1220,17 +1123,28 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         await _send_question_card(
             user_id=user_id,
             category=category,
-            question_id=question.id,
             page=page,
             callback=callback,
             answer_override=ai_answer,
-            question_token=question_token,
+            token=token,
+            question=question,
         )
         return
 
     if action == "card_manual":
+        question = _resolve_question(token_value=token, legacy_data=callback_data.model_dump())
+        if question is None:
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Не удалось найти вопрос для подготовки ответа.",
+                user_id=user_id,
+            )
+            return
         await state.set_state(QuestionAnswerStates.manual)
-        await state.update_data(question_id=question_id, category=category, page=page)
+        await state.update_data(
+            question_token=token, question_id=question.id, category=category, page=page
+        )
         await send_ephemeral_message(
             callback.message.bot,
             callback.message.chat.id,
@@ -1240,8 +1154,19 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         return
 
     if action == "card_reprompt":
+        question = _resolve_question(token_value=token, legacy_data=callback_data.model_dump())
+        if question is None:
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Не удалось найти вопрос для пересборки ответа.",
+                user_id=user_id,
+            )
+            return
         await state.set_state(QuestionAnswerStates.reprompt)
-        await state.update_data(question_id=question_id, category=category, page=page)
+        await state.update_data(
+            question_token=token, question_id=question.id, category=category, page=page
+        )
         await send_ephemeral_message(
             callback.message.bot,
             callback.message.chat.id,
@@ -1251,12 +1176,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         return
 
     if action == "send":
-        question = None
-        if question_id:
-            question = find_question(user_id, question_id) or await api_get_question_by_id(
-                question_id
-            )
-        if not question:
+        question = _resolve_question(token_value=token, legacy_data=callback_data.model_dump())
+        if question is None:
             await send_ephemeral_message(
                 callback.message.bot,
                 callback.message.chat.id,
@@ -1310,11 +1231,11 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         await _send_question_card(
             user_id=user_id,
             category=category,
-            question_id=question.id,
             page=page,
             callback=callback,
             answer_override=answer,
-            question_token=question_token,
+            token=token,
+            question=question,
         )
         return
 
@@ -1332,7 +1253,7 @@ async def handle_reprompt(message: Message, state: FSMContext) -> None:
     page = int(data.get("page") or 0)
     user_id = message.from_user.id
 
-    review, _ = await get_review_by_id(user_id, category, review_id)
+    review, resolved_index = await get_review_by_id(user_id, category, review_id)
     if not review:
         await send_ephemeral_message(
             message.bot,
@@ -1347,6 +1268,7 @@ async def handle_reprompt(message: Message, state: FSMContext) -> None:
         category=category,
         page=page,
         review=review,
+        index=resolved_index or 0,
         user_prompt=(message.text or message.caption or ""),
     )
 
@@ -1386,13 +1308,14 @@ async def handle_manual_answer(message: Message, state: FSMContext) -> None:
 async def handle_question_reprompt(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     await state.clear()
+    question_token = data.get("question_token")
     question_id = data.get("question_id")
     category = data.get("category") or "all"
     page = int(data.get("page") or 0)
     user_id = message.from_user.id
 
-    question = None
-    if question_id:
+    question = resolve_question_token(user_id, question_token) if question_token else None
+    if question is None and question_id:
         question = find_question(user_id, question_id) or await api_get_question_by_id(
             question_id
         )
@@ -1429,10 +1352,11 @@ async def handle_question_reprompt(message: Message, state: FSMContext) -> None:
     await _send_question_card(
         user_id=user_id,
         category=category,
-        question_id=question.id,
         page=page,
         message=message,
         answer_override=ai_answer,
+        token=question_token,
+        question=question,
     )
 
 
@@ -1440,6 +1364,7 @@ async def handle_question_reprompt(message: Message, state: FSMContext) -> None:
 async def handle_question_manual(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     await state.clear()
+    question_token = data.get("question_token")
     question_id = data.get("question_id")
     category = data.get("category") or "all"
     page = int(data.get("page") or 0)
@@ -1455,8 +1380,8 @@ async def handle_question_manual(message: Message, state: FSMContext) -> None:
         )
         return
 
-    question = None
-    if question_id:
+    question = resolve_question_token(user_id, question_token) if question_token else None
+    if question is None and question_id:
         question = find_question(user_id, question_id) or await api_get_question_by_id(
             question_id
         )
@@ -1485,10 +1410,11 @@ async def handle_question_manual(message: Message, state: FSMContext) -> None:
     await _send_question_card(
         user_id=user_id,
         category=category,
-        question_id=question.id,
         page=page,
         message=message,
         answer_override=text,
+        token=question_token,
+        question=question,
     )
 
 
