@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -119,6 +120,9 @@ def _human_age(dt: Optional[datetime]) -> str:
 # ---------------------------------------------------------------------------
 
 
+_CYRILLIC_RE = re.compile("[А-Яа-яЁё]")
+
+
 def _filter_by_category(items: List[Question], category: str) -> List[Question]:
     """Фильтруем вопросы по UI-категории.
 
@@ -164,7 +168,9 @@ async def _prefetch_question_product_names(questions: List[Question]) -> None:
 
     missing_ids: list[str] = []
     for q in questions:
-        if (getattr(q, "product_name", None) or "").strip():
+        existing_name = (getattr(q, "product_name", None) or "").strip()
+        has_cyrillic = bool(_CYRILLIC_RE.search(existing_name))
+        if existing_name and has_cyrillic:
             continue
         pid = getattr(q, "product_id", None) or getattr(q, "sku", None)
         pid_str = str(pid).strip() if pid not in (None, "") else ""
@@ -192,7 +198,8 @@ async def _prefetch_question_product_names(questions: List[Question]) -> None:
             pid_val = getattr(q, "product_id", None) or getattr(q, "sku", None)
             if str(pid_val).strip() != pid:
                 continue
-            if not (getattr(q, "product_name", None) or "").strip():
+            existing_name = (getattr(q, "product_name", None) or "").strip()
+            if not existing_name or not _CYRILLIC_RE.search(existing_name):
                 q.product_name = name
 
 

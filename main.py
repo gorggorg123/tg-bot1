@@ -669,15 +669,6 @@ async def _send_question_card(
     markup = question_card_keyboard(
         category=category, page=page, token=effective_token, can_send=True
     )
-    active_bot = None
-    active_chat = None
-    if callback and callback.message:
-        active_bot = callback.message.bot
-        active_chat = callback.message.chat.id
-    elif message:
-        active_bot = message.bot
-        active_chat = message.chat.id
-
     await send_section_message(
         SECTION_QUESTION_CARD,
         text=text,
@@ -686,10 +677,7 @@ async def _send_question_card(
         callback=callback,
         user_id=user_id,
     )
-    if active_bot and active_chat is not None:
-        await delete_section_message(
-            user_id, SECTION_QUESTIONS_LIST, active_bot, preserve_message_id=None
-        )
+    # Сохраняем карточку вопроса без удаления исходного списка, чтобы экран не исчезал.
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "home"))
