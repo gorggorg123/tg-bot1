@@ -138,15 +138,16 @@ def _filter_by_category(items: List[Question], category: str) -> List[Question]:
         return [
             q
             for q in items
-            if (getattr(q, "status", "") or "").upper() != "PROCESSED"
-            and not (getattr(q, "answer_text", None) or "").strip()
+            if not getattr(q, "has_answer", False)
+            and (getattr(q, "status", "") or "").upper() != "PROCESSED"
         ]
 
     if cat == "answered":
         return [
             q
             for q in items
-            if (getattr(q, "status", "") or "").upper() == "PROCESSED"
+            if getattr(q, "has_answer", False)
+            or (getattr(q, "status", "") or "").upper() == "PROCESSED"
             or (getattr(q, "answer_text", None) or "").strip()
         ]
 
@@ -242,11 +243,9 @@ async def refresh_questions(user_id: int, category: str) -> List[Question]:
 
     Возвращаем список уже отфильтрованный по категории.
     """
-    # Внешний статус API Ozon: our "all" = status=None
-    status = None if category == "all" else category
-
+    # Загружаем все вопросы один раз и фильтруем локально
     questions = await get_questions_list(
-        status=status,
+        status=None,
         limit=200,
         offset=0,
     )
@@ -319,6 +318,7 @@ async def get_questions_table(
     }.get((category or "all").lower(), category)
 
     lines.append(f"Категория: {pretty_category}")
+    lines.append("✅ — есть ответ, ❗ — нет ответа")
 
     if not page_items:
         lines.append("")
@@ -329,8 +329,7 @@ async def get_questions_table(
             created = _parse_date(getattr(q, "created_at", None))
             created_text = _fmt_dt_msk(created) or "—"
             age_text = _human_age(created)
-            status_value = (getattr(q, "status", None) or "").upper()
-            status_icon = "✅" if status_value == "PROCESSED" or (getattr(q, "answer_text", None) or "").strip() else "⏳"
+            status_icon = "✅" if getattr(q, "has_answer", False) else "❗"
             product_name = (getattr(q, "product_name", None) or "").strip() or "—"
 
             lines.append(
@@ -346,8 +345,7 @@ async def get_questions_table(
         created = _parse_date(getattr(q, "created_at", None))
         created_text = _fmt_dt_msk(created) or "—"
         age_text = _human_age(created)
-        status_value = (getattr(q, "status", None) or "").upper()
-        status_icon = "✅" if status_value == "PROCESSED" or (getattr(q, "answer_text", None) or "").strip() else "⏳"
+        status_icon = "✅" if getattr(q, "has_answer", False) else "❗"
         product_name = (getattr(q, "product_name", None) or "").strip() or "—"
 
         label = (
@@ -418,7 +416,9 @@ def format_question_card_text(
     created = _parse_date(getattr(question, "created_at", None))
     product_name = getattr(question, "product_name", None) or "—"
     status_raw = (getattr(question, "status", None) or "").upper()
-    status_text = "Ответ дан" if status_raw == "PROCESSED" else "Без ответа"
+    status_text = (
+        "Ответ дан" if getattr(question, "has_answer", False) or status_raw == "PROCESSED" else "Без ответа"
+    )
 
     lines: List[str] = [
         "❓ Вопрос покупателя",
@@ -439,7 +439,7 @@ def format_question_card_text(
         or "ответ пока не задан"
     )
 
-    lines.extend(["", "Текущий ответ:", answer_text])
+    lines.extend(["", "Текущий ответ ITOM:", answer_text])
 
     return "\n".join(lines)
 
