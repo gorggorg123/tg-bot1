@@ -297,8 +297,10 @@ class OzonClient:
                 raw = await r.aread()
             except Exception:
                 raw = b""
-            logger.error("Ozon %s -> JSON decode failed: %s", url, raw[:500])
-            return status, None
+            logger.error(
+                "Ozon %s -> HTTP %s JSON decode failed: %s", url, status, raw[:500]
+            )
+            return status, {"raw": raw.decode(errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)}
 
         if status >= 400:
             logger.warning("Ozon %s -> HTTP %s: %s", url, status, data)
@@ -614,12 +616,12 @@ class OzonClient:
             return payload
 
     async def question_answer(self, question_id: str, text: str) -> dict | None:
-        """Отправить ответ на вопрос через /v1/question/answer."""
+        """Отправить ответ на вопрос через /v1/question/answer/create."""
 
         body = {"question_id": question_id, "answer": text}
-        data = await self.post("/v1/question/answer", body)
+        data = await self.post("/v1/question/answer/create", body)
         if not isinstance(data, dict):
-            logger.warning("Unexpected /v1/question/answer response: %r", data)
+            logger.warning("Unexpected /v1/question/answer/create response: %r", data)
             return None
         return data.get("result") if isinstance(data.get("result"), dict) else data
 
@@ -1155,10 +1157,16 @@ async def send_question_answer(question_id: str, text: str) -> None:
     if client is None:
         raise OzonAPIError("Нет прав на отправку ответов в Ozon")
 
-    body = {"question_id": question_id, "answer": text, "text": text}
-    status_code, data = await client._post_with_status("/v1/question/answer", body)
+    body = {"question_id": question_id, "answer": text}
+    status_code, data = await client._post_with_status("/v1/question/answer/create", body)
     if status_code >= 400:
-        raise OzonAPIError(f"Ошибка Ozon API: HTTP {status_code} {data}")
+        raise OzonAPIError(
+            f"Ошибка Ozon API: HTTP {status_code} {data.get('message') if isinstance(data, dict) else data}"
+        )
+    if data is None:
+        raise OzonAPIError(
+            "Ошибка Ozon API: пустой ответ при отправке ответа на вопрос"
+        )
 
 
 async def get_question_by_id(question_id: str) -> Question | None:
