@@ -297,8 +297,10 @@ class OzonClient:
                 raw = await r.aread()
             except Exception:
                 raw = b""
-            logger.error("Ozon %s -> JSON decode failed: %s", url, raw[:500])
-            return status, None
+            logger.error(
+                "Ozon %s -> HTTP %s JSON decode failed: %s", url, status, raw[:500]
+            )
+            return status, {"raw": raw.decode(errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)}
 
         if status >= 400:
             logger.warning("Ozon %s -> HTTP %s: %s", url, status, data)
@@ -613,13 +615,28 @@ class OzonClient:
             logger.warning("Failed to parse questions response: %s", exc)
             return payload
 
-    async def question_answer(self, question_id: str, text: str) -> dict | None:
-        """Отправить ответ на вопрос через /v1/question/answer."""
+    async def question_answer(
+        self, question_id: str, text: str, *, sku: int | None = None
+    ) -> dict | None:
+        """Отправить ответ на вопрос через /v1/question/answer/create."""
 
-        body = {"question_id": question_id, "answer": text}
-        data = await self.post("/v1/question/answer", body)
+        text_clean = (text or "").strip()
+        if len(text_clean) < 2:
+            raise OzonAPIError("Ответ пустой или слишком короткий для отправки в Ozon")
+
+        logger.debug(
+            "Sending Ozon question answer: question_id=%s, len(text)=%d, text_preview=%r",
+            question_id,
+            len(text_clean),
+            text_clean[:80],
+        )
+
+        body = {"question_id": question_id, "text": text_clean}
+        if sku and sku > 0:
+            body["sku"] = sku
+        data = await self.post("/v1/question/answer/create", body)
         if not isinstance(data, dict):
-            logger.warning("Unexpected /v1/question/answer response: %r", data)
+            logger.warning("Unexpected /v1/question/answer/create response: %r", data)
             return None
         return data.get("result") if isinstance(data.get("result"), dict) else data
 
@@ -1150,15 +1167,34 @@ async def get_questions_list(
     return result
 
 
-async def send_question_answer(question_id: str, text: str) -> None:
+async def send_question_answer(question_id: str, text: str, *, sku: int | None = None) -> None:
     client = get_write_client()
     if client is None:
         raise OzonAPIError("Нет прав на отправку ответов в Ozon")
 
-    body = {"question_id": question_id, "answer": text, "text": text}
-    status_code, data = await client._post_with_status("/v1/question/answer", body)
+    text_clean = (text or "").strip()
+    if len(text_clean) < 2:
+        raise OzonAPIError("Ответ пустой или слишком короткий, сначала отредактируйте текст")
+
+    logger.debug(
+        "Sending Ozon question answer: question_id=%s, len(text)=%d, text_preview=%r",
+        question_id,
+        len(text_clean),
+        text_clean[:80],
+    )
+
+    body = {"question_id": question_id, "text": text_clean}
+    if sku and sku > 0:
+        body["sku"] = sku
+    status_code, data = await client._post_with_status("/v1/question/answer/create", body)
     if status_code >= 400:
-        raise OzonAPIError(f"Ошибка Ozon API: HTTP {status_code} {data}")
+        raise OzonAPIError(
+            f"Ошибка Ozon API: HTTP {status_code} {data.get('message') if isinstance(data, dict) else data}"
+        )
+    if data is None:
+        raise OzonAPIError(
+            "Ошибка Ozon API: пустой ответ при отправке ответа на вопрос"
+        )
 
 
 async def get_question_by_id(question_id: str) -> Question | None:

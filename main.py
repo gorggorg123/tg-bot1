@@ -1186,16 +1186,26 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
             return
 
         answer = get_last_question_answer(user_id, question.id) or question.answer_text
-        if not answer:
+        answer_clean = (answer or "").strip()
+        if len(answer_clean) < 2:
             await send_ephemeral_message(
                 callback.message.bot,
                 callback.message.chat.id,
-                "Ответ пока не подготовлен.",
+                "Ответ пустой или слишком короткий, сначала отредактируйте текст.",
                 user_id=user_id,
             )
             return
         try:
-            await send_question_answer(question.id, answer)
+            await send_question_answer(question.id, answer_clean, sku=question.sku)
+        except OzonAPIError as exc:
+            logger.warning("Failed to send question answer %s: %s", question.id, exc)
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                str(exc),
+                user_id=user_id,
+            )
+            return
         except Exception as exc:
             logger.warning("Failed to send question answer %s: %s", question.id, exc)
             await send_ephemeral_message(
@@ -1206,14 +1216,14 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
             )
             return
 
-        _remember_question_answer(user_id, question.id, answer, status="sent")
+        _remember_question_answer(user_id, question.id, answer_clean, status="sent")
         upsert_question_answer(
             question_id=question.id,
             created_at=question.created_at,
             sku=question.sku,
             product_name=question.product_name,
             question=question.question_text,
-            answer=answer,
+            answer=answer_clean,
             answer_source=_question_answer_status.get((user_id, question.id), "manual"),
             answer_sent_to_ozon=True,
             answer_sent_at=datetime.now(timezone.utc).isoformat(),
