@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Optional
 
 from openai import AsyncOpenAI
@@ -11,6 +12,12 @@ from openai import APIStatusError, NotFoundError, PermissionDeniedError
 logger = logging.getLogger(__name__)
 
 _client: Optional[AsyncOpenAI] = None
+_itom_qna_digest: Optional[str] = None
+
+_DEFAULT_QNA_DIGEST_PATH = (
+    Path(__file__).resolve().parent.parent / "data" / "itom_qna_digest.txt"
+)
+_QNA_DIGEST_ENV = "ITOM_QNA_DIGEST_PATH"
 
 
 class AIClientError(RuntimeError):
@@ -30,6 +37,28 @@ def _get_client() -> AsyncOpenAI:
     if _client is None:
         _client = AsyncOpenAI(api_key=api_key)
     return _client
+
+
+def _load_itom_qna_digest() -> str:
+    """Ленивая загрузка справочника по ответам в стиле ITOM."""
+
+    global _itom_qna_digest
+    if _itom_qna_digest is not None:
+        return _itom_qna_digest
+
+    path_raw = os.getenv(_QNA_DIGEST_ENV)
+    digest_path = Path(path_raw) if path_raw else _DEFAULT_QNA_DIGEST_PATH
+
+    try:
+        _itom_qna_digest = digest_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        logger.warning("ITOM Q&A digest not found at %s", digest_path)
+        _itom_qna_digest = ""
+    except Exception as exc:  # pragma: no cover - дополнительная защита
+        logger.warning("Failed to read ITOM Q&A digest: %s", exc)
+        _itom_qna_digest = ""
+
+    return _itom_qna_digest
 
 
 async def _call_openai(system_prompt: str, user_message: str, *, max_tokens: int = 300) -> str | None:
@@ -70,10 +99,16 @@ async def generate_review_reply(
 ) -> str | None:
     """Return a short, friendly draft reply to a customer review."""
 
+    style_digest = _load_itom_qna_digest()
+
     system_prompt = (
-        "Ты — продавец на Ozon. Пиши кратко, вежливо, по-человечески,"
-        " без канцелярита и токсичности. Отвечай на русском."
+        "Ты — продавец на Ozon от имени бренда ИТОМ. Пиши кратко, по делу и"
+        " по-доброму, избегай канцелярита и токсичности. Всегда отвечай"
+        " на русском языке и используй стиль бренда (приветствие, сжатость,"
+        " корректные формулировки)."
     )
+    if style_digest:
+        system_prompt = f"{system_prompt}\n\nСправочник по ответам бренда ИТОМ:\n{style_digest}"
 
     user_parts = [f"Отзыв: {review_text.strip()}"[:2000]]
     if product_name:
@@ -97,11 +132,16 @@ async def generate_answer_for_question(
 ) -> str:
     """Generate short polite answer for customer question."""
 
+    style_digest = _load_itom_qna_digest()
+
     system_prompt = (
         "Ты отвечаешь покупателю на Ozon от имени бренда ИТОМ. Пиши дружелюбно,"
         " по делу и кратко. Избегай воды и лишних деталей. Отвечай строго на"
-        " русском языке."
+        " русском языке. Всегда используй приветствие «Здравствуйте!» или"
+        " «Добрый день!» и придерживайся подсказок по бренду."
     )
+    if style_digest:
+        system_prompt = f"{system_prompt}\n\nСправочник по ответам бренда ИТОМ:\n{style_digest}"
     parts = [f"Вопрос: {question_text.strip()}"[:2000]]
     if product_name:
         parts.append(f"Товар: {product_name}")
