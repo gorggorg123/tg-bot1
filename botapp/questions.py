@@ -185,6 +185,7 @@ async def _prefetch_question_product_names(questions: List[Question]) -> None:
             unique_ids.append(pid)
 
     title_map: dict[str, str] = {}
+    covered_ids: set[str] = set()
     if unique_ids:
         date_to = datetime.utcnow().date()
         date_from = date_to - timedelta(days=60)
@@ -206,13 +207,17 @@ async def _prefetch_question_product_names(questions: List[Question]) -> None:
             if getattr(q, "product_name", None) and _CYRILLIC_RE.search(
                 str(q.product_name)
             ):
+                covered_ids.add(pid_str)
                 continue
-            mapped_name = title_map.get(pid_str)
-            if mapped_name:
-                q.product_name = mapped_name
+            mapped_name = (title_map.get(pid_str) or "").strip()
+            if not mapped_name:
+                continue
+            q.product_name = mapped_name
+            if _CYRILLIC_RE.search(mapped_name):
+                covered_ids.add(pid_str)
 
     for pid in unique_ids:
-        if pid in title_map:
+        if pid in covered_ids:
             continue
         try:
             name = await client.get_product_name(pid)
