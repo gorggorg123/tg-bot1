@@ -620,7 +620,18 @@ class OzonClient:
     ) -> dict | None:
         """Отправить ответ на вопрос через /v1/question/answer/create."""
 
-        body = {"question_id": question_id, "answer": text}
+        text_clean = (text or "").strip()
+        if len(text_clean) < 2:
+            raise OzonAPIError("Ответ пустой или слишком короткий для отправки в Ozon")
+
+        logger.debug(
+            "Sending Ozon question answer: question_id=%s, len(text)=%d, text_preview=%r",
+            question_id,
+            len(text_clean),
+            text_clean[:80],
+        )
+
+        body = {"question_id": question_id, "text": text_clean}
         if sku and sku > 0:
             body["sku"] = sku
         data = await self.post("/v1/question/answer/create", body)
@@ -1161,7 +1172,18 @@ async def send_question_answer(question_id: str, text: str, *, sku: int | None =
     if client is None:
         raise OzonAPIError("Нет прав на отправку ответов в Ozon")
 
-    body = {"question_id": question_id, "answer": text}
+    text_clean = (text or "").strip()
+    if len(text_clean) < 2:
+        raise OzonAPIError("Ответ пустой или слишком короткий, сначала отредактируйте текст")
+
+    logger.debug(
+        "Sending Ozon question answer: question_id=%s, len(text)=%d, text_preview=%r",
+        question_id,
+        len(text_clean),
+        text_clean[:80],
+    )
+
+    body = {"question_id": question_id, "text": text_clean}
     if sku and sku > 0:
         body["sku"] = sku
     status_code, data = await client._post_with_status("/v1/question/answer/create", body)
