@@ -50,9 +50,7 @@ class ReviewsCallbackData(CallbackData, prefix="reviews"):
 class QuestionsCallbackData(CallbackData, prefix="questions"):
     action: str
     category: Optional[str] = None
-    index: Optional[int] = None
-    question_id: Optional[str] = None
-    question_token: Optional[str] = None
+    token: Optional[str] = None
     page: Optional[int] = None
 
 
@@ -276,9 +274,9 @@ def reviews_navigation_keyboard(
 def review_card_keyboard(
     *,
     category: str,
-    page: int,
     index: int,
     review_id: str | None,
+    page: int = 0,
     can_send: bool = True,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
@@ -371,8 +369,7 @@ def question_card_keyboard(
     *,
     category: str,
     page: int,
-    question_id: str | None,
-    question_token: str | None = None,
+    token: str | None = None,
     can_send: bool = True,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
@@ -383,8 +380,7 @@ def question_card_keyboard(
                     action="card_ai",
                     category=category,
                     page=page,
-                    question_id=question_id,
-                    question_token=question_token,
+                    token=token,
                 ).pack(),
             )
         ],
@@ -395,8 +391,7 @@ def question_card_keyboard(
                     action="card_manual",
                     category=category,
                     page=page,
-                    question_id=question_id,
-                    question_token=question_token,
+                    token=token,
                 ).pack(),
             )
         ],
@@ -407,8 +402,7 @@ def question_card_keyboard(
                     action="card_reprompt",
                     category=category,
                     page=page,
-                    question_id=question_id,
-                    question_token=question_token,
+                    token=token,
                 ).pack(),
             )
         ],
@@ -423,8 +417,7 @@ def question_card_keyboard(
                         action="send",
                         category=category,
                         page=page,
-                        question_id=question_id,
-                        question_token=question_token,
+                        token=token,
                     ).pack(),
                 )
             ]
@@ -436,11 +429,9 @@ def question_card_keyboard(
                 InlineKeyboardButton(
                     text="⬅️ Назад к списку",
                     callback_data=QuestionsCallbackData(
-                        action="list_page",
+                        action="page",
                         category=category,
                         page=page,
-                        question_id=question_id,
-                        question_token=question_token,
                     ).pack(),
                 )
             ],
@@ -551,7 +542,7 @@ def questions_list_keyboard(
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
 
-    for label, _question_id, idx in items:
+    for label, _unused_question_id, idx in items:
         token = register_question_token(user_id=user_id, category=category, index=idx)
         rows.append(
             [
@@ -560,8 +551,7 @@ def questions_list_keyboard(
                     callback_data=QuestionsCallbackData(
                         action="open",
                         category=category,
-                        question_id=_question_id,
-                        question_token=token,
+                        token=token,
                         page=page,
                     ).pack(),
                 )
