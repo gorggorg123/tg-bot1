@@ -1067,9 +1067,10 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
     """
 
     try:
+        answers_count = 0
         if isinstance(item, QuestionListItem):
-            question_id_raw = item.question_id or item.id
-            created = item.created_at or item.published_at
+            question_id_raw = item.id
+            created = item.published_at or item.created_at
             extras = getattr(item, "model_extra", {}) or {}
             product_name = (
                 item.product_name
@@ -1100,6 +1101,8 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
             sku_val = item.sku or item.product_id
             status = item.status or extras.get("status")
             product_url = item.product_url or extras.get("product_url")
+            answers_count = getattr(item, "answers_count", None) or extras.get("answers_count") or 0
+            answer_id = None
         else:
             question_id_raw = item.get("question_id") or item.get("id")
             created = (
@@ -1134,6 +1137,7 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
             )
             status = item.get("status")
             product_url = item.get("product_url")
+            answers_count = item.get("answers_count") or item.get("answersCount") or 0
 
         question_id = str(question_id_raw or "").strip()
         if not question_id:
@@ -1148,7 +1152,15 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
             product_name = _name_from_product_url(str(product_url)) or product_name
 
         answer_text_clean = str(answer_text) if answer_text not in (None, "") else None
-        has_answer = bool(answer_text_clean) or str(status or "").upper() == "PROCESSED"
+        try:
+            answers_count_int = int(answers_count) if answers_count is not None else 0
+        except Exception:
+            answers_count_int = 0
+        has_answer = (
+            bool(answer_text_clean)
+            or answers_count_int > 0
+            or str(status or "").upper() == "PROCESSED"
+        )
         return Question(
             id=question_id,
             created_at=str(created) if created is not None else None,
