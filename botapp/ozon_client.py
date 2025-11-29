@@ -615,10 +615,14 @@ class OzonClient:
             logger.warning("Failed to parse questions response: %s", exc)
             return payload
 
-    async def question_answer(self, question_id: str, text: str) -> dict | None:
+    async def question_answer(
+        self, question_id: str, text: str, *, sku: int | None = None
+    ) -> dict | None:
         """Отправить ответ на вопрос через /v1/question/answer/create."""
 
         body = {"question_id": question_id, "answer": text}
+        if sku and sku > 0:
+            body["sku"] = sku
         data = await self.post("/v1/question/answer/create", body)
         if not isinstance(data, dict):
             logger.warning("Unexpected /v1/question/answer/create response: %r", data)
@@ -1152,12 +1156,14 @@ async def get_questions_list(
     return result
 
 
-async def send_question_answer(question_id: str, text: str) -> None:
+async def send_question_answer(question_id: str, text: str, *, sku: int | None = None) -> None:
     client = get_write_client()
     if client is None:
         raise OzonAPIError("Нет прав на отправку ответов в Ozon")
 
     body = {"question_id": question_id, "answer": text}
+    if sku and sku > 0:
+        body["sku"] = sku
     status_code, data = await client._post_with_status("/v1/question/answer/create", body)
     if status_code >= 400:
         raise OzonAPIError(

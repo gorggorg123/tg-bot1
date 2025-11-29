@@ -1195,7 +1195,7 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
             )
             return
         try:
-            await send_question_answer(question.id, answer)
+            await send_question_answer(question.id, answer, sku=question.sku)
         except Exception as exc:
             logger.warning("Failed to send question answer %s: %s", question.id, exc)
             await send_ephemeral_message(
