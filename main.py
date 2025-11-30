@@ -38,6 +38,8 @@ from botapp.ozon_client import (
     has_write_credentials,
     get_question_by_id as api_get_question_by_id,
     get_questions_list,
+    list_question_answers,
+    delete_question_answer,
     send_question_answer,
 )
 from botapp.ai_client import generate_review_reply, generate_answer_for_question
@@ -248,6 +250,11 @@ async def _clear_sections(bot: Bot, user_id: int, sections: list[str]) -> None:
 def _remember_question_answer(user_id: int, question_id: str, text: str, status: str = "draft") -> None:
     _question_answers[(user_id, question_id)] = text
     _question_answer_status[(user_id, question_id)] = status
+
+
+def _forget_question_answer(user_id: int, question_id: str) -> None:
+    _question_answers.pop((user_id, question_id), None)
+    _question_answer_status.pop((user_id, question_id), None)
 
 
 async def _send_reviews_list(
@@ -665,9 +672,53 @@ async def _send_question_card(
                 user_id=user_id, category=category, index=idx
             )
 
-    text = format_question_card_text(resolved_question, answer_override=answer_override)
+    answers_count: int | None = getattr(resolved_question, "answers_count", None)
+    display_answer = answer_override
+
+    if display_answer is None:
+        display_answer = getattr(resolved_question, "answer_text", None)
+
+    # Если ответ отмечен, но текста нет — пробуем подтянуть через answer/list
+    if (
+        (display_answer is None or not str(display_answer).strip())
+        and getattr(resolved_question, "has_answer", False)
+    ):
+        sku_val = getattr(resolved_question, "sku", None)
+        try:
+            sku_int = int(sku_val) if sku_val is not None else None
+        except Exception:
+            sku_int = None
+
+        if sku_int is None or sku_int <= 0:
+            logger.warning(
+                "Skip loading answers for %s: missing/invalid SKU %r", resolved_question.id, sku_val
+            )
+        else:
+            try:
+                answers = await list_question_answers(
+                    resolved_question.id, limit=5, sku=sku_int
+                )
+                answers_count = len(answers)
+                resolved_question.answers_count = answers_count
+                if answers:
+                    display_answer = answers[0].text or display_answer
+                    resolved_question.answer_id = answers[0].id or getattr(resolved_question, "answer_id", None)
+                    resolved_question.answer_text = display_answer or resolved_question.answer_text
+                    resolved_question.has_answer = bool(resolved_question.answer_text)
+            except Exception as exc:
+                logger.warning("Failed to fetch answers for %s: %s", resolved_question.id, exc)
+
+    text = format_question_card_text(
+        resolved_question,
+        answer_override=display_answer,
+        answers_count=answers_count,
+    )
     markup = question_card_keyboard(
-        category=category, page=page, token=effective_token, can_send=True
+        category=category,
+        page=page,
+        token=effective_token,
+        can_send=True,
+        has_answer=getattr(resolved_question, "has_answer", False),
     )
     await send_section_message(
         SECTION_QUESTION_CARD,
@@ -1080,6 +1131,155 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         )
         return
 
+    if action == "prefill":
+        question = _resolve_question(token_value=token, legacy_data=callback_data.model_dump())
+        if question is None:
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Не удалось найти вопрос для обновления ответа.",
+                user_id=user_id,
+            )
+            return
+
+        answer_text = question.answer_text
+        if not (answer_text or "").strip():
+            try:
+                answers = await list_question_answers(
+                    question.id, limit=1, sku=getattr(question, "sku", None)
+                )
+                if answers:
+                    question.answer_text = answers[0].text or question.answer_text
+                    question.answer_id = answers[0].id or question.answer_id
+                    question.has_answer = bool(question.answer_text)
+                    answer_text = question.answer_text
+            except Exception as exc:
+                logger.warning("Failed to load current answer for %s: %s", question.id, exc)
+
+        if not (answer_text or "").strip():
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Ответ для этого вопроса в Ozon не найден.",
+                user_id=user_id,
+            )
+            return
+
+        _remember_question_answer(user_id, question.id, answer_text, status="existing")
+        upsert_question_answer(
+            question_id=question.id,
+            created_at=question.created_at,
+            sku=question.sku,
+            product_name=question.product_name,
+            question=question.question_text,
+            answer=answer_text,
+            answer_source="existing",
+            answer_sent_to_ozon=True,
+        )
+        await send_ephemeral_message(
+            callback.message.bot,
+            callback.message.chat.id,
+            "Текущий ответ подставлен в черновик, можно отредактировать и отправить.",
+            user_id=user_id,
+        )
+        await _send_question_card(
+            user_id=user_id,
+            category=category,
+            page=page,
+            callback=callback,
+            answer_override=answer_text,
+            token=token,
+            question=question,
+        )
+        return
+
+    if action == "delete":
+        question = _resolve_question(token_value=token, legacy_data=callback_data.model_dump())
+        if question is None:
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Вопрос не найден. Обновите список и попробуйте снова.",
+                user_id=user_id,
+            )
+            return
+
+        answer_id = getattr(question, "answer_id", None)
+        if not answer_id:
+            try:
+                answers = await list_question_answers(
+                    question.id, limit=1, sku=getattr(question, "sku", None)
+                )
+                if answers:
+                    answer_id = answers[0].id
+                    question.answer_id = answer_id
+                    question.answer_text = answers[0].text or question.answer_text
+                    question.has_answer = bool(question.answer_text)
+            except Exception as exc:
+                logger.warning("Failed to fetch answers before delete %s: %s", question.id, exc)
+
+        if not answer_id:
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Не нашли ответ, который можно удалить.",
+                user_id=user_id,
+            )
+            return
+
+        try:
+            await delete_question_answer(question.id, answer_id=answer_id)
+        except OzonAPIError as exc:
+            logger.warning("Failed to delete question answer %s: %s", question.id, exc)
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                str(exc),
+                user_id=user_id,
+            )
+            return
+        except Exception as exc:
+            logger.warning("Failed to delete question answer %s: %s", question.id, exc)
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                "Не удалось удалить ответ, попробуйте позже.",
+                user_id=user_id,
+            )
+            return
+
+        _forget_question_answer(user_id, question.id)
+        question.answer_text = None
+        question.answer_id = None
+        question.has_answer = False
+        upsert_question_answer(
+            question_id=question.id,
+            created_at=question.created_at,
+            sku=question.sku,
+            product_name=question.product_name,
+            question=question.question_text,
+            answer=None,
+            answer_source="deleted",
+            answer_sent_to_ozon=False,
+        )
+        await refresh_questions(user_id, category)
+        await send_ephemeral_message(
+            callback.message.bot,
+            callback.message.chat.id,
+            "Ответ удалён в Ozon.",
+            user_id=user_id,
+        )
+        await _send_question_card(
+            user_id=user_id,
+            category=category,
+            page=page,
+            callback=callback,
+            token=token,
+            question=question,
+            answer_override=None,
+        )
+        return
+
     if action == "card_ai":
         question = _resolve_question(
             token_value=token, legacy_data=callback_data.model_dump()
@@ -1186,16 +1386,26 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
             return
 
         answer = get_last_question_answer(user_id, question.id) or question.answer_text
-        if not answer:
+        answer_clean = (answer or "").strip()
+        if len(answer_clean) < 2:
             await send_ephemeral_message(
                 callback.message.bot,
                 callback.message.chat.id,
-                "Ответ пока не подготовлен.",
+                "Ответ пустой или слишком короткий, сначала отредактируйте текст.",
                 user_id=user_id,
             )
             return
         try:
-            await send_question_answer(question.id, answer)
+            await send_question_answer(question.id, answer_clean, sku=question.sku)
+        except OzonAPIError as exc:
+            logger.warning("Failed to send question answer %s: %s", question.id, exc)
+            await send_ephemeral_message(
+                callback.message.bot,
+                callback.message.chat.id,
+                str(exc),
+                user_id=user_id,
+            )
+            return
         except Exception as exc:
             logger.warning("Failed to send question answer %s: %s", question.id, exc)
             await send_ephemeral_message(
@@ -1206,19 +1416,21 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
             )
             return
 
-        _remember_question_answer(user_id, question.id, answer, status="sent")
+        _remember_question_answer(user_id, question.id, answer_clean, status="sent")
         upsert_question_answer(
             question_id=question.id,
             created_at=question.created_at,
             sku=question.sku,
             product_name=question.product_name,
             question=question.question_text,
-            answer=answer,
+            answer=answer_clean,
             answer_source=_question_answer_status.get((user_id, question.id), "manual"),
             answer_sent_to_ozon=True,
             answer_sent_at=datetime.now(timezone.utc).isoformat(),
             meta={"chat_id": callback.message.chat.id, "message_id": callback.message.message_id},
         )
+        question.has_answer = True
+        question.answer_text = answer_clean
         await refresh_questions(user_id, category)
         await send_ephemeral_message(
             callback.message.bot,
