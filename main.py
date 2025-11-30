@@ -66,6 +66,7 @@ from botapp.questions import (
     get_question_by_index,
     get_question_index,
     get_questions_table,
+    ensure_question_answer_text,
     refresh_questions,
     register_question_token,
     resolve_question_id,
@@ -671,6 +672,8 @@ async def _send_question_card(
             effective_token = register_question_token(
                 user_id=user_id, category=category, index=idx
             )
+
+    await ensure_question_answer_text(resolved_question)
 
     text = format_question_card_text(resolved_question, answer_override=answer_override)
     markup = question_card_keyboard(
