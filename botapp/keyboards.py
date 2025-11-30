@@ -371,6 +371,7 @@ def question_card_keyboard(
     page: int,
     token: str | None = None,
     can_send: bool = True,
+    has_answer: bool = False,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [
@@ -408,6 +409,22 @@ def question_card_keyboard(
         ],
     ]
 
+    if has_answer:
+        rows.insert(
+            0,
+            [
+                InlineKeyboardButton(
+                    text="✏️ Обновить ответ",
+                    callback_data=QuestionsCallbackData(
+                        action="prefill",
+                        category=category,
+                        page=page,
+                        token=token,
+                    ).pack(),
+                )
+            ],
+        )
+
     if can_send and has_write_credentials():
         rows.append(
             [
@@ -415,6 +432,21 @@ def question_card_keyboard(
                     text="✅ Отправить на Ozon",
                     callback_data=QuestionsCallbackData(
                         action="send",
+                        category=category,
+                        page=page,
+                        token=token,
+                    ).pack(),
+                )
+            ]
+        )
+
+    if has_answer and has_write_credentials():
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🗑 Удалить ответ",
+                    callback_data=QuestionsCallbackData(
+                        action="delete",
                         category=category,
                         page=page,
                         token=token,
@@ -558,17 +590,18 @@ def questions_list_keyboard(
             ]
         )
 
+    active_cat = (category or "all").lower()
     filter_row = [
         InlineKeyboardButton(
-            text="Все",
+            text=("✅ Все" if active_cat == "all" else "Все"),
             callback_data=QuestionsCallbackData(action="list", category="all", page=0).pack(),
         ),
         InlineKeyboardButton(
-            text="Без ответа",
+            text=("✅ Без ответа" if active_cat == "unanswered" else "Без ответа"),
             callback_data=QuestionsCallbackData(action="list", category="unanswered", page=0).pack(),
         ),
         InlineKeyboardButton(
-            text="С ответом",
+            text=("✅ С ответом" if active_cat == "answered" else "С ответом"),
             callback_data=QuestionsCallbackData(action="list", category="answered", page=0).pack(),
         ),
     ]

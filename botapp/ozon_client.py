@@ -45,6 +45,7 @@ class QuestionItem(BaseModel):
     status: str | None = None
     answer: str | None = None
     last_answer: str | None = None
+    answer_id: str | None = None
     created_at: Any = None
     updated_at: Any = None
 
@@ -126,6 +127,20 @@ def _ensure_utc(dt: datetime) -> datetime:
     if dt.tzinfo:
         return dt.astimezone(timezone.utc)
     return dt.replace(tzinfo=timezone.utc)
+
+
+def _clean_sku(value: Any) -> int | None:
+    """Вернуть положительный SKU или None, чтобы не отправлять 0 в Ozon."""
+
+    try:
+        sku_int = int(value)
+    except Exception:
+        return None
+
+    if sku_int <= 0:
+        return None
+
+    return sku_int
 
 
 def msk_today_range() -> Tuple[str, str, str]:
@@ -297,8 +312,10 @@ class OzonClient:
                 raw = await r.aread()
             except Exception:
                 raw = b""
-            logger.error("Ozon %s -> JSON decode failed: %s", url, raw[:500])
-            return status, None
+            logger.error(
+                "Ozon %s -> HTTP %s JSON decode failed: %s", url, status, raw[:500]
+            )
+            return status, {"raw": raw.decode(errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)}
 
         if status >= 400:
             logger.warning("Ozon %s -> HTTP %s: %s", url, status, data)
@@ -613,15 +630,87 @@ class OzonClient:
             logger.warning("Failed to parse questions response: %s", exc)
             return payload
 
-    async def question_answer(self, question_id: str, text: str) -> dict | None:
-        """Отправить ответ на вопрос через /v1/question/answer."""
+    async def question_answer(
+        self, question_id: str, text: str, *, sku: int | None = None
+    ) -> dict | None:
+        """Отправить ответ на вопрос через /v1/question/answer/create."""
 
-        body = {"question_id": question_id, "answer": text}
-        data = await self.post("/v1/question/answer", body)
+        text_clean = (text or "").strip()
+        if len(text_clean) < 2:
+            raise OzonAPIError("Ответ пустой или слишком короткий для отправки в Ozon")
+
+        logger.debug(
+            "Sending Ozon question answer: question_id=%s, len(text)=%d, text_preview=%r",
+            question_id,
+            len(text_clean),
+            text_clean[:80],
+        )
+
+        body = {"question_id": question_id, "text": text_clean}
+
+        sku_clean = _clean_sku(sku)
+        if sku_clean is not None:
+            body["sku"] = sku_clean
+        data = await self.post("/v1/question/answer/create", body)
         if not isinstance(data, dict):
-            logger.warning("Unexpected /v1/question/answer response: %r", data)
+            logger.warning("Unexpected /v1/question/answer/create response: %r", data)
             return None
         return data.get("result") if isinstance(data.get("result"), dict) else data
+
+    async def question_answer_list(
+        self, question_id: str, *, limit: int = 20, sku: int | None = None
+    ) -> list[QuestionAnswer]:
+        """Получить ответы продавца на конкретный вопрос."""
+
+        body = {"question_id": question_id, "limit": max(1, min(limit, 50))}
+
+        sku_clean = _clean_sku(sku)
+        if sku_clean is not None:
+            body["sku"] = sku_clean
+        status_code, payload = await self._post_with_status(
+            "/v1/question/answer/list", body
+        )
+        if status_code >= 400:
+            raise OzonAPIError(
+                f"Ошибка Ozon API: HTTP {status_code} {payload.get('message') if isinstance(payload, dict) else payload}"
+            )
+        if not isinstance(payload, dict):
+            logger.warning("Unexpected /v1/question/answer/list response: %r", payload)
+            return []
+
+        result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+        raw_answers = result.get("answers") if isinstance(result, dict) else []
+        if not isinstance(raw_answers, list):
+            raw_answers = result.get("items") if isinstance(result, dict) else []
+        answers: list[QuestionAnswer] = []
+        for item in raw_answers if isinstance(raw_answers, list) else []:
+            if not isinstance(item, dict):
+                continue
+            answers.append(
+                QuestionAnswer(
+                    id=str(item.get("id") or item.get("answer_id") or item.get("answerId") or "")
+                    or None,
+                    text=str(item.get("text") or item.get("answer") or "") or None,
+                    created_at=str(item.get("created_at") or item.get("createdAt") or "") or None,
+                    updated_at=str(item.get("updated_at") or item.get("updatedAt") or "") or None,
+                )
+            )
+        return answers
+
+    async def question_answer_delete(self, answer_id: str) -> dict | None:
+        """Удалить ответ продавца на вопрос через /v1/question/answer/delete."""
+
+        body = {"answer_id": answer_id}
+        status_code, payload = await self._post_with_status(
+            "/v1/question/answer/delete", body
+        )
+        if status_code >= 400:
+            raise OzonAPIError(
+                f"Ошибка Ozon API: HTTP {status_code} {payload.get('message') if isinstance(payload, dict) else payload}"
+            )
+        if payload is None:
+            logger.warning("Empty response for /v1/question/answer/delete %s", answer_id)
+        return payload
 
     async def create_review_comment(
         self,
@@ -947,6 +1036,14 @@ class GetQuestionListResponse(BaseModel):
 
 
 @dataclass
+class QuestionAnswer:
+    id: str | None
+    text: str | None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass
 class Question:
     id: str
     created_at: str | None
@@ -956,6 +1053,8 @@ class Question:
     question_text: str
     answer_text: str | None
     status: str | None
+    has_answer: bool = False
+    answer_id: str | None = None
 
 
 def _name_from_product_url(url: str) -> str | None:
@@ -988,9 +1087,10 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
     """
 
     try:
+        answers_count = 0
         if isinstance(item, QuestionListItem):
-            question_id_raw = item.question_id or item.id
-            created = item.created_at or item.published_at
+            question_id_raw = item.id
+            created = item.published_at or item.created_at
             extras = getattr(item, "model_extra", {}) or {}
             product_name = (
                 item.product_name
@@ -1020,6 +1120,8 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
             sku_val = item.sku or item.product_id
             status = item.status or extras.get("status")
             product_url = item.product_url or extras.get("product_url")
+            answers_count = getattr(item, "answers_count", None) or extras.get("answers_count") or 0
+            answer_id = None
         else:
             question_id_raw = item.get("question_id") or item.get("id")
             created = (
@@ -1046,6 +1148,7 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
                 or item.get("answer")
                 or item.get("message")
             )
+            answer_id = item.get("answer_id")
             sku_val = (
                 item.get("sku")
                 or item.get("product_id")
@@ -1053,6 +1156,7 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
             )
             status = item.get("status")
             product_url = item.get("product_url")
+            answers_count = item.get("answers_count") or item.get("answersCount") or 0
 
         question_id = str(question_id_raw or "").strip()
         if not question_id:
@@ -1066,6 +1170,16 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
         if (product_name in (None, "")) and product_url:
             product_name = _name_from_product_url(str(product_url)) or product_name
 
+        answer_text_clean = str(answer_text) if answer_text not in (None, "") else None
+        try:
+            answers_count_int = int(answers_count) if answers_count is not None else 0
+        except Exception:
+            answers_count_int = 0
+        has_answer = (
+            bool(answer_text_clean)
+            or answers_count_int > 0
+            or str(status or "").upper() == "PROCESSED"
+        )
         return Question(
             id=question_id,
             created_at=str(created) if created is not None else None,
@@ -1073,8 +1187,10 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
             product_id=str(sku_val) if sku_val is not None else None,
             product_name=str(product_name) if product_name not in (None, "") else None,
             question_text=str(question_text) if question_text not in (None, "") else "",
-            answer_text=str(answer_text) if answer_text not in (None, "") else None,
+            answer_text=answer_text_clean,
             status=str(status or "").strip() or None,
+            has_answer=has_answer,
+            answer_id=str(answer_id) if answer_id not in (None, "") else None,
         )
     except Exception as exc:  # pragma: no cover - защита от неожиданных данных
         logger.warning("Failed to parse question item %s: %s", item, exc)
@@ -1083,11 +1199,11 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
 
 def _map_question_status(category: str | None) -> str:
     if not category:
-        return QUESTION_STATUS_MAP["all"]
+        return ""
     mapped = QUESTION_STATUS_MAP.get(category)
     if not mapped:
         logger.warning("Unknown question category %s, fallback to ALL", category)
-        return QUESTION_STATUS_MAP["all"]
+        return ""
     return mapped
 
 
@@ -1112,7 +1228,7 @@ async def get_questions_list(
     request = GetQuestionListRequest(
         limit=max(1, min(limit, 200)),
         offset=max(0, offset),
-        filter=QuestionListFilter(status=ozon_status),
+        filter=QuestionListFilter(status=ozon_status) if ozon_status else None,
     )
 
     body = request.model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -1143,22 +1259,102 @@ async def get_questions_list(
         raw_items = arr  # type: ignore[assignment]
 
     result: list[Question] = []
+    missing_answers: list[Question] = []
     for raw in raw_items:
         parsed = _parse_question_item(raw)
         if parsed:
             result.append(parsed)
+            if parsed.has_answer and not parsed.answer_text:
+                missing_answers.append(parsed)
+
+    # Если Ozon не вернул текст ответа в списке, пробуем подтянуть через answer/list
+    if missing_answers:
+        for item in missing_answers:
+            try:
+                answers = await client.question_answer_list(
+                    item.id, limit=1, sku=item.sku
+                )
+            except Exception as exc:  # pragma: no cover - сеть/формат
+                logger.warning("Failed to fetch answers for %s: %s", item.id, exc)
+                continue
+            if not answers:
+                continue
+            first = answers[0]
+            item.answer_text = first.text or item.answer_text
+            item.answer_id = first.id or item.answer_id
+            item.has_answer = bool(item.answer_text)
     return result
 
 
-async def send_question_answer(question_id: str, text: str) -> None:
+async def send_question_answer(question_id: str, text: str, *, sku: int | None = None) -> None:
     client = get_write_client()
     if client is None:
         raise OzonAPIError("Нет прав на отправку ответов в Ozon")
 
-    body = {"question_id": question_id, "answer": text, "text": text}
-    status_code, data = await client._post_with_status("/v1/question/answer", body)
+    text_clean = (text or "").strip()
+    if len(text_clean) < 2:
+        raise OzonAPIError("Ответ пустой или слишком короткий, сначала отредактируйте текст")
+
+    logger.debug(
+        "Sending Ozon question answer: question_id=%s, len(text)=%d, text_preview=%r",
+        question_id,
+        len(text_clean),
+        text_clean[:80],
+    )
+
+    body = {"question_id": question_id, "text": text_clean}
+    sku_clean = _clean_sku(sku)
+    if sku_clean is not None:
+        body["sku"] = sku_clean
+    status_code, data = await client._post_with_status("/v1/question/answer/create", body)
     if status_code >= 400:
-        raise OzonAPIError(f"Ошибка Ozon API: HTTP {status_code} {data}")
+        raise OzonAPIError(
+            f"Ошибка Ozon API: HTTP {status_code} {data.get('message') if isinstance(data, dict) else data}"
+        )
+    if data is None:
+        raise OzonAPIError(
+            "Ошибка Ozon API: пустой ответ при отправке ответа на вопрос"
+        )
+
+
+async def list_question_answers(
+    question_id: str, *, limit: int = 20, sku: int | None = None
+) -> list[QuestionAnswer]:
+    client = get_client()
+    answers = await client.question_answer_list(
+        question_id, limit=limit, sku=sku
+    )
+    return answers
+
+
+# Совместимость со старым импортом
+async def get_question_answers(
+    question_id: str, *, limit: int = 20, sku: int | None = None
+) -> list[QuestionAnswer]:
+    return await list_question_answers(question_id, limit=limit, sku=sku)
+
+
+async def delete_question_answer(
+    question_id: str, *, answer_id: str | None = None, sku: int | None = None
+) -> None:
+    client = get_write_client()
+    if client is None:
+        raise OzonAPIError("Нет прав на удаление ответов в Ozon")
+
+    target_answer_id = answer_id
+    if not target_answer_id:
+        try:
+            existing = await client.question_answer_list(
+                question_id, limit=1, sku=sku
+            )
+        except Exception as exc:
+            raise OzonAPIError(f"Не удалось получить список ответов: {exc}")
+        target_answer_id = existing[0].id if existing else None
+
+    if not target_answer_id:
+        raise OzonAPIError("Ответ не найден, удалять нечего")
+
+    await client.question_answer_delete(target_answer_id)
 
 
 async def get_question_by_id(question_id: str) -> Question | None:
