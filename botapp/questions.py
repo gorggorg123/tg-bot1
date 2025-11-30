@@ -449,7 +449,6 @@ def format_question_card_text(
     status_text = (
         "Ответ дан" if getattr(question, "has_answer", False) or status_raw == "PROCESSED" else "Без ответа"
     )
-    answers_count = getattr(question, "answers_count", None)
 
     lines: List[str] = [
         "❓ Вопрос покупателя",

@@ -642,11 +642,13 @@ class OzonClient:
         return data.get("result") if isinstance(data.get("result"), dict) else data
 
     async def question_answer_list(
-        self, question_id: str, *, limit: int = 20
+        self, question_id: str, *, limit: int = 20, sku: int | None = None
     ) -> list[QuestionAnswer]:
         """Получить ответы продавца на конкретный вопрос."""
 
         body = {"question_id": question_id, "limit": max(1, min(limit, 50))}
+        if sku and sku > 0:
+            body["sku"] = sku
         status_code, payload = await self._post_with_status(
             "/v1/question/answer/list", body
         )
@@ -1035,7 +1037,6 @@ class Question:
     status: str | None
     has_answer: bool = False
     answer_id: str | None = None
-    answers_count: int | None = None
 
 
 def _name_from_product_url(url: str) -> str | None:
@@ -1070,7 +1071,7 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
     try:
         answers_count = 0
         if isinstance(item, QuestionListItem):
-            question_id_raw = item.id or item.question_id
+            question_id_raw = item.id
             created = item.published_at or item.created_at
             extras = getattr(item, "model_extra", {}) or {}
             product_name = (
@@ -1102,11 +1103,8 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
             sku_val = item.sku or item.product_id
             status = item.status or extras.get("status")
             product_url = item.product_url or extras.get("product_url")
-            answers_count = (
-                getattr(item, "answers_count", None)
-                or extras.get("answers_count")
-                or 0
-            )
+            answers_count = getattr(item, "answers_count", None) or extras.get("answers_count") or 0
+            answer_id = None
         else:
             question_id_raw = item.get("question_id") or item.get("id")
             created = (
@@ -1176,7 +1174,6 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
             status=str(status or "").strip() or None,
             has_answer=has_answer,
             answer_id=str(answer_id) if answer_id not in (None, "") else None,
-            answers_count=answers_count_int,
         )
     except Exception as exc:  # pragma: no cover - защита от неожиданных данных
         logger.warning("Failed to parse question item %s: %s", item, exc)
@@ -1257,7 +1254,9 @@ async def get_questions_list(
     if missing_answers:
         for item in missing_answers:
             try:
-                answers = await client.question_answer_list(item.id, limit=1)
+                answers = await client.question_answer_list(
+                    item.id, limit=1, sku=item.sku
+                )
             except Exception as exc:  # pragma: no cover - сеть/формат
                 logger.warning("Failed to fetch answers for %s: %s", item.id, exc)
                 continue
@@ -1267,7 +1266,6 @@ async def get_questions_list(
             item.answer_text = first.text or item.answer_text
             item.answer_id = first.id or item.answer_id
             item.has_answer = bool(item.answer_text)
-            item.answers_count = item.answers_count or len(answers)
     return result
 
 
@@ -1302,23 +1300,17 @@ async def send_question_answer(question_id: str, text: str, *, sku: int | None =
 
 
 async def list_question_answers(
-    question_id: str, *, limit: int = 20
+    question_id: str, *, limit: int = 20, sku: int | None = None
 ) -> list[QuestionAnswer]:
     client = get_client()
-    answers = await client.question_answer_list(question_id, limit=limit)
+    answers = await client.question_answer_list(
+        question_id, limit=limit, sku=sku
+    )
     return answers
 
 
-async def get_question_answers(
-    question_id: str, *, limit: int = 20
-) -> list[QuestionAnswer]:
-    """Совместимый алиас для получения ответов на вопрос."""
-
-    return await list_question_answers(question_id, limit=limit)
-
-
 async def delete_question_answer(
-    question_id: str, *, answer_id: str | None = None
+    question_id: str, *, answer_id: str | None = None, sku: int | None = None
 ) -> None:
     client = get_write_client()
     if client is None:
@@ -1327,7 +1319,9 @@ async def delete_question_answer(
     target_answer_id = answer_id
     if not target_answer_id:
         try:
-            existing = await client.question_answer_list(question_id, limit=1)
+            existing = await client.question_answer_list(
+                question_id, limit=1, sku=sku
+            )
         except Exception as exc:
             raise OzonAPIError(f"Не удалось получить список ответов: {exc}")
         target_answer_id = existing[0].id if existing else None
