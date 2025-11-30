@@ -16,7 +16,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple, Optional
 
-from botapp.ozon_client import Question, get_client, get_questions_list
+from botapp.ozon_client import (
+    Question,
+    get_client,
+    get_question_answers,
+    get_questions_list,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +286,31 @@ def _get_cached_questions(user_id: int, category: str) -> List[Question]:
     return session.all
 
 
+async def ensure_question_answer_text(question: Question) -> None:
+    """Догружает текст ответа для вопроса, если он отмечен как отвеченный."""
+
+    if not getattr(question, "has_answer", False):
+        return
+
+    if (getattr(question, "answer_text", None) or "").strip():
+        return
+
+    try:
+        answers = await get_question_answers(question.id, limit=1)
+    except Exception as exc:  # pragma: no cover - сеть/формат
+        logger.warning("Failed to fetch answer text for %s: %s", question.id, exc)
+        return
+
+    if not answers:
+        return
+
+    first = answers[0]
+    question.answer_text = first.text or question.answer_text
+    question.answer_id = first.id or question.answer_id
+    question.has_answer = bool(question.answer_text)
+    question.answers_count = question.answers_count or len(answers)
+
+
 # ---------------------------------------------------------------------------
 # Пагинация и таблица списка вопросов
 # ---------------------------------------------------------------------------
@@ -425,6 +455,8 @@ def format_question_card_text(
         f"Товар: {product_name}",
         f"Дата: {_fmt_dt_msk(created)} (МСК)",
         f"Статус: {status_text}",
+        f"Статус Ozon: {status_raw or '—'}",
+        f"Ответов: {answers_count if answers_count is not None else '—'}",
         "",
         "Вопрос:",
         getattr(question, "question_text", None) or
@@ -478,6 +510,7 @@ __all__ = [
     "find_question",
     "resolve_question_id",
     "format_question_card_text",
+    "ensure_question_answer_text",
     "register_question_token",
     "resolve_question_token",
 ]
