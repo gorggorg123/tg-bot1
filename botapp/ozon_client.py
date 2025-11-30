@@ -129,6 +129,20 @@ def _ensure_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc)
 
 
+def _clean_sku(value: Any) -> int | None:
+    """Вернуть положительный SKU или None, чтобы не отправлять 0 в Ozon."""
+
+    try:
+        sku_int = int(value)
+    except Exception:
+        return None
+
+    if sku_int <= 0:
+        return None
+
+    return sku_int
+
+
 def msk_today_range() -> Tuple[str, str, str]:
     """
     Диапазон на сегодня в МСК, но границы в UTC.
@@ -633,8 +647,10 @@ class OzonClient:
         )
 
         body = {"question_id": question_id, "text": text_clean}
-        if sku and sku > 0:
-            body["sku"] = sku
+
+        sku_clean = _clean_sku(sku)
+        if sku_clean is not None:
+            body["sku"] = sku_clean
         data = await self.post("/v1/question/answer/create", body)
         if not isinstance(data, dict):
             logger.warning("Unexpected /v1/question/answer/create response: %r", data)
@@ -647,8 +663,10 @@ class OzonClient:
         """Получить ответы продавца на конкретный вопрос."""
 
         body = {"question_id": question_id, "limit": max(1, min(limit, 50))}
-        if sku and sku > 0:
-            body["sku"] = sku
+
+        sku_clean = _clean_sku(sku)
+        if sku_clean is not None:
+            body["sku"] = sku_clean
         status_code, payload = await self._post_with_status(
             "/v1/question/answer/list", body
         )
@@ -1286,8 +1304,9 @@ async def send_question_answer(question_id: str, text: str, *, sku: int | None =
     )
 
     body = {"question_id": question_id, "text": text_clean}
-    if sku and sku > 0:
-        body["sku"] = sku
+    sku_clean = _clean_sku(sku)
+    if sku_clean is not None:
+        body["sku"] = sku_clean
     status_code, data = await client._post_with_status("/v1/question/answer/create", body)
     if status_code >= 400:
         raise OzonAPIError(
@@ -1307,6 +1326,13 @@ async def list_question_answers(
         question_id, limit=limit, sku=sku
     )
     return answers
+
+
+# Совместимость со старым импортом
+async def get_question_answers(
+    question_id: str, *, limit: int = 20, sku: int | None = None
+) -> list[QuestionAnswer]:
+    return await list_question_answers(question_id, limit=limit, sku=sku)
 
 
 async def delete_question_answer(
