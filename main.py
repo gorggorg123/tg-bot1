@@ -66,6 +66,7 @@ from botapp.questions import (
     get_question_by_index,
     get_question_index,
     get_questions_table,
+    ensure_question_answer_text,
     refresh_questions,
     register_question_token,
     resolve_question_id,
