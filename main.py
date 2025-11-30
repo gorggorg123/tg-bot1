@@ -673,9 +673,47 @@ async def _send_question_card(
                 user_id=user_id, category=category, index=idx
             )
 
-    await ensure_question_answer_text(resolved_question)
+    answers_count: int | None = getattr(resolved_question, "answers_count", None)
+    display_answer = answer_override
 
-    text = format_question_card_text(resolved_question, answer_override=answer_override)
+    if display_answer is None:
+        display_answer = getattr(resolved_question, "answer_text", None)
+
+    # Если ответ отмечен, но текста нет — пробуем подтянуть через answer/list
+    if (
+        (display_answer is None or not str(display_answer).strip())
+        and getattr(resolved_question, "has_answer", False)
+    ):
+        sku_val = getattr(resolved_question, "sku", None)
+        try:
+            sku_int = int(sku_val) if sku_val is not None else None
+        except Exception:
+            sku_int = None
+
+        if sku_int is None or sku_int <= 0:
+            logger.warning(
+                "Skip loading answers for %s: missing/invalid SKU %r", resolved_question.id, sku_val
+            )
+        else:
+            try:
+                answers = await list_question_answers(
+                    resolved_question.id, limit=5, sku=sku_int
+                )
+                answers_count = len(answers)
+                resolved_question.answers_count = answers_count
+                if answers:
+                    display_answer = answers[0].text or display_answer
+                    resolved_question.answer_id = answers[0].id or getattr(resolved_question, "answer_id", None)
+                    resolved_question.answer_text = display_answer or resolved_question.answer_text
+                    resolved_question.has_answer = bool(resolved_question.answer_text)
+            except Exception as exc:
+                logger.warning("Failed to fetch answers for %s: %s", resolved_question.id, exc)
+
+    text = format_question_card_text(
+        resolved_question,
+        answer_override=display_answer,
+        answers_count=answers_count,
+    )
     markup = question_card_keyboard(
         category=category,
         page=page,
@@ -1108,7 +1146,9 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         answer_text = question.answer_text
         if not (answer_text or "").strip():
             try:
-                answers = await list_question_answers(question.id, limit=1)
+                answers = await list_question_answers(
+                    question.id, limit=1, sku=getattr(question, "sku", None)
+                )
                 if answers:
                     question.answer_text = answers[0].text or question.answer_text
                     question.answer_id = answers[0].id or question.answer_id
@@ -1168,7 +1208,9 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         answer_id = getattr(question, "answer_id", None)
         if not answer_id:
             try:
-                answers = await list_question_answers(question.id, limit=1)
+                answers = await list_question_answers(
+                    question.id, limit=1, sku=getattr(question, "sku", None)
+                )
                 if answers:
                     answer_id = answers[0].id
                     question.answer_id = answer_id

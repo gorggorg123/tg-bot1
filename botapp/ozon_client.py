@@ -1055,6 +1055,7 @@ class Question:
     status: str | None
     has_answer: bool = False
     answer_id: str | None = None
+    answers_count: int | None = None
 
 
 def _name_from_product_url(url: str) -> str | None:
@@ -1192,6 +1193,7 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
             status=str(status or "").strip() or None,
             has_answer=has_answer,
             answer_id=str(answer_id) if answer_id not in (None, "") else None,
+            answers_count=answers_count_int if answers_count_int >= 0 else None,
         )
     except Exception as exc:  # pragma: no cover - защита от неожиданных данных
         logger.warning("Failed to parse question item %s: %s", item, exc)
@@ -1271,9 +1273,15 @@ async def get_questions_list(
     # Если Ozon не вернул текст ответа в списке, пробуем подтянуть через answer/list
     if missing_answers:
         for item in missing_answers:
+            sku_clean = _clean_sku(getattr(item, "sku", None))
+            if sku_clean is None:
+                logger.warning(
+                    "Skip fetching answers for %s: missing/invalid SKU", item.id
+                )
+                continue
             try:
                 answers = await client.question_answer_list(
-                    item.id, limit=1, sku=item.sku
+                    item.id, limit=1, sku=sku_clean
                 )
             except Exception as exc:  # pragma: no cover - сеть/формат
                 logger.warning("Failed to fetch answers for %s: %s", item.id, exc)
@@ -1321,9 +1329,23 @@ async def send_question_answer(question_id: str, text: str, *, sku: int | None =
 async def list_question_answers(
     question_id: str, *, limit: int = 20, sku: int | None = None
 ) -> list[QuestionAnswer]:
+    sku_clean = _clean_sku(sku)
+    if sku is not None and sku_clean is None:
+        logger.warning(
+            "Skip question_answer_list for %s: invalid sku=%r", question_id, sku
+        )
+        return []
+
+    if sku_clean is None:
+        logger.warning(
+            "Skip question_answer_list for %s: missing SKU to avoid 400 from Ozon",
+            question_id,
+        )
+        return []
+
     client = get_client()
     answers = await client.question_answer_list(
-        question_id, limit=limit, sku=sku
+        question_id, limit=limit, sku=sku_clean
     )
     return answers
 
