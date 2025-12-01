@@ -1042,7 +1042,7 @@ def has_write_credentials() -> bool:
 async def chat_list(*, limit: int = 10, offset: int = 0) -> list[dict]:
     client = get_client()
     body = {"limit": max(1, min(limit, 50)), "offset": max(0, offset)}
-    status_code, data = await client._post_with_status("/v2/chat/list", body)
+    status_code, data = await client._post_with_status("/v3/chat/list", body)
     if status_code >= 400 or not isinstance(data, dict):
         message = None
         if isinstance(data, dict):
@@ -1061,7 +1061,7 @@ async def chat_list(*, limit: int = 10, offset: int = 0) -> list[dict]:
 async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:
     client = get_client()
     body = {"chat_id": chat_id, "limit": max(1, min(limit, 50))}
-    status_code, data = await client._post_with_status("/v2/chat/history", body)
+    status_code, data = await client._post_with_status("/v3/chat/history", body)
     if status_code >= 400 or not isinstance(data, dict):
         message = None
         if isinstance(data, dict):
