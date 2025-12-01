@@ -33,6 +33,7 @@ from botapp.keyboards import (
     review_card_keyboard,
     reviews_list_keyboard,
 )
+from botapp.chats import router as chats_router
 from botapp.orders import get_orders_today_text
 from botapp.ozon_client import (
     OzonAPIError,
@@ -86,6 +87,9 @@ from botapp.questions import (
 from botapp.storage import append_question_record, upsert_question_answer
 from botapp.message_gc import (
     SECTION_ACCOUNT,
+    SECTION_CHAT_CARD,
+    SECTION_CHAT_LIST,
+    SECTION_CHAT_PROMPT,
     SECTION_FBO,
     SECTION_FINANCE_TODAY,
     SECTION_MENU,
@@ -177,6 +181,7 @@ ENABLE_TG_POLLING = os.getenv("ENABLE_TG_POLLING", "1") == "1"
 if not TG_BOT_TOKEN:
     raise RuntimeError("TG_BOT_TOKEN is not set")
 router = Router()
+router.include_router(chats_router)
 _polling_task: asyncio.Task | None = None
 _polling_lock = asyncio.Lock()
 _ephemeral_messages: Dict[int, Tuple[int, int, asyncio.Task]] = {}

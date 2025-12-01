@@ -233,6 +233,93 @@ def reviews_root_keyboard() -> InlineKeyboardMarkup:
 
 
 # ---------------------------------------------------------------------------
+# Chats
+# ---------------------------------------------------------------------------
+
+
+def chats_list_keyboard(items: list[tuple[str, str]], *, page: int, has_prev: bool, has_next: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for chat_id, title in items:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=title,
+                    callback_data=ChatsCallbackData(action="open", chat_id=chat_id, page=page).pack(),
+                )
+            ]
+        )
+
+    nav_row: list[InlineKeyboardButton] = []
+    if has_prev:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data=ChatsCallbackData(action="list", page=max(page - 1, 0)).pack(),
+            )
+        )
+    nav_row.append(
+        InlineKeyboardButton(text=f"Стр. {page + 1}", callback_data=ChatsCallbackData(action="noop", page=page).pack())
+    )
+    if has_next:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="➡️ Далее",
+                callback_data=ChatsCallbackData(action="list", page=page + 1).pack(),
+            )
+        )
+    if nav_row:
+        rows.append(nav_row)
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ В главное меню",
+                callback_data=MenuCallbackData(section="home", action="open").pack(),
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def chat_card_keyboard(chat_id: str, *, page: int = 0) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🧠 Сгенерировать ответ",
+                    callback_data=ChatsCallbackData(action="ai", chat_id=chat_id, page=page).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✍ Написать свой ответ",
+                    callback_data=ChatsCallbackData(action="manual", chat_id=chat_id, page=page).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить историю",
+                    callback_data=ChatsCallbackData(action="refresh", chat_id=chat_id, page=page).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ К списку чатов",
+                    callback_data=ChatsCallbackData(action="list", page=page).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ В главное меню",
+                    callback_data=MenuCallbackData(section="home", action="open").pack(),
+                )
+            ],
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
 # Отзывы: навигация
 # ---------------------------------------------------------------------------
 
