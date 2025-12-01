@@ -440,6 +440,7 @@ def resolve_question_id(user_id: int, question_id: str) -> Optional[Question]:
 def format_question_card_text(
     question: Question,
     answer_override: Optional[str] = None,
+    answers_count: Optional[int] = None,
 ) -> str:
     """Собираем человекочитаемую карточку вопроса для Telegram."""
 
