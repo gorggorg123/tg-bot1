@@ -18,12 +18,16 @@ from dotenv import load_dotenv
 from botapp.account import get_account_info_text
 from botapp.finance import get_finance_today_text
 from botapp.keyboards import (
+    ChatsCallbackData,
     MenuCallbackData,
     QuestionsCallbackData,
     ReviewsCallbackData,
     QuestionsCallbackData,
     ChatsCallbackData,
     account_keyboard,
+    chat_actions_keyboard,
+    chat_ai_confirm_keyboard,
+    chats_list_keyboard,
     fbo_menu_keyboard,
     main_menu_keyboard,
     question_card_keyboard,
@@ -35,6 +39,10 @@ from botapp.chats import router as chats_router
 from botapp.orders import get_orders_today_text
 from botapp.ozon_client import (
     OzonAPIError,
+    chat_history,
+    chat_list,
+    chat_read,
+    chat_send_message,
     get_client,
     get_write_client,
     has_write_credentials,
@@ -44,7 +52,11 @@ from botapp.ozon_client import (
     delete_question_answer,
     send_question_answer,
 )
-from botapp.ai_client import generate_review_reply, generate_answer_for_question
+from botapp.ai_client import (
+    generate_chat_reply,
+    generate_review_reply,
+    generate_answer_for_question,
+)
 from botapp.reviews import (
     ReviewCard,
     format_review_card_text,
@@ -89,6 +101,9 @@ from botapp.message_gc import (
     SECTION_REVIEW_CARD,
     SECTION_REVIEW_PROMPT,
     SECTION_REVIEWS_LIST,
+    SECTION_CHAT_HISTORY,
+    SECTION_CHATS_LIST,
+    SECTION_CHAT_PROMPT,
     delete_message_safe,
     delete_section_message,
     send_section_message,
@@ -102,11 +117,15 @@ from botapp.questions import (
 )
 
 try:
-    from botapp.states import QuestionAnswerStates
+    from botapp.states import QuestionAnswerStates, ChatStates
 except Exception:  # pragma: no cover - fallback for import issues during deploy
     class QuestionAnswerStates(StatesGroup):
         manual = State()
         reprompt = State()
+
+    class ChatStates(StatesGroup):
+        waiting_manual = State()
+        waiting_ai_confirm = State()
 
 try:
     from botapp.states import QuestionAnswerStates
@@ -266,6 +285,244 @@ def _remember_question_answer(user_id: int, question_id: str, text: str, status:
 def _forget_question_answer(user_id: int, question_id: str) -> None:
     _question_answers.pop((user_id, question_id), None)
     _question_answer_status.pop((user_id, question_id), None)
+
+
+CHAT_PAGE_SIZE = 5
+
+
+def _truncate_text(text: str, limit: int = 80) -> str:
+    cleaned = (text or "").strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1] + "…"
+
+
+def _parse_chat_caption(chat: dict) -> tuple[str | None, str]:
+    chat_id = None
+    if isinstance(chat, dict):
+        raw_id = chat.get("chat_id") or chat.get("id") or chat.get("chatId")
+        chat_id = str(raw_id) if raw_id else None
+    posting = (
+        chat.get("posting_number")
+        if isinstance(chat, dict)
+        else None
+    ) or (chat.get("order_id") if isinstance(chat, dict) else None)
+    buyer = None
+    if isinstance(chat, dict):
+        buyer = chat.get("buyer_name") or chat.get("client_name") or chat.get("customer_name")
+    last_message = None
+    if isinstance(chat, dict):
+        last_block = chat.get("last_message") or chat.get("lastMessage")
+        if isinstance(last_block, dict):
+            last_message = last_block.get("text") or last_block.get("message")
+        if last_message is None:
+            last_message = chat.get("last_message_text") or chat.get("lastMessageText")
+    unread = False
+    if isinstance(chat, dict):
+        unread = bool(chat.get("unread_count") or chat.get("is_unread") or chat.get("has_unread"))
+
+    caption_parts = []
+    if unread:
+        caption_parts.append("★")
+    if posting:
+        caption_parts.append(str(posting))
+    caption_parts.append(buyer or "Покупатель")
+    if last_message:
+        caption_parts.append("— " + _truncate_text(str(last_message), limit=40))
+    caption = " ".join(caption_parts)
+    return chat_id, caption
+
+
+def _chat_sort_key(chat: dict) -> str:
+    if not isinstance(chat, dict):
+        return ""
+    ts = chat.get("last_message_time") or chat.get("updated_at") or chat.get("updatedAt")
+    if isinstance(ts, str):
+        return ts
+    return ""
+
+
+async def _send_chats_list(
+    *,
+    user_id: int,
+    state: FSMContext,
+    page: int = 0,
+    message: Message | None = None,
+    callback: CallbackQuery | None = None,
+    bot: Bot | None = None,
+    chat_id: int | None = None,
+) -> None:
+    try:
+        items_raw = await chat_list(limit=CHAT_PAGE_SIZE, offset=max(page, 0) * CHAT_PAGE_SIZE)
+    except OzonAPIError as exc:
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                target.chat.id,
+                f"⚠️ Не удалось получить список чатов. Ошибка: {exc}",
+                user_id=user_id,
+            )
+        logger.warning("Unable to load chats list: %s", exc)
+        return
+    except Exception:
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                target.chat.id,
+                "⚠️ Не удалось получить список чатов. Попробуйте позже.",
+                user_id=user_id,
+            )
+        logger.exception("Unexpected error while loading chats list")
+        return
+
+    sorted_items = sorted(items_raw, key=_chat_sort_key, reverse=True)
+    captions: list[tuple[str, str]] = []
+    cache: dict[str, dict] = {}
+    for chat in sorted_items:
+        chat_id_val, caption = _parse_chat_caption(chat)
+        if not chat_id_val:
+            continue
+        captions.append((chat_id_val, caption))
+        cache[chat_id_val] = chat if isinstance(chat, dict) else {}
+
+    await state.update_data(chats_cache=cache, chats_page=page)
+    total_pages = page + 1 + (1 if len(sorted_items) >= CHAT_PAGE_SIZE else 0)
+
+    lines = ["💬 Активные чаты с покупателями:" ]
+    if not captions:
+        lines.append("Нет активных диалогов")
+    else:
+        for idx, (cid, caption) in enumerate(captions, start=1 + page * CHAT_PAGE_SIZE):
+            lines.append(f"{idx}. {caption}")
+
+    markup = chats_list_keyboard(items=captions, page=page, total_pages=total_pages)
+    target = callback.message if callback else message
+    active_bot = bot or (target.bot if target else None)
+    active_chat = chat_id or (target.chat.id if target else None)
+    if not active_bot or active_chat is None:
+        return
+
+    sent = await send_section_message(
+        SECTION_CHATS_LIST,
+        text="\n".join(lines),
+        reply_markup=markup,
+        message=message,
+        callback=callback,
+        bot=bot,
+        chat_id=chat_id,
+        user_id=user_id,
+    )
+    await delete_section_message(
+        user_id,
+        SECTION_CHAT_HISTORY,
+        active_bot,
+        preserve_message_id=sent.message_id if sent else None,
+    )
+    await delete_section_message(user_id, SECTION_CHAT_PROMPT, active_bot, force=True)
+
+
+def _format_chat_history_text(chat_meta: dict | None, messages: list[dict]) -> str:
+    buyer = None
+    posting = None
+    if isinstance(chat_meta, dict):
+        buyer = chat_meta.get("buyer_name") or chat_meta.get("client_name") or chat_meta.get("customer_name")
+        posting = chat_meta.get("posting_number") or chat_meta.get("order_id")
+
+    header_parts = ["💬 Чат с покупателем"]
+    if buyer:
+        header_parts.append(str(buyer))
+    if posting:
+        header_parts.append(f"(заказ {posting})")
+    header = " ".join(header_parts)
+
+    lines = [header, ""]
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        text = msg.get("text") or msg.get("message") or msg.get("content")
+        if not text:
+            continue
+        author_block = msg.get("author") if isinstance(msg.get("author"), dict) else None
+        role = None
+        if author_block:
+            role = author_block.get("role") or author_block.get("type") or author_block.get("name")
+        if not role:
+            role = msg.get("from") or msg.get("sender")
+        role_lower = str(role or "customer").lower()
+        prefix = "Клиент"
+        if "seller" in role_lower or "operator" in role_lower or "store" in role_lower:
+            prefix = "Вы"
+        lines.append(f"{prefix}: {text}")
+
+    return "\n".join(lines)
+
+
+async def _open_chat_history(
+    *,
+    user_id: int,
+    chat_id: str,
+    state: FSMContext,
+    message: Message | None = None,
+    callback: CallbackQuery | None = None,
+    bot: Bot | None = None,
+    chat_id_override: int | None = None,
+) -> None:
+    data = await state.get_data()
+    chat_meta = None
+    cache = data.get("chats_cache") if isinstance(data.get("chats_cache"), dict) else {}
+    if isinstance(cache, dict):
+        chat_meta = cache.get(chat_id)
+
+    try:
+        messages = await chat_history(chat_id, limit=30)
+    except OzonAPIError as exc:
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                target.chat.id,
+                f"⚠️ Не удалось получить историю чата. Ошибка: {exc}",
+                user_id=user_id,
+            )
+        logger.warning("Unable to load chat history for %s: %s", chat_id, exc)
+        return
+    except Exception:
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                target.chat.id,
+                "⚠️ Не удалось загрузить историю чата. Попробуйте позже.",
+                user_id=user_id,
+            )
+        logger.exception("Unexpected error while loading chat %s", chat_id)
+        return
+
+    with suppress(Exception):
+        await chat_read(chat_id)
+
+    history_text = _format_chat_history_text(chat_meta, messages)
+    markup = chat_actions_keyboard(chat_id)
+    target = callback.message if callback else message
+    active_bot = bot or (target.bot if target else None)
+    active_chat = chat_id_override or (target.chat.id if target else None)
+    if not active_bot or active_chat is None:
+        return
+
+    await state.update_data(chat_history=messages, current_chat_id=chat_id)
+    await send_section_message(
+        SECTION_CHAT_HISTORY,
+        text=history_text,
+        reply_markup=markup,
+        message=message,
+        callback=callback,
+        bot=bot,
+        chat_id=chat_id_override,
+        user_id=user_id,
+    )
+    await delete_section_message(user_id, SECTION_CHAT_PROMPT, active_bot, force=True)
 
 
 async def _send_reviews_list(
@@ -1202,7 +1459,9 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         answer_text = question.answer_text
         if not (answer_text or "").strip():
             try:
-                answers = await list_question_answers(question.id, limit=1)
+                answers = await list_question_answers(
+                    question.id, limit=1, sku=getattr(question, "sku", None)
+                )
                 if answers:
                     question.answer_text = answers[0].text or question.answer_text
                     question.answer_id = answers[0].id or question.answer_id
@@ -1262,7 +1521,9 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         answer_id = getattr(question, "answer_id", None)
         if not answer_id:
             try:
-                answers = await list_question_answers(question.id, limit=1)
+                answers = await list_question_answers(
+                    question.id, limit=1, sku=getattr(question, "sku", None)
+                )
                 if answers:
                     answer_id = answers[0].id
                     question.answer_id = answer_id
