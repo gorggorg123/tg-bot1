@@ -66,6 +66,7 @@ from botapp.questions import (
     get_question_by_index,
     get_question_index,
     get_questions_table,
+    ensure_question_answer_text,
     refresh_questions,
     register_question_token,
     resolve_question_id,
@@ -78,8 +79,10 @@ from botapp.message_gc import (
     SECTION_FINANCE_TODAY,
     SECTION_MENU,
     SECTION_QUESTION_CARD,
+    SECTION_QUESTION_PROMPT,
     SECTION_QUESTIONS_LIST,
     SECTION_REVIEW_CARD,
+    SECTION_REVIEW_PROMPT,
     SECTION_REVIEWS_LIST,
     delete_message_safe,
     delete_section_message,
@@ -242,9 +245,11 @@ async def send_ephemeral_message(
         category=category, page=page, question_id=question.id, can_send=True
     )
 
-async def _clear_sections(bot: Bot, user_id: int, sections: list[str]) -> None:
+async def _clear_sections(
+    bot: Bot, user_id: int, sections: list[str], *, force: bool = False
+) -> None:
     for section in sections:
-        await delete_section_message(user_id, section, bot)
+        await delete_section_message(user_id, section, bot, force=force)
 
 
 def _remember_question_answer(user_id: int, question_id: str, text: str, status: str = "draft") -> None:
@@ -365,11 +370,12 @@ async def _send_questions_list(
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, state: FSMContext) -> None:
     text = (
         "Привет! Я помогу быстро смотреть финансы, заказы и отзывы Ozon.\n"
         "Выберите раздел через кнопки ниже."
     )
+    await state.clear()
     await _clear_sections(
         message.bot,
         message.from_user.id,
@@ -381,7 +387,10 @@ async def cmd_start(message: Message) -> None:
             SECTION_REVIEW_CARD,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await send_section_message(
         SECTION_MENU,
@@ -392,8 +401,9 @@ async def cmd_start(message: Message) -> None:
 
 
 @router.message(Command("fin_today"))
-async def cmd_fin_today(message: Message) -> None:
+async def cmd_fin_today(message: Message, state: FSMContext) -> None:
     text = await get_finance_today_text()
+    await state.clear()
     await _clear_sections(
         message.bot,
         message.from_user.id,
@@ -404,7 +414,10 @@ async def cmd_fin_today(message: Message) -> None:
             SECTION_REVIEW_CARD,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await send_section_message(
         SECTION_FINANCE_TODAY,
@@ -415,8 +428,9 @@ async def cmd_fin_today(message: Message) -> None:
 
 
 @router.message(Command("account"))
-async def cmd_account(message: Message) -> None:
+async def cmd_account(message: Message, state: FSMContext) -> None:
     text = await get_account_info_text()
+    await state.clear()
     await _clear_sections(
         message.bot,
         message.from_user.id,
@@ -427,7 +441,10 @@ async def cmd_account(message: Message) -> None:
             SECTION_REVIEW_CARD,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await send_section_message(
         SECTION_ACCOUNT,
@@ -438,8 +455,9 @@ async def cmd_account(message: Message) -> None:
 
 
 @router.message(Command("fbo"))
-async def cmd_fbo(message: Message) -> None:
+async def cmd_fbo(message: Message, state: FSMContext) -> None:
     text = await get_orders_today_text()
+    await state.clear()
     await _clear_sections(
         message.bot,
         message.from_user.id,
@@ -450,7 +468,10 @@ async def cmd_fbo(message: Message) -> None:
             SECTION_REVIEW_CARD,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await send_section_message(
         SECTION_FBO,
@@ -461,8 +482,9 @@ async def cmd_fbo(message: Message) -> None:
 
 
 @router.message(Command("reviews"))
-async def cmd_reviews(message: Message) -> None:
+async def cmd_reviews(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
+    await state.clear()
     await _clear_sections(
         message.bot,
         user_id,
@@ -472,7 +494,10 @@ async def cmd_reviews(message: Message) -> None:
             SECTION_ACCOUNT,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await refresh_reviews(user_id)
     await _send_reviews_list(
@@ -486,8 +511,9 @@ async def cmd_reviews(message: Message) -> None:
 
 
 @router.message(Command("questions"))
-async def cmd_questions(message: Message) -> None:
+async def cmd_questions(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
+    await state.clear()
     await _clear_sections(
         message.bot,
         user_id,
@@ -498,7 +524,10 @@ async def cmd_questions(message: Message) -> None:
             SECTION_REVIEWS_LIST,
             SECTION_REVIEW_CARD,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await refresh_questions(user_id)
     await _send_questions_list(
@@ -672,6 +701,8 @@ async def _send_question_card(
                 user_id=user_id, category=category, index=idx
             )
 
+    await ensure_question_answer_text(resolved_question)
+
     text = format_question_card_text(resolved_question, answer_override=answer_override)
     markup = question_card_keyboard(
         category=category,
@@ -692,9 +723,12 @@ async def _send_question_card(
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "home"))
-async def cb_home(callback: CallbackQuery, callback_data: MenuCallbackData) -> None:
+async def cb_home(
+    callback: CallbackQuery, callback_data: MenuCallbackData, state: FSMContext
+) -> None:
     await callback.answer()
     user_id = callback.from_user.id
+    await state.clear()
     await _clear_sections(
         callback.message.bot,
         user_id,
@@ -706,7 +740,10 @@ async def cb_home(callback: CallbackQuery, callback_data: MenuCallbackData) -> N
             SECTION_REVIEW_CARD,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await send_section_message(
         SECTION_MENU,
@@ -718,10 +755,13 @@ async def cb_home(callback: CallbackQuery, callback_data: MenuCallbackData) -> N
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "fbo"))
-async def cb_fbo(callback: CallbackQuery, callback_data: MenuCallbackData) -> None:
+async def cb_fbo(
+    callback: CallbackQuery, callback_data: MenuCallbackData, state: FSMContext
+) -> None:
     await callback.answer()
     action = callback_data.action
     user_id = callback.from_user.id
+    await state.clear()
     if action == "summary":
         text = await get_orders_today_text()
         await send_section_message(
@@ -768,7 +808,10 @@ async def cb_fbo(callback: CallbackQuery, callback_data: MenuCallbackData) -> No
                 SECTION_REVIEW_CARD,
                 SECTION_QUESTIONS_LIST,
                 SECTION_QUESTION_CARD,
+                SECTION_REVIEW_PROMPT,
+                SECTION_QUESTION_PROMPT,
             ],
+            force=True,
         )
         await send_section_message(
             SECTION_MENU,
@@ -780,10 +823,13 @@ async def cb_fbo(callback: CallbackQuery, callback_data: MenuCallbackData) -> No
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "account"))
-async def cb_account(callback: CallbackQuery, callback_data: MenuCallbackData) -> None:
+async def cb_account(
+    callback: CallbackQuery, callback_data: MenuCallbackData, state: FSMContext
+) -> None:
     await callback.answer()
     text = await get_account_info_text()
     user_id = callback.from_user.id
+    await state.clear()
     await _clear_sections(
         callback.message.bot,
         user_id,
@@ -794,7 +840,10 @@ async def cb_account(callback: CallbackQuery, callback_data: MenuCallbackData) -
             SECTION_REVIEW_CARD,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await send_section_message(
         SECTION_ACCOUNT,
@@ -806,10 +855,13 @@ async def cb_account(callback: CallbackQuery, callback_data: MenuCallbackData) -
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "fin_today"))
-async def cb_fin_today(callback: CallbackQuery, callback_data: MenuCallbackData) -> None:
+async def cb_fin_today(
+    callback: CallbackQuery, callback_data: MenuCallbackData, state: FSMContext
+) -> None:
     await callback.answer()
     text = await get_finance_today_text()
     user_id = callback.from_user.id
+    await state.clear()
     await _clear_sections(
         callback.message.bot,
         user_id,
@@ -820,7 +872,10 @@ async def cb_fin_today(callback: CallbackQuery, callback_data: MenuCallbackData)
             SECTION_REVIEW_CARD,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await send_section_message(
         SECTION_FINANCE_TODAY,
@@ -894,16 +949,34 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
 
     if action == "card_reprompt":
         await callback.answer()
+        prompt = await send_section_message(
+            SECTION_REVIEW_PROMPT,
+            text="Напишите свои пожелания к ответу, я пересоберу текст.",
+            bot=callback.message.bot,
+            chat_id=callback.message.chat.id,
+            user_id=user_id,
+            persistent=True,
+        )
         await state.set_state(ReviewAnswerStates.reprompt)
-        await state.update_data(review_id=review_id, category=category, page=page)
-        await callback.message.answer("Напишите свои пожелания к ответу, я пересоберу текст.")
+        await state.update_data(
+            review_id=review_id, category=category, page=page, prompt_message_id=prompt.message_id
+        )
         return
 
     if action == "card_manual":
         await callback.answer()
+        prompt = await send_section_message(
+            SECTION_REVIEW_PROMPT,
+            text="Пришлите текст ответа, я сохраню его как текущий.",
+            bot=callback.message.bot,
+            chat_id=callback.message.chat.id,
+            user_id=user_id,
+            persistent=True,
+        )
         await state.set_state(ReviewAnswerStates.manual)
-        await state.update_data(review_id=review_id, category=category, page=page)
-        await callback.message.answer("Пришлите текст ответа, я сохраню его как текущий.")
+        await state.update_data(
+            review_id=review_id, category=category, page=page, prompt_message_id=prompt.message_id
+        )
         return
 
     if action == "send":
@@ -1296,15 +1369,21 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
                 user_id=user_id,
             )
             return
+        prompt = await send_section_message(
+            SECTION_QUESTION_PROMPT,
+            text="Пришлите текст ответа для покупателя.",
+            bot=callback.message.bot,
+            chat_id=callback.message.chat.id,
+            user_id=user_id,
+            persistent=True,
+        )
         await state.set_state(QuestionAnswerStates.manual)
         await state.update_data(
-            question_token=token, question_id=question.id, category=category, page=page
-        )
-        await send_ephemeral_message(
-            callback.message.bot,
-            callback.message.chat.id,
-            "Пришлите текст ответа для покупателя.",
-            user_id=user_id,
+            question_token=token,
+            question_id=question.id,
+            category=category,
+            page=page,
+            prompt_message_id=prompt.message_id,
         )
         return
 
@@ -1318,15 +1397,21 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
                 user_id=user_id,
             )
             return
+        prompt = await send_section_message(
+            SECTION_QUESTION_PROMPT,
+            text="Опишите, что изменить или добавить к ответу.",
+            bot=callback.message.bot,
+            chat_id=callback.message.chat.id,
+            user_id=user_id,
+            persistent=True,
+        )
         await state.set_state(QuestionAnswerStates.reprompt)
         await state.update_data(
-            question_token=token, question_id=question.id, category=category, page=page
-        )
-        await send_ephemeral_message(
-            callback.message.bot,
-            callback.message.chat.id,
-            "Опишите, что изменить или добавить к ответу.",
-            user_id=user_id,
+            question_token=token,
+            question_id=question.id,
+            category=category,
+            page=page,
+            prompt_message_id=prompt.message_id,
         )
         return
 
@@ -1413,11 +1498,20 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
 @router.message(ReviewAnswerStates.reprompt)
 async def handle_reprompt(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    await state.clear()
     review_id = data.get("review_id")
     category = data.get("category") or "all"
     page = int(data.get("page") or 0)
     user_id = message.from_user.id
+
+    text_payload = (message.text or message.caption or "").strip()
+    if not text_payload:
+        await send_ephemeral_message(
+            message.bot,
+            message.chat.id,
+            "Ответ пустой, пришлите текст.",
+            user_id=user_id,
+        )
+        return
 
     review, resolved_index = await get_review_by_id(user_id, category, review_id)
     if not review:
@@ -1427,6 +1521,8 @@ async def handle_reprompt(message: Message, state: FSMContext) -> None:
             "Не удалось найти отзыв для пересборки.",
             user_id=user_id,
         )
+        await delete_section_message(user_id, SECTION_REVIEW_PROMPT, message.bot, force=True)
+        await state.clear()
         return
 
     await _handle_ai_reply(
@@ -1435,14 +1531,15 @@ async def handle_reprompt(message: Message, state: FSMContext) -> None:
         page=page,
         review=review,
         index=resolved_index or 0,
-        user_prompt=(message.text or message.caption or ""),
+        user_prompt=text_payload,
     )
+    await delete_section_message(user_id, SECTION_REVIEW_PROMPT, message.bot, force=True)
+    await state.clear()
 
 
 @router.message(ReviewAnswerStates.manual)
 async def handle_manual_answer(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    await state.clear()
     review_id = data.get("review_id")
     category = data.get("category") or "all"
     page = int(data.get("page") or 0)
@@ -1458,6 +1555,8 @@ async def handle_manual_answer(message: Message, state: FSMContext) -> None:
         )
         return
 
+    await delete_section_message(user_id, SECTION_REVIEW_PROMPT, message.bot, force=True)
+    await state.clear()
     await _remember_local_answer(user_id, review_id, text)
     await _send_review_card(
         user_id=user_id,
@@ -1473,12 +1572,21 @@ async def handle_manual_answer(message: Message, state: FSMContext) -> None:
 @router.message(QuestionAnswerStates.reprompt)
 async def handle_question_reprompt(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    await state.clear()
     question_token = data.get("question_token")
     question_id = data.get("question_id")
     category = data.get("category") or "all"
     page = int(data.get("page") or 0)
     user_id = message.from_user.id
+
+    text_payload = (message.text or message.caption or "").strip()
+    if not text_payload:
+        await send_ephemeral_message(
+            message.bot,
+            message.chat.id,
+            "Ответ пустой, пришлите текст.",
+            user_id=user_id,
+        )
+        return
 
     question = resolve_question_token(user_id, question_token) if question_token else None
     if question is None and question_id:
@@ -1492,10 +1600,12 @@ async def handle_question_reprompt(message: Message, state: FSMContext) -> None:
             "Не удалось найти вопрос для пересборки.",
             user_id=user_id,
         )
+        await delete_section_message(user_id, SECTION_QUESTION_PROMPT, message.bot, force=True)
+        await state.clear()
         return
 
     previous = get_last_question_answer(user_id, question.id) or question.answer_text
-    prompt = (message.text or message.caption or "").strip()
+    prompt = text_payload
     ai_answer = await generate_answer_for_question(
         question_text=question.question_text,
         product_name=question.product_name,
@@ -1523,12 +1633,13 @@ async def handle_question_reprompt(message: Message, state: FSMContext) -> None:
         token=question_token,
         question=question,
     )
+    await delete_section_message(user_id, SECTION_QUESTION_PROMPT, message.bot, force=True)
+    await state.clear()
 
 
 @router.message(QuestionAnswerStates.manual)
 async def handle_question_manual(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    await state.clear()
     question_token = data.get("question_token")
     question_id = data.get("question_id")
     category = data.get("category") or "all"
@@ -1557,6 +1668,8 @@ async def handle_question_manual(message: Message, state: FSMContext) -> None:
             "Не удалось найти вопрос.",
             user_id=user_id,
         )
+        await delete_section_message(user_id, SECTION_QUESTION_PROMPT, message.bot, force=True)
+        await state.clear()
         return
 
     _remember_question_answer(user_id, question.id, text, status="manual")
@@ -1580,10 +1693,13 @@ async def handle_question_manual(message: Message, state: FSMContext) -> None:
         token=question_token,
         question=question,
     )
+    await delete_section_message(user_id, SECTION_QUESTION_PROMPT, message.bot, force=True)
+    await state.clear()
 
 
 @router.message()
-async def handle_any(message: Message) -> None:
+async def handle_any(message: Message, state: FSMContext) -> None:
+    await state.clear()
     await _clear_sections(
         message.bot,
         message.from_user.id,
@@ -1595,7 +1711,10 @@ async def handle_any(message: Message) -> None:
             SECTION_REVIEW_CARD,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await send_section_message(
         SECTION_MENU,
