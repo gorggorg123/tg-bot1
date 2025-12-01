@@ -157,51 +157,44 @@ async def generate_answer_for_question(
 
 async def generate_chat_reply(
     *,
-    chat_messages: list[dict[str, str]],
-    product_context: str | None = None,
-    max_tokens: int = 500,
+    customer_messages: list[str],
+    seller_messages: list[str] | None = None,
+    product_name: str | None = None,
+    extra_context: str | None = None,
+    max_tokens: int = 600,
 ) -> str:
-    """Generate a reply for Ozon Chat using recent history and product context."""
+    """Generate friendly draft reply for Ozon chat conversations."""
 
     style_digest = _load_itom_qna_digest()
-    system_parts: list[str] = [
-        "Ты — ассистент магазина мебели ITOM на Ozon. Отвечай дружелюбно, по делу",
-        "и на русском языке. Не раскрывай внутренних процессов. Тон — деловой,",
-        "но тёплый. Не превышай 3000 символов.",
-    ]
+    system_prompt = (
+        "Ты – продавец мебели бренда ИТОМ на маркетплейсе Ozon. Ты отвечаешь "
+        "покупателю от лица живого человека. Отвечай по-русски, коротко, "
+        "дружелюбно и по делу. Учитывай контекст диалога и характеристики "
+        "товара. Не пиши, что ты нейросеть или бот. Если чего-то не знаешь, "
+        "предложи уточнить детали в кабинете Ozon."
+    )
     if style_digest:
-        system_parts.append(f"Стиль бренда ИТОМ:\n{style_digest}")
-    if product_context:
-        system_parts.append(f"Контекст товара:\n{product_context}")
+        system_prompt = f"{system_prompt}\n\nСправочник по ответам бренда ИТОМ:\n{style_digest}"
 
-    system_prompt = "\n\n".join(system_parts)
+    parts: list[str] = []
+    if product_name:
+        parts.append(f"Товар: {product_name}")
+    if extra_context:
+        parts.append(extra_context.strip())
 
-    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
-    for msg in chat_messages:
-        role = msg.get("role") or "user"
-        content = msg.get("content") or ""
-        messages.append({"role": role, "content": content})
+    recent_customer = [m.strip() for m in customer_messages if m.strip()][:5]
+    recent_seller = [m.strip() for m in seller_messages or [] if m.strip()][:3]
 
-    client = _get_client()
-    try:
-        resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=0.6,
+    if recent_customer:
+        parts.append(
+            "Последние сообщения клиента:" "\n" + "\n".join(recent_customer[-5:])
         )
-    except (PermissionDeniedError, NotFoundError) as exc:
-        logger.warning("OpenAI model error during chat reply: %s", exc)
-        return "Не удалось сгенерировать ответ, попробуйте написать вручную."
-    except APIStatusError as exc:
-        logger.warning("OpenAI API status error during chat reply: %s", exc)
-        return "Сервис ИИ временно недоступен, ответьте вручную."
-    except Exception as exc:  # pragma: no cover
-        logger.exception("OpenAI unexpected error during chat reply: %s", exc)
-        return "Сервис ИИ временно недоступен, ответьте вручную."
+    if recent_seller:
+        parts.append("Последние ответы продавца:\n" + "\n".join(recent_seller[-3:]))
 
-    content = resp.choices[0].message.content if resp.choices else None
-    return (content or "Спасибо за ваш вопрос!").strip()
+    user_message = "\n\n".join(parts) or "Клиент ожидает ответ."
+    draft = await _call_openai(system_prompt, user_message, max_tokens=max_tokens)
+    return draft or "Спасибо за ваш вопрос!"
 
 
 __all__ = [

@@ -1359,6 +1359,7 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
                 or extras.get("answer")
                 or extras.get("message")
             )
+            answer_id = getattr(item, "answer_id", None) or extras.get("answer_id")
             sku_val = item.sku or item.product_id
             status = item.status or extras.get("status")
             product_url = item.product_url or extras.get("product_url")

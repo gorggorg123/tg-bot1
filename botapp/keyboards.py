@@ -110,10 +110,10 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="💬 Чаты Ozon",
-                    callback_data=ChatsCallbackData(
-                        action="list",
-                        page=0,
+                    text="💬 Чаты с покупателями",
+                    callback_data=MenuCallbackData(
+                        section="chats",
+                        action="open",
                     ).pack(),
                 )
             ],

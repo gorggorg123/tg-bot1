@@ -19,8 +19,8 @@ SECTION_QUESTIONS_LIST = "questions_list"
 SECTION_QUESTION_CARD = "question_card"
 SECTION_QUESTION_PROMPT = "question_prompt"
 SECTION_REVIEW_PROMPT = "review_prompt"
-SECTION_CHAT_LIST = "chat_list"
-SECTION_CHAT_CARD = "chat_card"
+SECTION_CHATS_LIST = "chats_list"
+SECTION_CHAT_HISTORY = "chat_history"
 SECTION_CHAT_PROMPT = "chat_prompt"
 SECTION_FBO = "fbo"
 SECTION_FINANCE_TODAY = "finance_today"
@@ -231,9 +231,6 @@ __all__ = [
     "SECTION_ACCOUNT",
     "SECTION_QUESTION_PROMPT",
     "SECTION_REVIEW_PROMPT",
-    "SECTION_CHAT_LIST",
-    "SECTION_CHAT_CARD",
-    "SECTION_CHAT_PROMPT",
     "delete_message_safe",
     "delete_section_message",
     "send_section_message",
