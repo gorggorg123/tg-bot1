@@ -32,6 +32,28 @@ _analytics_forbidden: bool = False
 _analytics_forbidden_logged: bool = False
 
 
+class ChatListItem(BaseModel):
+    chat_id: str
+    last_message_text: str | None = None
+    last_message_at: datetime | None = None
+    order_id: str | None = None
+    participant_name: str | None = None
+    status: str | None = None
+    product_id: str | None = None
+    sku: str | None = None
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+
+class ChatHistoryMessage(BaseModel):
+    chat_id: str | None = None
+    created_at: datetime | None = None
+    author_type: str | None = None
+    text: str | None = None
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+
 class QuestionItem(BaseModel):
     question_id: str | None = Field(default=None)
     product_id: str | None = None
@@ -692,6 +714,107 @@ class OzonClient:
             logger.warning("Empty response for /v1/question/answer/delete %s", answer_id)
         return payload
 
+    async def chat_list(self, *, limit: int = 20, offset: int = 0) -> list[ChatListItem]:
+        """Получить список чатов через /v3/chat/list (или SellerAPI.chat_list)."""
+
+        payload = {"limit": limit, "offset": offset}
+        api = self._get_seller_api()
+        if api and hasattr(api, "chat_list"):
+            try:
+                res = await api.chat_list(limit=limit, offset=offset)
+                if hasattr(res, "model_dump"):
+                    res = res.model_dump()
+                raw_items = res.get("result") if isinstance(res, dict) else res
+                if isinstance(raw_items, dict):
+                    raw_items = raw_items.get("chats") or raw_items.get("items")
+                return [ChatListItem.model_validate(item) for item in raw_items or []]
+            except Exception as exc:
+                logger.warning("SellerAPI chat_list failed, falling back: %s", exc)
+
+        data = await self.post("/v3/chat/list", payload)
+        items_raw = []
+        if isinstance(data, dict):
+            if isinstance(data.get("result"), dict):
+                items_raw = data["result"].get("chats") or data["result"].get("items") or []
+            elif isinstance(data.get("result"), list):
+                items_raw = data["result"]
+            elif isinstance(data.get("chats"), list):
+                items_raw = data["chats"]
+        parsed: list[ChatListItem] = []
+        for raw in items_raw if isinstance(items_raw, list) else []:
+            try:
+                parsed.append(ChatListItem.model_validate(raw))
+            except ValidationError as exc:
+                logger.warning("Skip chat item: %s", exc)
+        return parsed
+
+    async def chat_history(self, *, chat_id: str, limit: int = 30, offset: int = 0) -> list[ChatHistoryMessage]:
+        """Получить историю сообщений чата."""
+
+        payload = {"chat_id": chat_id, "limit": limit, "offset": offset}
+        api = self._get_seller_api()
+        if api and hasattr(api, "chat_history"):
+            try:
+                res = await api.chat_history(chat_id=chat_id, limit=limit, offset=offset)
+                if hasattr(res, "model_dump"):
+                    res = res.model_dump()
+                raw_items = res.get("result") if isinstance(res, dict) else res
+                if isinstance(raw_items, dict):
+                    raw_items = raw_items.get("messages") or raw_items.get("items")
+                return [ChatHistoryMessage.model_validate(item) for item in raw_items or []]
+            except Exception as exc:
+                logger.warning("SellerAPI chat_history failed, falling back: %s", exc)
+
+        data = await self.post("/v3/chat/history", payload)
+        items_raw = []
+        if isinstance(data, dict):
+            if isinstance(data.get("result"), dict):
+                items_raw = data["result"].get("messages") or data["result"].get("items") or []
+            elif isinstance(data.get("result"), list):
+                items_raw = data["result"]
+            elif isinstance(data.get("messages"), list):
+                items_raw = data["messages"]
+        parsed: list[ChatHistoryMessage] = []
+        for raw in items_raw if isinstance(items_raw, list) else []:
+            try:
+                parsed.append(ChatHistoryMessage.model_validate(raw))
+            except ValidationError as exc:
+                logger.warning("Skip chat history item: %s", exc)
+        return parsed
+
+    async def chat_send_message(self, *, chat_id: str, text: str) -> dict[str, Any]:
+        payload = {"chat_id": chat_id, "text": text}
+        api = self._get_seller_api()
+        if api and hasattr(api, "chat_send_message"):
+            try:
+                res = await api.chat_send_message(chat_id=chat_id, text=text)
+                return res.model_dump() if hasattr(res, "model_dump") else res
+            except Exception as exc:
+                logger.warning("SellerAPI chat_send_message failed, falling back: %s", exc)
+        return await self.post("/v1/chat/send/message", payload)
+
+    async def chat_start(self, *, chat_id: str) -> dict[str, Any]:
+        payload = {"chat_id": chat_id}
+        api = self._get_seller_api()
+        if api and hasattr(api, "chat_start"):
+            try:
+                res = await api.chat_start(chat_id=chat_id)
+                return res.model_dump() if hasattr(res, "model_dump") else res
+            except Exception as exc:
+                logger.warning("SellerAPI chat_start failed, falling back: %s", exc)
+        return await self.post("/v1/chat/start", payload)
+
+    async def chat_read(self, *, chat_id: str) -> dict[str, Any]:
+        payload = {"chat_id": chat_id}
+        api = self._get_seller_api()
+        if api and hasattr(api, "chat_read"):
+            try:
+                res = await api.chat_read(chat_id=chat_id)
+                return res.model_dump() if hasattr(res, "model_dump") else res
+            except Exception as exc:
+                logger.warning("SellerAPI chat_read failed, falling back: %s", exc)
+        return await self.post("/v2/chat/read", payload)
+
     async def create_review_comment(
         self,
         review_id: str,
@@ -1035,6 +1158,7 @@ class Question:
     status: str | None
     has_answer: bool = False
     answer_id: str | None = None
+    answers_count: int | None = None
 
 
 def _name_from_product_url(url: str) -> str | None:
@@ -1069,7 +1193,7 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
     try:
         answers_count = 0
         if isinstance(item, QuestionListItem):
-            question_id_raw = item.id
+            question_id_raw = item.id or item.question_id
             created = item.published_at or item.created_at
             extras = getattr(item, "model_extra", {}) or {}
             product_name = (
@@ -1097,12 +1221,15 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
                 or extras.get("answer")
                 or extras.get("message")
             )
-            answer_id = item.answer_id or extras.get("answer_id")
+            answer_id = getattr(item, "answer_id", None) or extras.get("answer_id")
             sku_val = item.sku or item.product_id
             status = item.status or extras.get("status")
             product_url = item.product_url or extras.get("product_url")
-            answers_count = getattr(item, "answers_count", None) or extras.get("answers_count") or 0
-            answer_id = None
+            answers_count = (
+                getattr(item, "answers_count", None)
+                or extras.get("answers_count")
+                or 0
+            )
         else:
             question_id_raw = item.get("question_id") or item.get("id")
             created = (
@@ -1172,6 +1299,7 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
             status=str(status or "").strip() or None,
             has_answer=has_answer,
             answer_id=str(answer_id) if answer_id not in (None, "") else None,
+            answers_count=answers_count_int,
         )
     except Exception as exc:  # pragma: no cover - защита от неожиданных данных
         logger.warning("Failed to parse question item %s: %s", item, exc)
@@ -1262,6 +1390,7 @@ async def get_questions_list(
             item.answer_text = first.text or item.answer_text
             item.answer_id = first.id or item.answer_id
             item.has_answer = bool(item.answer_text)
+            item.answers_count = item.answers_count or len(answers)
     return result
 
 
@@ -1303,6 +1432,14 @@ async def list_question_answers(
     return answers
 
 
+async def get_question_answers(
+    question_id: str, *, limit: int = 20
+) -> list[QuestionAnswer]:
+    """Совместимый алиас для получения ответов на вопрос."""
+
+    return await list_question_answers(question_id, limit=limit)
+
+
 async def delete_question_answer(
     question_id: str, *, answer_id: str | None = None
 ) -> None:
@@ -1330,6 +1467,38 @@ async def get_question_by_id(question_id: str) -> Question | None:
         if q.id == question_id:
             return q
     return None
+
+
+# ---------- Chats (v3) ----------
+
+
+async def get_chat_list(*, limit: int = 20, offset: int = 0) -> list[ChatListItem]:
+    client = get_client()
+    return await client.chat_list(limit=limit, offset=offset)
+
+
+async def get_chat_history(*, chat_id: str, limit: int = 30, offset: int = 0) -> list[ChatHistoryMessage]:
+    client = get_client()
+    return await client.chat_history(chat_id=chat_id, limit=limit, offset=offset)
+
+
+async def send_chat_message(*, chat_id: str, text: str) -> dict[str, Any]:
+    client = get_write_client()
+    if not client:
+        raise OzonAPIError("Нет прав на отправку сообщений в чат")
+    return await client.chat_send_message(chat_id=chat_id, text=text)
+
+
+async def start_chat(*, chat_id: str) -> dict[str, Any]:
+    client = get_write_client()
+    if not client:
+        raise OzonAPIError("Нет прав на запуск чата")
+    return await client.chat_start(chat_id=chat_id)
+
+
+async def mark_chat_read(*, chat_id: str) -> dict[str, Any]:
+    client = get_write_client() or get_client()
+    return await client.chat_read(chat_id=chat_id)
 
 
 
