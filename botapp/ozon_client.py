@@ -1150,6 +1150,34 @@ def get_write_client() -> OzonClient | None:
     return get_client()
 
 
+# ---------- Chats helpers ----------
+
+
+async def get_chat_list(*, limit: int = 20, offset: int = 0) -> list[ChatListItem]:
+    client = get_client()
+    return await client.chat_list(limit=limit, offset=offset)
+
+
+async def get_chat_history(*, chat_id: str, limit: int = 30, offset: int = 0) -> list[ChatHistoryMessage]:
+    client = get_client()
+    return await client.chat_history(chat_id=chat_id, limit=limit, offset=offset)
+
+
+async def send_chat_message(*, chat_id: str, text: str) -> dict[str, Any]:
+    client = get_client()
+    return await client.chat_send_message(chat_id=chat_id, text=text)
+
+
+async def start_chat(*, chat_id: str) -> dict[str, Any]:
+    client = get_client()
+    return await client.chat_start(chat_id=chat_id)
+
+
+async def mark_chat_read(*, chat_id: str) -> dict[str, Any]:
+    client = get_client()
+    return await client.chat_read(chat_id=chat_id)
+
+
 # ---------- Questions helpers ----------
 
 
@@ -1331,7 +1359,6 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
                 or extras.get("answer")
                 or extras.get("message")
             )
-            answer_id = getattr(item, "answer_id", None) or extras.get("answer_id")
             sku_val = item.sku or item.product_id
             status = item.status or extras.get("status")
             product_url = item.product_url or extras.get("product_url")
