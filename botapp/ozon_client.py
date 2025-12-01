@@ -129,6 +129,20 @@ def _ensure_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc)
 
 
+def _clean_sku(value: Any) -> int | None:
+    """Вернуть положительный SKU или None, чтобы не отправлять 0 в Ozon."""
+
+    try:
+        sku_int = int(value)
+    except Exception:
+        return None
+
+    if sku_int <= 0:
+        return None
+
+    return sku_int
+
+
 def msk_today_range() -> Tuple[str, str, str]:
     """
     Диапазон на сегодня в МСК, но границы в UTC.
@@ -633,8 +647,10 @@ class OzonClient:
         )
 
         body = {"question_id": question_id, "text": text_clean}
-        if sku and sku > 0:
-            body["sku"] = sku
+
+        sku_clean = _clean_sku(sku)
+        if sku_clean is not None:
+            body["sku"] = sku_clean
         data = await self.post("/v1/question/answer/create", body)
         if not isinstance(data, dict):
             logger.warning("Unexpected /v1/question/answer/create response: %r", data)
@@ -642,11 +658,15 @@ class OzonClient:
         return data.get("result") if isinstance(data.get("result"), dict) else data
 
     async def question_answer_list(
-        self, question_id: str, *, limit: int = 20
+        self, question_id: str, *, limit: int = 20, sku: int | None = None
     ) -> list[QuestionAnswer]:
         """Получить ответы продавца на конкретный вопрос."""
 
         body = {"question_id": question_id, "limit": max(1, min(limit, 50))}
+
+        sku_clean = _clean_sku(sku)
+        if sku_clean is not None:
+            body["sku"] = sku_clean
         status_code, payload = await self._post_with_status(
             "/v1/question/answer/list", body
         )
@@ -1256,8 +1276,16 @@ async def get_questions_list(
     # Если Ozon не вернул текст ответа в списке, пробуем подтянуть через answer/list
     if missing_answers:
         for item in missing_answers:
+            sku_clean = _clean_sku(getattr(item, "sku", None))
+            if sku_clean is None:
+                logger.warning(
+                    "Skip fetching answers for %s: missing/invalid SKU", item.id
+                )
+                continue
             try:
-                answers = await client.question_answer_list(item.id, limit=1)
+                answers = await client.question_answer_list(
+                    item.id, limit=1, sku=sku_clean
+                )
             except Exception as exc:  # pragma: no cover - сеть/формат
                 logger.warning("Failed to fetch answers for %s: %s", item.id, exc)
                 continue
@@ -1288,8 +1316,9 @@ async def send_question_answer(question_id: str, text: str, *, sku: int | None =
     )
 
     body = {"question_id": question_id, "text": text_clean}
-    if sku and sku > 0:
-        body["sku"] = sku
+    sku_clean = _clean_sku(sku)
+    if sku_clean is not None:
+        body["sku"] = sku_clean
     status_code, data = await client._post_with_status("/v1/question/answer/create", body)
     if status_code >= 400:
         raise OzonAPIError(
@@ -1302,10 +1331,26 @@ async def send_question_answer(question_id: str, text: str, *, sku: int | None =
 
 
 async def list_question_answers(
-    question_id: str, *, limit: int = 20
+    question_id: str, *, limit: int = 20, sku: int | None = None
 ) -> list[QuestionAnswer]:
+    sku_clean = _clean_sku(sku)
+    if sku is not None and sku_clean is None:
+        logger.warning(
+            "Skip question_answer_list for %s: invalid sku=%r", question_id, sku
+        )
+        return []
+
+    if sku_clean is None:
+        logger.warning(
+            "Skip question_answer_list for %s: missing SKU to avoid 400 from Ozon",
+            question_id,
+        )
+        return []
+
     client = get_client()
-    answers = await client.question_answer_list(question_id, limit=limit)
+    answers = await client.question_answer_list(
+        question_id, limit=limit, sku=sku_clean
+    )
     return answers
 
 
@@ -1318,7 +1363,7 @@ async def get_question_answers(
 
 
 async def delete_question_answer(
-    question_id: str, *, answer_id: str | None = None
+    question_id: str, *, answer_id: str | None = None, sku: int | None = None
 ) -> None:
     client = get_write_client()
     if client is None:
@@ -1327,7 +1372,9 @@ async def delete_question_answer(
     target_answer_id = answer_id
     if not target_answer_id:
         try:
-            existing = await client.question_answer_list(question_id, limit=1)
+            existing = await client.question_answer_list(
+                question_id, limit=1, sku=sku
+            )
         except Exception as exc:
             raise OzonAPIError(f"Не удалось получить список ответов: {exc}")
         target_answer_id = existing[0].id if existing else None

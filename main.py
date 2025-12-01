@@ -1128,7 +1128,9 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         answer_text = question.answer_text
         if not (answer_text or "").strip():
             try:
-                answers = await list_question_answers(question.id, limit=1)
+                answers = await list_question_answers(
+                    question.id, limit=1, sku=getattr(question, "sku", None)
+                )
                 if answers:
                     question.answer_text = answers[0].text or question.answer_text
                     question.answer_id = answers[0].id or question.answer_id
@@ -1188,7 +1190,9 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         answer_id = getattr(question, "answer_id", None)
         if not answer_id:
             try:
-                answers = await list_question_answers(question.id, limit=1)
+                answers = await list_question_answers(
+                    question.id, limit=1, sku=getattr(question, "sku", None)
+                )
                 if answers:
                     answer_id = answers[0].id
                     question.answer_id = answer_id

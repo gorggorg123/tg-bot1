@@ -440,6 +440,7 @@ def resolve_question_id(user_id: int, question_id: str) -> Optional[Question]:
 def format_question_card_text(
     question: Question,
     answer_override: Optional[str] = None,
+    answers_count: Optional[int] = None,
 ) -> str:
     """Собираем человекочитаемую карточку вопроса для Telegram."""
 
@@ -450,6 +451,14 @@ def format_question_card_text(
         "Ответ дан" if getattr(question, "has_answer", False) or status_raw == "PROCESSED" else "Без ответа"
     )
     answers_count = getattr(question, "answers_count", None)
+
+    effective_answers_count = answers_count
+    if effective_answers_count is None:
+        raw_count = getattr(question, "answers_count", None)
+        try:
+            effective_answers_count = int(raw_count) if raw_count is not None else None
+        except Exception:
+            effective_answers_count = None
 
     lines: List[str] = [
         "❓ Вопрос покупателя",
