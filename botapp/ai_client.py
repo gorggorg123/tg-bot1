@@ -155,4 +155,58 @@ async def generate_answer_for_question(
     return draft or "Спасибо за вопрос!"
 
 
-__all__ = ["generate_review_reply", "generate_answer_for_question", "AIClientError"]
+async def generate_chat_reply(
+    *,
+    chat_messages: list[dict[str, str]],
+    product_context: str | None = None,
+    max_tokens: int = 500,
+) -> str:
+    """Generate a reply for Ozon Chat using recent history and product context."""
+
+    style_digest = _load_itom_qna_digest()
+    system_parts: list[str] = [
+        "Ты — ассистент магазина мебели ITOM на Ozon. Отвечай дружелюбно, по делу",
+        "и на русском языке. Не раскрывай внутренних процессов. Тон — деловой,",
+        "но тёплый. Не превышай 3000 символов.",
+    ]
+    if style_digest:
+        system_parts.append(f"Стиль бренда ИТОМ:\n{style_digest}")
+    if product_context:
+        system_parts.append(f"Контекст товара:\n{product_context}")
+
+    system_prompt = "\n\n".join(system_parts)
+
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    for msg in chat_messages:
+        role = msg.get("role") or "user"
+        content = msg.get("content") or ""
+        messages.append({"role": role, "content": content})
+
+    client = _get_client()
+    try:
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.6,
+        )
+    except (PermissionDeniedError, NotFoundError) as exc:
+        logger.warning("OpenAI model error during chat reply: %s", exc)
+        return "Не удалось сгенерировать ответ, попробуйте написать вручную."
+    except APIStatusError as exc:
+        logger.warning("OpenAI API status error during chat reply: %s", exc)
+        return "Сервис ИИ временно недоступен, ответьте вручную."
+    except Exception as exc:  # pragma: no cover
+        logger.exception("OpenAI unexpected error during chat reply: %s", exc)
+        return "Сервис ИИ временно недоступен, ответьте вручную."
+
+    content = resp.choices[0].message.content if resp.choices else None
+    return (content or "Спасибо за ваш вопрос!").strip()
+
+
+__all__ = [
+    "generate_review_reply",
+    "generate_answer_for_question",
+    "generate_chat_reply",
+    "AIClientError",
+]

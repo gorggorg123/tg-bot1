@@ -151,6 +151,20 @@ def _ensure_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc)
 
 
+def _clean_sku(value: Any) -> int | None:
+    """Вернуть положительный SKU или None, чтобы не отправлять 0 в Ozon."""
+
+    try:
+        sku_int = int(value)
+    except Exception:
+        return None
+
+    if sku_int <= 0:
+        return None
+
+    return sku_int
+
+
 def msk_today_range() -> Tuple[str, str, str]:
     """
     Диапазон на сегодня в МСК, но границы в UTC.
@@ -655,8 +669,10 @@ class OzonClient:
         )
 
         body = {"question_id": question_id, "text": text_clean}
-        if sku and sku > 0:
-            body["sku"] = sku
+
+        sku_clean = _clean_sku(sku)
+        if sku_clean is not None:
+            body["sku"] = sku_clean
         data = await self.post("/v1/question/answer/create", body)
         if not isinstance(data, dict):
             logger.warning("Unexpected /v1/question/answer/create response: %r", data)
@@ -664,11 +680,15 @@ class OzonClient:
         return data.get("result") if isinstance(data.get("result"), dict) else data
 
     async def question_answer_list(
-        self, question_id: str, *, limit: int = 20
+        self, question_id: str, *, limit: int = 20, sku: int | None = None
     ) -> list[QuestionAnswer]:
         """Получить ответы продавца на конкретный вопрос."""
 
         body = {"question_id": question_id, "limit": max(1, min(limit, 50))}
+
+        sku_clean = _clean_sku(sku)
+        if sku_clean is not None:
+            body["sku"] = sku_clean
         status_code, payload = await self._post_with_status(
             "/v1/question/answer/list", body
         )
@@ -1016,6 +1036,96 @@ def has_write_credentials() -> bool:
     return bool(client_id and api_key)
 
 
+# ---------- Chats ----------
+
+
+async def chat_list(*, limit: int = 10, offset: int = 0) -> list[dict]:
+    client = get_client()
+    body = {"limit": max(1, min(limit, 50)), "offset": max(0, offset)}
+    status_code, data = await client._post_with_status("/v2/chat/list", body)
+    if status_code >= 400 or not isinstance(data, dict):
+        message = None
+        if isinstance(data, dict):
+            message = data.get("message") or data.get("error")
+        raise OzonAPIError(
+            f"Ошибка Ozon API при получении списка чатов: HTTP {status_code} {message or data}"
+        )
+
+    payload = data.get("result") if isinstance(data.get("result"), dict) else data
+    items = payload.get("chats") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        items = payload.get("result") if isinstance(payload, dict) else None
+    return items or []
+
+
+async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:
+    client = get_client()
+    body = {"chat_id": chat_id, "limit": max(1, min(limit, 50))}
+    status_code, data = await client._post_with_status("/v2/chat/history", body)
+    if status_code >= 400 or not isinstance(data, dict):
+        message = None
+        if isinstance(data, dict):
+            message = data.get("message") or data.get("error")
+        raise OzonAPIError(
+            f"Ошибка Ozon API при получении истории чата: HTTP {status_code} {message or data}"
+        )
+
+    payload = data.get("result") if isinstance(data.get("result"), dict) else data
+    messages = payload.get("messages") if isinstance(payload, dict) else None
+    if not isinstance(messages, list):
+        messages = payload.get("result") if isinstance(payload, dict) else None
+    return messages or []
+
+
+async def chat_read(chat_id: str) -> None:
+    client = get_client()
+    body = {"chat_id": chat_id}
+    status_code, data = await client._post_with_status("/v2/chat/read", body)
+    if status_code >= 400:
+        logger.warning("Failed to mark chat %s as read: %s", chat_id, data)
+
+
+async def chat_send_message(chat_id: str, text: str) -> None:
+    client = get_write_client()
+    if client is None:
+        raise OzonAPIError("Нет прав на отправку сообщений в чаты Ozon")
+
+    text_clean = (text or "").strip()
+    if len(text_clean) < 2:
+        raise OzonAPIError("Текст сообщения пустой или слишком короткий")
+
+    body = {"chat_id": chat_id, "text": text_clean}
+    status_code, data = await client._post_with_status("/v1/chat/send/message", body)
+    if status_code >= 400:
+        message = None
+        if isinstance(data, dict):
+            message = data.get("message") or data.get("error")
+        raise OzonAPIError(
+            f"Ошибка Ozon API при отправке сообщения: HTTP {status_code} {message or data}"
+        )
+    if isinstance(data, dict) and data.get("result") is False:
+        raise OzonAPIError("Ozon отклонил отправку сообщения в чат")
+
+
+async def chat_start(posting_number: str) -> dict | None:
+    client = get_write_client()
+    if client is None:
+        raise OzonAPIError("Нет прав на создание чатов в Ozon")
+
+    body = {"posting_number": posting_number}
+    status_code, data = await client._post_with_status("/v1/chat/start", body)
+    if status_code >= 400:
+        message = None
+        if isinstance(data, dict):
+            message = data.get("message") or data.get("error")
+        raise OzonAPIError(
+            f"Ошибка Ozon API при создании чата: HTTP {status_code} {message or data}"
+        )
+    if isinstance(data, dict):
+        return data.get("result") or data
+    return None
+
+
 def get_client() -> OzonClient:
     """
     Ленивая инициализация клиента Ozon для всех операций (чтение, аналитика, ответы).
@@ -1186,6 +1296,7 @@ class Question:
     status: str | None
     has_answer: bool = False
     answer_id: str | None = None
+    answers_count: int | None = None
 
 
 def _name_from_product_url(url: str) -> str | None:
@@ -1220,7 +1331,7 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
     try:
         answers_count = 0
         if isinstance(item, QuestionListItem):
-            question_id_raw = item.id
+            question_id_raw = item.id or item.question_id
             created = item.published_at or item.created_at
             extras = getattr(item, "model_extra", {}) or {}
             product_name = (
@@ -1251,8 +1362,11 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
             sku_val = item.sku or item.product_id
             status = item.status or extras.get("status")
             product_url = item.product_url or extras.get("product_url")
-            answers_count = getattr(item, "answers_count", None) or extras.get("answers_count") or 0
-            answer_id = None
+            answers_count = (
+                getattr(item, "answers_count", None)
+                or extras.get("answers_count")
+                or 0
+            )
         else:
             question_id_raw = item.get("question_id") or item.get("id")
             created = (
@@ -1322,6 +1436,7 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
             status=str(status or "").strip() or None,
             has_answer=has_answer,
             answer_id=str(answer_id) if answer_id not in (None, "") else None,
+            answers_count=answers_count_int,
         )
     except Exception as exc:  # pragma: no cover - защита от неожиданных данных
         logger.warning("Failed to parse question item %s: %s", item, exc)
@@ -1401,8 +1516,16 @@ async def get_questions_list(
     # Если Ozon не вернул текст ответа в списке, пробуем подтянуть через answer/list
     if missing_answers:
         for item in missing_answers:
+            sku_clean = _clean_sku(getattr(item, "sku", None))
+            if sku_clean is None:
+                logger.warning(
+                    "Skip fetching answers for %s: missing/invalid SKU", item.id
+                )
+                continue
             try:
-                answers = await client.question_answer_list(item.id, limit=1)
+                answers = await client.question_answer_list(
+                    item.id, limit=1, sku=sku_clean
+                )
             except Exception as exc:  # pragma: no cover - сеть/формат
                 logger.warning("Failed to fetch answers for %s: %s", item.id, exc)
                 continue
@@ -1412,6 +1535,7 @@ async def get_questions_list(
             item.answer_text = first.text or item.answer_text
             item.answer_id = first.id or item.answer_id
             item.has_answer = bool(item.answer_text)
+            item.answers_count = item.answers_count or len(answers)
     return result
 
 
@@ -1432,8 +1556,9 @@ async def send_question_answer(question_id: str, text: str, *, sku: int | None =
     )
 
     body = {"question_id": question_id, "text": text_clean}
-    if sku and sku > 0:
-        body["sku"] = sku
+    sku_clean = _clean_sku(sku)
+    if sku_clean is not None:
+        body["sku"] = sku_clean
     status_code, data = await client._post_with_status("/v1/question/answer/create", body)
     if status_code >= 400:
         raise OzonAPIError(
@@ -1446,15 +1571,39 @@ async def send_question_answer(question_id: str, text: str, *, sku: int | None =
 
 
 async def list_question_answers(
-    question_id: str, *, limit: int = 20
+    question_id: str, *, limit: int = 20, sku: int | None = None
 ) -> list[QuestionAnswer]:
+    sku_clean = _clean_sku(sku)
+    if sku is not None and sku_clean is None:
+        logger.warning(
+            "Skip question_answer_list for %s: invalid sku=%r", question_id, sku
+        )
+        return []
+
+    if sku_clean is None:
+        logger.warning(
+            "Skip question_answer_list for %s: missing SKU to avoid 400 from Ozon",
+            question_id,
+        )
+        return []
+
     client = get_client()
-    answers = await client.question_answer_list(question_id, limit=limit)
+    answers = await client.question_answer_list(
+        question_id, limit=limit, sku=sku_clean
+    )
     return answers
 
 
+async def get_question_answers(
+    question_id: str, *, limit: int = 20
+) -> list[QuestionAnswer]:
+    """Совместимый алиас для получения ответов на вопрос."""
+
+    return await list_question_answers(question_id, limit=limit)
+
+
 async def delete_question_answer(
-    question_id: str, *, answer_id: str | None = None
+    question_id: str, *, answer_id: str | None = None, sku: int | None = None
 ) -> None:
     client = get_write_client()
     if client is None:
@@ -1463,7 +1612,9 @@ async def delete_question_answer(
     target_answer_id = answer_id
     if not target_answer_id:
         try:
-            existing = await client.question_answer_list(question_id, limit=1)
+            existing = await client.question_answer_list(
+                question_id, limit=1, sku=sku
+            )
         except Exception as exc:
             raise OzonAPIError(f"Не удалось получить список ответов: {exc}")
         target_answer_id = existing[0].id if existing else None
@@ -1480,6 +1631,38 @@ async def get_question_by_id(question_id: str) -> Question | None:
         if q.id == question_id:
             return q
     return None
+
+
+# ---------- Chats (v3) ----------
+
+
+async def get_chat_list(*, limit: int = 20, offset: int = 0) -> list[ChatListItem]:
+    client = get_client()
+    return await client.chat_list(limit=limit, offset=offset)
+
+
+async def get_chat_history(*, chat_id: str, limit: int = 30, offset: int = 0) -> list[ChatHistoryMessage]:
+    client = get_client()
+    return await client.chat_history(chat_id=chat_id, limit=limit, offset=offset)
+
+
+async def send_chat_message(*, chat_id: str, text: str) -> dict[str, Any]:
+    client = get_write_client()
+    if not client:
+        raise OzonAPIError("Нет прав на отправку сообщений в чат")
+    return await client.chat_send_message(chat_id=chat_id, text=text)
+
+
+async def start_chat(*, chat_id: str) -> dict[str, Any]:
+    client = get_write_client()
+    if not client:
+        raise OzonAPIError("Нет прав на запуск чата")
+    return await client.chat_start(chat_id=chat_id)
+
+
+async def mark_chat_read(*, chat_id: str) -> dict[str, Any]:
+    client = get_write_client() or get_client()
+    return await client.chat_read(chat_id=chat_id)
 
 
 
