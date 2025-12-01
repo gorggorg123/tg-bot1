@@ -913,6 +913,96 @@ def has_write_credentials() -> bool:
     return bool(client_id and api_key)
 
 
+# ---------- Chats ----------
+
+
+async def chat_list(*, limit: int = 10, offset: int = 0) -> list[dict]:
+    client = get_client()
+    body = {"limit": max(1, min(limit, 50)), "offset": max(0, offset)}
+    status_code, data = await client._post_with_status("/v2/chat/list", body)
+    if status_code >= 400 or not isinstance(data, dict):
+        message = None
+        if isinstance(data, dict):
+            message = data.get("message") or data.get("error")
+        raise OzonAPIError(
+            f"Ошибка Ozon API при получении списка чатов: HTTP {status_code} {message or data}"
+        )
+
+    payload = data.get("result") if isinstance(data.get("result"), dict) else data
+    items = payload.get("chats") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        items = payload.get("result") if isinstance(payload, dict) else None
+    return items or []
+
+
+async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:
+    client = get_client()
+    body = {"chat_id": chat_id, "limit": max(1, min(limit, 50))}
+    status_code, data = await client._post_with_status("/v2/chat/history", body)
+    if status_code >= 400 or not isinstance(data, dict):
+        message = None
+        if isinstance(data, dict):
+            message = data.get("message") or data.get("error")
+        raise OzonAPIError(
+            f"Ошибка Ozon API при получении истории чата: HTTP {status_code} {message or data}"
+        )
+
+    payload = data.get("result") if isinstance(data.get("result"), dict) else data
+    messages = payload.get("messages") if isinstance(payload, dict) else None
+    if not isinstance(messages, list):
+        messages = payload.get("result") if isinstance(payload, dict) else None
+    return messages or []
+
+
+async def chat_read(chat_id: str) -> None:
+    client = get_client()
+    body = {"chat_id": chat_id}
+    status_code, data = await client._post_with_status("/v2/chat/read", body)
+    if status_code >= 400:
+        logger.warning("Failed to mark chat %s as read: %s", chat_id, data)
+
+
+async def chat_send_message(chat_id: str, text: str) -> None:
+    client = get_write_client()
+    if client is None:
+        raise OzonAPIError("Нет прав на отправку сообщений в чаты Ozon")
+
+    text_clean = (text or "").strip()
+    if len(text_clean) < 2:
+        raise OzonAPIError("Текст сообщения пустой или слишком короткий")
+
+    body = {"chat_id": chat_id, "text": text_clean}
+    status_code, data = await client._post_with_status("/v1/chat/send/message", body)
+    if status_code >= 400:
+        message = None
+        if isinstance(data, dict):
+            message = data.get("message") or data.get("error")
+        raise OzonAPIError(
+            f"Ошибка Ozon API при отправке сообщения: HTTP {status_code} {message or data}"
+        )
+    if isinstance(data, dict) and data.get("result") is False:
+        raise OzonAPIError("Ozon отклонил отправку сообщения в чат")
+
+
+async def chat_start(posting_number: str) -> dict | None:
+    client = get_write_client()
+    if client is None:
+        raise OzonAPIError("Нет прав на создание чатов в Ozon")
+
+    body = {"posting_number": posting_number}
+    status_code, data = await client._post_with_status("/v1/chat/start", body)
+    if status_code >= 400:
+        message = None
+        if isinstance(data, dict):
+            message = data.get("message") or data.get("error")
+        raise OzonAPIError(
+            f"Ошибка Ozon API при создании чата: HTTP {status_code} {message or data}"
+        )
+    if isinstance(data, dict):
+        return data.get("result") or data
+    return None
+
+
 def get_client() -> OzonClient:
     """
     Ленивая инициализация клиента Ozon для всех операций (чтение, аналитика, ответы).
