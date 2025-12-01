@@ -155,4 +155,51 @@ async def generate_answer_for_question(
     return draft or "Спасибо за вопрос!"
 
 
-__all__ = ["generate_review_reply", "generate_answer_for_question", "AIClientError"]
+async def generate_chat_reply(
+    *,
+    customer_messages: list[str],
+    seller_messages: list[str] | None = None,
+    product_name: str | None = None,
+    extra_context: str | None = None,
+    max_tokens: int = 600,
+) -> str:
+    """Generate friendly draft reply for Ozon chat conversations."""
+
+    style_digest = _load_itom_qna_digest()
+    system_prompt = (
+        "Ты – продавец мебели бренда ИТОМ на маркетплейсе Ozon. Ты отвечаешь "
+        "покупателю от лица живого человека. Отвечай по-русски, коротко, "
+        "дружелюбно и по делу. Учитывай контекст диалога и характеристики "
+        "товара. Не пиши, что ты нейросеть или бот. Если чего-то не знаешь, "
+        "предложи уточнить детали в кабинете Ozon."
+    )
+    if style_digest:
+        system_prompt = f"{system_prompt}\n\nСправочник по ответам бренда ИТОМ:\n{style_digest}"
+
+    parts: list[str] = []
+    if product_name:
+        parts.append(f"Товар: {product_name}")
+    if extra_context:
+        parts.append(extra_context.strip())
+
+    recent_customer = [m.strip() for m in customer_messages if m.strip()][:5]
+    recent_seller = [m.strip() for m in seller_messages or [] if m.strip()][:3]
+
+    if recent_customer:
+        parts.append(
+            "Последние сообщения клиента:" "\n" + "\n".join(recent_customer[-5:])
+        )
+    if recent_seller:
+        parts.append("Последние ответы продавца:\n" + "\n".join(recent_seller[-3:]))
+
+    user_message = "\n\n".join(parts) or "Клиент ожидает ответ."
+    draft = await _call_openai(system_prompt, user_message, max_tokens=max_tokens)
+    return draft or "Спасибо за ваш вопрос!"
+
+
+__all__ = [
+    "generate_review_reply",
+    "generate_answer_for_question",
+    "generate_chat_reply",
+    "AIClientError",
+]

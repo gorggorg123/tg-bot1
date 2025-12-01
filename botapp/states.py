@@ -6,4 +6,9 @@ class QuestionAnswerStates(StatesGroup):
     reprompt = State()
 
 
-__all__ = ["QuestionAnswerStates"]
+class ChatStates(StatesGroup):
+    waiting_manual = State()
+    waiting_ai_confirm = State()
+
+
+__all__ = ["QuestionAnswerStates", "ChatStates"]
