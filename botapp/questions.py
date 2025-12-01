@@ -450,6 +450,7 @@ def format_question_card_text(
     status_text = (
         "Ответ дан" if getattr(question, "has_answer", False) or status_raw == "PROCESSED" else "Без ответа"
     )
+    answers_count = getattr(question, "answers_count", None)
 
     effective_answers_count = answers_count
     if effective_answers_count is None:
@@ -464,7 +465,8 @@ def format_question_card_text(
         f"Товар: {product_name}",
         f"Дата: {_fmt_dt_msk(created)} (МСК)",
         f"Статус: {status_text}",
-        f"Ответов: {effective_answers_count if effective_answers_count is not None else '—'}",
+        f"Статус Ozon: {status_raw or '—'}",
+        f"Ответов: {answers_count if answers_count is not None else '—'}",
         "",
         "Вопрос:",
         getattr(question, "question_text", None) or

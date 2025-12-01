@@ -1090,7 +1090,7 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
     try:
         answers_count = 0
         if isinstance(item, QuestionListItem):
-            question_id_raw = item.id
+            question_id_raw = item.id or item.question_id
             created = item.published_at or item.created_at
             extras = getattr(item, "model_extra", {}) or {}
             product_name = (
@@ -1122,8 +1122,11 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
             sku_val = item.sku or item.product_id
             status = item.status or extras.get("status")
             product_url = item.product_url or extras.get("product_url")
-            answers_count = getattr(item, "answers_count", None) or extras.get("answers_count") or 0
-            answer_id = None
+            answers_count = (
+                getattr(item, "answers_count", None)
+                or extras.get("answers_count")
+                or 0
+            )
         else:
             question_id_raw = item.get("question_id") or item.get("id")
             created = (
@@ -1193,7 +1196,7 @@ def _parse_question_item(item: Dict[str, Any]) -> Question | None:
             status=str(status or "").strip() or None,
             has_answer=has_answer,
             answer_id=str(answer_id) if answer_id not in (None, "") else None,
-            answers_count=answers_count_int if answers_count_int >= 0 else None,
+            answers_count=answers_count_int,
         )
     except Exception as exc:  # pragma: no cover - защита от неожиданных данных
         logger.warning("Failed to parse question item %s: %s", item, exc)
@@ -1292,6 +1295,7 @@ async def get_questions_list(
             item.answer_text = first.text or item.answer_text
             item.answer_id = first.id or item.answer_id
             item.has_answer = bool(item.answer_text)
+            item.answers_count = item.answers_count or len(answers)
     return result
 
 
@@ -1350,11 +1354,12 @@ async def list_question_answers(
     return answers
 
 
-# Совместимость со старым импортом
 async def get_question_answers(
-    question_id: str, *, limit: int = 20, sku: int | None = None
+    question_id: str, *, limit: int = 20
 ) -> list[QuestionAnswer]:
-    return await list_question_answers(question_id, limit=limit, sku=sku)
+    """Совместимый алиас для получения ответов на вопрос."""
+
+    return await list_question_answers(question_id, limit=limit)
 
 
 async def delete_question_answer(
