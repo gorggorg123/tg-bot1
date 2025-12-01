@@ -452,14 +452,6 @@ def format_question_card_text(
     )
     answers_count = getattr(question, "answers_count", None)
 
-    effective_answers_count = answers_count
-    if effective_answers_count is None:
-        raw_count = getattr(question, "answers_count", None)
-        try:
-            effective_answers_count = int(raw_count) if raw_count is not None else None
-        except Exception:
-            effective_answers_count = None
-
     lines: List[str] = [
         "❓ Вопрос покупателя",
         f"Товар: {product_name}",

@@ -245,9 +245,11 @@ async def send_ephemeral_message(
         category=category, page=page, question_id=question.id, can_send=True
     )
 
-async def _clear_sections(bot: Bot, user_id: int, sections: list[str]) -> None:
+async def _clear_sections(
+    bot: Bot, user_id: int, sections: list[str], *, force: bool = False
+) -> None:
     for section in sections:
-        await delete_section_message(user_id, section, bot)
+        await delete_section_message(user_id, section, bot, force=force)
 
 
 def _remember_question_answer(user_id: int, question_id: str, text: str, status: str = "draft") -> None:
@@ -368,11 +370,12 @@ async def _send_questions_list(
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, state: FSMContext) -> None:
     text = (
         "Привет! Я помогу быстро смотреть финансы, заказы и отзывы Ozon.\n"
         "Выберите раздел через кнопки ниже."
     )
+    await state.clear()
     await _clear_sections(
         message.bot,
         message.from_user.id,
@@ -384,7 +387,10 @@ async def cmd_start(message: Message) -> None:
             SECTION_REVIEW_CARD,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await send_section_message(
         SECTION_MENU,
@@ -395,8 +401,9 @@ async def cmd_start(message: Message) -> None:
 
 
 @router.message(Command("fin_today"))
-async def cmd_fin_today(message: Message) -> None:
+async def cmd_fin_today(message: Message, state: FSMContext) -> None:
     text = await get_finance_today_text()
+    await state.clear()
     await _clear_sections(
         message.bot,
         message.from_user.id,
@@ -407,7 +414,10 @@ async def cmd_fin_today(message: Message) -> None:
             SECTION_REVIEW_CARD,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await send_section_message(
         SECTION_FINANCE_TODAY,
@@ -418,8 +428,9 @@ async def cmd_fin_today(message: Message) -> None:
 
 
 @router.message(Command("account"))
-async def cmd_account(message: Message) -> None:
+async def cmd_account(message: Message, state: FSMContext) -> None:
     text = await get_account_info_text()
+    await state.clear()
     await _clear_sections(
         message.bot,
         message.from_user.id,
@@ -430,7 +441,10 @@ async def cmd_account(message: Message) -> None:
             SECTION_REVIEW_CARD,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await send_section_message(
         SECTION_ACCOUNT,
@@ -441,8 +455,9 @@ async def cmd_account(message: Message) -> None:
 
 
 @router.message(Command("fbo"))
-async def cmd_fbo(message: Message) -> None:
+async def cmd_fbo(message: Message, state: FSMContext) -> None:
     text = await get_orders_today_text()
+    await state.clear()
     await _clear_sections(
         message.bot,
         message.from_user.id,
@@ -453,7 +468,10 @@ async def cmd_fbo(message: Message) -> None:
             SECTION_REVIEW_CARD,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await send_section_message(
         SECTION_FBO,
@@ -464,8 +482,9 @@ async def cmd_fbo(message: Message) -> None:
 
 
 @router.message(Command("reviews"))
-async def cmd_reviews(message: Message) -> None:
+async def cmd_reviews(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
+    await state.clear()
     await _clear_sections(
         message.bot,
         user_id,
@@ -475,7 +494,10 @@ async def cmd_reviews(message: Message) -> None:
             SECTION_ACCOUNT,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await refresh_reviews(user_id)
     await _send_reviews_list(
@@ -489,8 +511,9 @@ async def cmd_reviews(message: Message) -> None:
 
 
 @router.message(Command("questions"))
-async def cmd_questions(message: Message) -> None:
+async def cmd_questions(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
+    await state.clear()
     await _clear_sections(
         message.bot,
         user_id,
@@ -501,7 +524,10 @@ async def cmd_questions(message: Message) -> None:
             SECTION_REVIEWS_LIST,
             SECTION_REVIEW_CARD,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await refresh_questions(user_id)
     await _send_questions_list(
@@ -697,9 +723,12 @@ async def _send_question_card(
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "home"))
-async def cb_home(callback: CallbackQuery, callback_data: MenuCallbackData) -> None:
+async def cb_home(
+    callback: CallbackQuery, callback_data: MenuCallbackData, state: FSMContext
+) -> None:
     await callback.answer()
     user_id = callback.from_user.id
+    await state.clear()
     await _clear_sections(
         callback.message.bot,
         user_id,
@@ -711,7 +740,10 @@ async def cb_home(callback: CallbackQuery, callback_data: MenuCallbackData) -> N
             SECTION_REVIEW_CARD,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await send_section_message(
         SECTION_MENU,
@@ -723,10 +755,13 @@ async def cb_home(callback: CallbackQuery, callback_data: MenuCallbackData) -> N
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "fbo"))
-async def cb_fbo(callback: CallbackQuery, callback_data: MenuCallbackData) -> None:
+async def cb_fbo(
+    callback: CallbackQuery, callback_data: MenuCallbackData, state: FSMContext
+) -> None:
     await callback.answer()
     action = callback_data.action
     user_id = callback.from_user.id
+    await state.clear()
     if action == "summary":
         text = await get_orders_today_text()
         await send_section_message(
@@ -773,7 +808,10 @@ async def cb_fbo(callback: CallbackQuery, callback_data: MenuCallbackData) -> No
                 SECTION_REVIEW_CARD,
                 SECTION_QUESTIONS_LIST,
                 SECTION_QUESTION_CARD,
+                SECTION_REVIEW_PROMPT,
+                SECTION_QUESTION_PROMPT,
             ],
+            force=True,
         )
         await send_section_message(
             SECTION_MENU,
@@ -785,10 +823,13 @@ async def cb_fbo(callback: CallbackQuery, callback_data: MenuCallbackData) -> No
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "account"))
-async def cb_account(callback: CallbackQuery, callback_data: MenuCallbackData) -> None:
+async def cb_account(
+    callback: CallbackQuery, callback_data: MenuCallbackData, state: FSMContext
+) -> None:
     await callback.answer()
     text = await get_account_info_text()
     user_id = callback.from_user.id
+    await state.clear()
     await _clear_sections(
         callback.message.bot,
         user_id,
@@ -799,7 +840,10 @@ async def cb_account(callback: CallbackQuery, callback_data: MenuCallbackData) -
             SECTION_REVIEW_CARD,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await send_section_message(
         SECTION_ACCOUNT,
@@ -811,10 +855,13 @@ async def cb_account(callback: CallbackQuery, callback_data: MenuCallbackData) -
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "fin_today"))
-async def cb_fin_today(callback: CallbackQuery, callback_data: MenuCallbackData) -> None:
+async def cb_fin_today(
+    callback: CallbackQuery, callback_data: MenuCallbackData, state: FSMContext
+) -> None:
     await callback.answer()
     text = await get_finance_today_text()
     user_id = callback.from_user.id
+    await state.clear()
     await _clear_sections(
         callback.message.bot,
         user_id,
@@ -825,7 +872,10 @@ async def cb_fin_today(callback: CallbackQuery, callback_data: MenuCallbackData)
             SECTION_REVIEW_CARD,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await send_section_message(
         SECTION_FINANCE_TODAY,
@@ -1652,7 +1702,8 @@ async def handle_question_manual(message: Message, state: FSMContext) -> None:
 
 
 @router.message()
-async def handle_any(message: Message) -> None:
+async def handle_any(message: Message, state: FSMContext) -> None:
+    await state.clear()
     await _clear_sections(
         message.bot,
         message.from_user.id,
@@ -1664,7 +1715,10 @@ async def handle_any(message: Message) -> None:
             SECTION_REVIEW_CARD,
             SECTION_QUESTIONS_LIST,
             SECTION_QUESTION_CARD,
+            SECTION_REVIEW_PROMPT,
+            SECTION_QUESTION_PROMPT,
         ],
+        force=True,
     )
     await send_section_message(
         SECTION_MENU,
