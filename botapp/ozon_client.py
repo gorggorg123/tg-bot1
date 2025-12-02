@@ -980,7 +980,11 @@ class ChatMessage(BaseModel):
     created_at: str | None = None
     send_time: str | None = None
 
-    model_config = ConfigDict(extra="ignore", protected_namespaces=(), populate_by_name=True)
+    model_config = ConfigDict(
+        extra="allow",
+        protected_namespaces=(),
+        populate_by_name=True,
+    )
 
     def to_dict(self) -> dict:
         data = self.model_dump(exclude_none=True, by_alias=False)
@@ -992,7 +996,7 @@ class ChatMessage(BaseModel):
         if not data.get("text"):
             for key in ("message", "content"):
                 value = getattr(self, key, None)
-                if value:
+                if isinstance(value, str) and value:
                     data["text"] = value
                     break
         if self.author is not None:
@@ -1125,69 +1129,40 @@ async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:
         )
 
     payload = data.get("result") if isinstance(data.get("result"), dict) else data
-    data_keys = list(data.keys()) if isinstance(data, dict) else []
-    payload_keys = list(payload.keys()) if isinstance(payload, dict) else []
-    logger.debug(
-        "chat_history payload received: status=%s data_keys=%s payload_type=%s payload_keys=%s",
-        status_code,
-        data_keys,
-        type(payload).__name__,
-        payload_keys,
-    )
-
-    def _log_validation_error(exc: ValidationError) -> None:
-        logger.warning("Failed to parse chat history payload: %s", exc)
-        try:
-            preview = str(payload)
-            if len(preview) > 500:
-                preview = preview[:500] + "..."
-            logger.warning("Chat history payload preview: %s", preview)
-        except Exception:
-            logger.warning("Unable to render chat history payload preview")
-
-    messages_raw: list[dict] = []
+    raw_items: list[dict] = []
     try:
         parsed = ChatHistoryResponse.model_validate(payload)
-        messages_raw = list(parsed.iter_items())
+        raw_items = list(parsed.iter_items())
     except ValidationError as exc:
-        _log_validation_error(exc)
-
-    if not messages_raw:
+        logger.warning("Failed to parse chat history payload: %s", exc)
         if isinstance(payload, dict):
-            for container in (payload, payload.get("result") if isinstance(payload.get("result"), dict) else {}):
-                for key in ("messages", "items", "chat_messages", "result"):
-                    maybe = container.get(key) if isinstance(container, dict) else None
-                    if isinstance(maybe, list):
-                        messages_raw = maybe
-                        break
-                if messages_raw:
+            for key in ("messages", "items", "result"):
+                maybe = payload.get(key)
+                if isinstance(maybe, list):
+                    raw_items = maybe
                     break
-        elif isinstance(payload, list):
-            messages_raw = payload
-
-    if not isinstance(messages_raw, list):
-        logger.warning("Unexpected chat history payload structure: %s", type(messages_raw).__name__)
-        return []
+                if isinstance(maybe, dict):
+                    for inner_key in ("messages", "items", "result"):
+                        inner = maybe.get(inner_key)
+                        if isinstance(inner, list):
+                            raw_items = inner
+                            break
+                    if raw_items:
+                        break
+        if not raw_items:
+            return []
 
     messages: list[dict] = []
-    for raw in messages_raw:
-        if not isinstance(raw, dict):
-            continue
+    for raw in raw_items:
         merged = _merge_nested_block(raw, "message")
         if not isinstance(merged, dict):
             continue
         try:
             normalized = ChatMessage.model_validate(merged).to_dict()
         except ValidationError as exc:
-            logger.warning("Failed to normalize chat message: %s", exc)
+            logger.warning("Failed to normalize chat message: %s; using raw item", exc)
             normalized = dict(merged)
-            if "message_id" not in normalized and normalized.get("id") is not None:
-                normalized["message_id"] = str(normalized.get("id"))
-            if "text" not in normalized:
-                for key in ("message", "content", "body"):
-                    if key in normalized and normalized.get(key):
-                        normalized.setdefault("text", normalized.get(key))
-                        break
+
         normalized.setdefault("_raw", merged)
         messages.append(normalized)
     return messages

@@ -438,77 +438,65 @@ def _format_chat_history_text(chat_meta: dict | None, messages: list[dict], *, l
     recent = list(messages[-max(1, limit):])
 
     def _ts(msg: dict) -> str:
-        def _from(source: dict | None) -> str:
-            if not isinstance(source, dict):
-                return ""
-            for key in (
-                "created_at",
-                "send_time",
-                "sent_at",
-                "timestamp",
-                "time",
-                "createdAt",
-                "sentAt",
-            ):
-                value = source.get(key)
-                if value is None:
-                    continue
+        if not isinstance(msg, dict):
+            return ""
+        for key in ("created_at", "send_time"):
+            value = msg.get(key)
+            if isinstance(value, str):
+                return value
+        raw = msg.get("_raw")
+        if isinstance(raw, dict):
+            for key in ("created_at", "send_time"):
+                value = raw.get(key)
                 if isinstance(value, str):
                     return value
-                try:
-                    return str(value)
-                except Exception:
-                    continue
-            return ""
-
-        for candidate in (msg, msg.get("_raw") if isinstance(msg, dict) else None):
-            ts_value = _from(candidate)
-            if ts_value:
-                return ts_value
         return ""
 
     def _extract_text(msg: dict) -> str | None:
-        def _search(obj):
-            if isinstance(obj, dict):
-                for key in (
-                    "text",
-                    "message",
-                    "content",
-                    "body",
-                    "value",
-                    "text_html",
-                    "textHtml",
-                ):
-                    if key in obj:
-                        val = obj.get(key)
-                        if isinstance(val, list):
-                            val = "\n".join(str(v) for v in val if v is not None)
-                        if isinstance(val, (str, int, float)):
-                            text_val = str(val).strip()
-                            if text_val:
-                                return text_val
-                for child in obj.values():
-                    nested = _search(child)
-                    if nested:
-                        return nested
-            elif isinstance(obj, (list, tuple)):
-                for child in obj:
-                    nested = _search(child)
-                    if nested:
-                        return nested
+        """Извлечь текст сообщения из разных возможных полей, включая вложенные."""
+        if not isinstance(msg, dict):
             return None
 
-        for candidate in (
-            msg,
-            msg.get("_raw") if isinstance(msg, dict) else None,
-        ):
-            if candidate is None:
+        # верхний уровень
+        for key in ("text", "message", "content"):
+            value = msg.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        # стартовая точка для обхода — _raw, если есть; иначе само сообщение
+        start_obj = msg.get("_raw")
+        if not isinstance(start_obj, (dict, list, tuple)):
+            start_obj = msg
+
+        seen: set[int] = set()
+        queue: list[object] = [start_obj]
+
+        while queue:
+            cur = queue.pop(0)
+            obj_id = id(cur)
+            if obj_id in seen:
                 continue
-            if not isinstance(candidate, (dict, list, tuple)):
-                continue
-            found = _search(candidate)
-            if found:
-                return found
+            seen.add(obj_id)
+
+            if isinstance(cur, dict):
+                # сначала пробуем ключи, по которым обычно лежит текст
+                for key in ("text", "message", "content", "body", "value"):
+                    value = cur.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+                # потом обходим вложенности
+                for v in cur.values():
+                    if isinstance(v, (dict, list, tuple)):
+                        queue.append(v)
+                    elif isinstance(v, str) and v.strip() and len(v.strip()) >= 2:
+                        # fallback: если просто встретили нормальную строку
+                        return v.strip()
+            elif isinstance(cur, (list, tuple)):
+                for v in cur:
+                    if isinstance(v, (dict, list, tuple)):
+                        queue.append(v)
+                    elif isinstance(v, str) and v.strip() and len(v.strip()) >= 2:
+                        return v.strip()
         return None
 
     recent.sort(key=_ts)
@@ -546,6 +534,8 @@ def _format_chat_history_text(chat_meta: dict | None, messages: list[dict], *, l
 
         text = _extract_text(msg)
         if not text:
+            # лог для диагностики, но без спама
+            logger.debug("Chat history: skip message without text: %r", msg)
             continue
 
         lines.append(f"{author}{dt_part}:\n{text}")
