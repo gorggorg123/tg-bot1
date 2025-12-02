@@ -438,24 +438,78 @@ def _format_chat_history_text(chat_meta: dict | None, messages: list[dict], *, l
     recent = list(messages[-max(1, limit):])
 
     def _ts(msg: dict) -> str:
-        for key in (
-            "created_at",
-            "send_time",
-            "sent_at",
-            "timestamp",
-            "time",
-            "createdAt",
-        ):
-            value = msg.get(key)
-            if value is None:
-                continue
-            if isinstance(value, str):
-                return value
-            try:
-                return str(value)
-            except Exception:
-                continue
+        def _from(source: dict | None) -> str:
+            if not isinstance(source, dict):
+                return ""
+            for key in (
+                "created_at",
+                "send_time",
+                "sent_at",
+                "timestamp",
+                "time",
+                "createdAt",
+                "sentAt",
+            ):
+                value = source.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, str):
+                    return value
+                try:
+                    return str(value)
+                except Exception:
+                    continue
+            return ""
+
+        for candidate in (msg, msg.get("_raw") if isinstance(msg, dict) else None):
+            ts_value = _from(candidate)
+            if ts_value:
+                return ts_value
         return ""
+
+    def _extract_text(msg: dict) -> str | None:
+        def _search(obj):
+            if isinstance(obj, dict):
+                for key in (
+                    "text",
+                    "message",
+                    "content",
+                    "body",
+                    "value",
+                    "text_html",
+                    "textHtml",
+                ):
+                    if key in obj:
+                        val = obj.get(key)
+                        if isinstance(val, list):
+                            val = "\n".join(str(v) for v in val if v is not None)
+                        if isinstance(val, (str, int, float)):
+                            text_val = str(val).strip()
+                            if text_val:
+                                return text_val
+                for child in obj.values():
+                    nested = _search(child)
+                    if nested:
+                        return nested
+            elif isinstance(obj, (list, tuple)):
+                for child in obj:
+                    nested = _search(child)
+                    if nested:
+                        return nested
+            return None
+
+        for candidate in (
+            msg,
+            msg.get("_raw") if isinstance(msg, dict) else None,
+        ):
+            if candidate is None:
+                continue
+            if not isinstance(candidate, (dict, list, tuple)):
+                continue
+            found = _search(candidate)
+            if found:
+                return found
+        return None
 
     recent.sort(key=_ts)
 
@@ -490,9 +544,7 @@ def _format_chat_history_text(chat_meta: dict | None, messages: list[dict], *, l
         if ts_value:
             dt_part = f" ({ts_value[:16]})"
 
-        text = msg.get("text") or msg.get("message") or msg.get("content") or msg.get("body")
-        if text:
-            text = str(text).strip()
+        text = _extract_text(msg)
         if not text:
             continue
 

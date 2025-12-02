@@ -982,13 +982,6 @@ class ChatMessage(BaseModel):
 
     model_config = ConfigDict(extra="ignore", protected_namespaces=(), populate_by_name=True)
 
-    @field_validator("message_id", mode="before")
-    @classmethod
-    def _coerce_message_id(cls, v):
-        if v is None:
-            raise ValueError("message_id is empty")
-        return str(v)
-
     def to_dict(self) -> dict:
         data = self.model_dump(exclude_none=True, by_alias=False)
         if not data.get("message_id") and self.id:
@@ -1158,13 +1151,14 @@ async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:
 
     if not messages_raw:
         if isinstance(payload, dict):
-            for key in ("messages", "chat_messages", "items"):
-                maybe = payload.get(key)
-                if isinstance(maybe, list):
-                    messages_raw = maybe
+            for container in (payload, payload.get("result") if isinstance(payload.get("result"), dict) else {}):
+                for key in ("messages", "items", "chat_messages", "result"):
+                    maybe = container.get(key) if isinstance(container, dict) else None
+                    if isinstance(maybe, list):
+                        messages_raw = maybe
+                        break
+                if messages_raw:
                     break
-            if not messages_raw and isinstance(payload.get("result"), list):
-                messages_raw = payload.get("result")
         elif isinstance(payload, list):
             messages_raw = payload
 
@@ -1180,18 +1174,19 @@ async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:
         if not isinstance(merged, dict):
             continue
         try:
-            messages.append(ChatMessage.model_validate(merged).to_dict())
+            normalized = ChatMessage.model_validate(merged).to_dict()
         except ValidationError as exc:
             logger.warning("Failed to normalize chat message: %s", exc)
-            msg_copy = dict(merged)
-            if "message_id" not in msg_copy and msg_copy.get("id") is not None:
-                msg_copy["message_id"] = str(msg_copy.get("id"))
-            if "text" not in msg_copy:
+            normalized = dict(merged)
+            if "message_id" not in normalized and normalized.get("id") is not None:
+                normalized["message_id"] = str(normalized.get("id"))
+            if "text" not in normalized:
                 for key in ("message", "content", "body"):
-                    if key in msg_copy and msg_copy.get(key):
-                        msg_copy.setdefault("text", msg_copy.get(key))
+                    if key in normalized and normalized.get(key):
+                        normalized.setdefault("text", normalized.get(key))
                         break
-            messages.append(msg_copy)
+        normalized.setdefault("_raw", merged)
+        messages.append(normalized)
     return messages
 
 
