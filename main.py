@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import os
 from contextlib import suppress
 from datetime import datetime, timezone
@@ -453,23 +454,50 @@ def _format_chat_history_text(chat_meta: dict | None, messages: list[dict], *, l
         return ""
 
     def _extract_text(msg: dict) -> str | None:
-        """Извлечь текст сообщения из разных возможных полей, включая вложенные."""
+        PREFERRED_KEYS = (
+            "text",
+            "message",
+            "content",
+            "body",
+            "value",
+            "text_html",
+            "textHtml",
+        )
+
+        def _is_timestamp(s: str) -> bool:
+            return bool(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:", s.strip()))
+
+        def _pick_from_dict(d: dict) -> str | None:
+            for key in PREFERRED_KEYS:
+                if key not in d:
+                    continue
+                value = d.get(key)
+                if isinstance(value, str):
+                    value_str = value.strip()
+                    if value_str and not _is_timestamp(value_str):
+                        return value_str
+                if isinstance(value, dict):
+                    for k2 in PREFERRED_KEYS:
+                        inner = value.get(k2)
+                        if isinstance(inner, str):
+                            inner_str = inner.strip()
+                            if inner_str and not _is_timestamp(inner_str):
+                                return inner_str
+            return None
+
         if not isinstance(msg, dict):
             return None
 
-        # верхний уровень
-        for key in ("text", "message", "content"):
-            value = msg.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+        direct = _pick_from_dict(msg)
+        if direct:
+            return direct
 
-        # стартовая точка для обхода — _raw, если есть; иначе само сообщение
-        start_obj = msg.get("_raw")
-        if not isinstance(start_obj, (dict, list, tuple)):
-            start_obj = msg
+        root = msg.get("_raw")
+        if not isinstance(root, (dict, list)):
+            return None
 
+        queue: list[object] = [root]
         seen: set[int] = set()
-        queue: list[object] = [start_obj]
 
         while queue:
             cur = queue.pop(0)
@@ -479,24 +507,17 @@ def _format_chat_history_text(chat_meta: dict | None, messages: list[dict], *, l
             seen.add(obj_id)
 
             if isinstance(cur, dict):
-                # сначала пробуем ключи, по которым обычно лежит текст
-                for key in ("text", "message", "content", "body", "value"):
-                    value = cur.get(key)
-                    if isinstance(value, str) and value.strip():
-                        return value.strip()
-                # потом обходим вложенности
+                candidate = _pick_from_dict(cur)
+                if candidate:
+                    return candidate
                 for v in cur.values():
-                    if isinstance(v, (dict, list, tuple)):
+                    if isinstance(v, (dict, list)):
                         queue.append(v)
-                    elif isinstance(v, str) and v.strip() and len(v.strip()) >= 2:
-                        # fallback: если просто встретили нормальную строку
-                        return v.strip()
-            elif isinstance(cur, (list, tuple)):
+            elif isinstance(cur, list):
                 for v in cur:
-                    if isinstance(v, (dict, list, tuple)):
+                    if isinstance(v, (dict, list)):
                         queue.append(v)
-                    elif isinstance(v, str) and v.strip() and len(v.strip()) >= 2:
-                        return v.strip()
+
         return None
 
     recent.sort(key=_ts)
@@ -534,12 +555,25 @@ def _format_chat_history_text(chat_meta: dict | None, messages: list[dict], *, l
 
         text = _extract_text(msg)
         if not text:
-            # лог для диагностики, но без спама
-            logger.debug("Chat history: skip message without text: %r", msg)
             continue
 
         lines.append(f"{author}{dt_part}:\n{text}")
 
+    if len(lines) == 2 and recent:
+        sample = recent[-1]
+        raw = sample.get("_raw") or sample
+        if isinstance(raw, dict):
+            logger.info(
+                "No text found in chat history, sample message keys: %s, raw=%r",
+                list(raw.keys()),
+                raw,
+            )
+        else:
+            logger.info(
+                "No text found in chat history, sample message type: %r, value=%r",
+                type(raw),
+                raw,
+            )
     if len(lines) == 2:
         lines.append("В этом чате нет текстовых сообщений.")
 
