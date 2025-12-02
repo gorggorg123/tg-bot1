@@ -1125,7 +1125,7 @@ async def chat_read(chat_id: str, messages: Sequence[dict] | None = None) -> Non
         return
 
     client = get_client()
-    body = {"chat_id": chat_id, "message_id": last_message_id}
+    body = {"chat_id": chat_id, "from_message_id": last_message_id}
     status_code, data = await client._post_with_status("/v2/chat/read", body)
     if status_code >= 400:
         logger.warning("Failed to mark chat %s as read: %s", chat_id, data)
