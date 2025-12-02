@@ -416,7 +416,7 @@ async def _send_chats_list(
     await delete_section_message(user_id, SECTION_CHAT_PROMPT, active_bot, force=True)
 
 
-def _format_chat_history_text(chat_meta: dict | None, messages: list[dict]) -> str:
+def _format_chat_history_text(chat_meta: dict | None, messages: list[dict], *, limit: int = 20) -> str:
     buyer = None
     posting = None
     if isinstance(chat_meta, dict):
@@ -431,25 +431,133 @@ def _format_chat_history_text(chat_meta: dict | None, messages: list[dict]) -> s
     header = " ".join(header_parts)
 
     lines = [header, ""]
-    for msg in messages:
+    if not messages:
+        lines.append("История чата пуста.")
+        return "\n".join(lines)
+
+    recent = list(messages[-max(1, limit):])
+
+    def _ts(msg: dict) -> str:
+        def _from(source: dict | None) -> str:
+            if not isinstance(source, dict):
+                return ""
+            for key in (
+                "created_at",
+                "send_time",
+                "sent_at",
+                "timestamp",
+                "time",
+                "createdAt",
+                "sentAt",
+            ):
+                value = source.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, str):
+                    return value
+                try:
+                    return str(value)
+                except Exception:
+                    continue
+            return ""
+
+        for candidate in (msg, msg.get("_raw") if isinstance(msg, dict) else None):
+            ts_value = _from(candidate)
+            if ts_value:
+                return ts_value
+        return ""
+
+    def _extract_text(msg: dict) -> str | None:
+        def _search(obj):
+            if isinstance(obj, dict):
+                for key in (
+                    "text",
+                    "message",
+                    "content",
+                    "body",
+                    "value",
+                    "text_html",
+                    "textHtml",
+                ):
+                    if key in obj:
+                        val = obj.get(key)
+                        if isinstance(val, list):
+                            val = "\n".join(str(v) for v in val if v is not None)
+                        if isinstance(val, (str, int, float)):
+                            text_val = str(val).strip()
+                            if text_val:
+                                return text_val
+                for child in obj.values():
+                    nested = _search(child)
+                    if nested:
+                        return nested
+            elif isinstance(obj, (list, tuple)):
+                for child in obj:
+                    nested = _search(child)
+                    if nested:
+                        return nested
+            return None
+
+        for candidate in (
+            msg,
+            msg.get("_raw") if isinstance(msg, dict) else None,
+        ):
+            if candidate is None:
+                continue
+            if not isinstance(candidate, (dict, list, tuple)):
+                continue
+            found = _search(candidate)
+            if found:
+                return found
+        return None
+
+    recent.sort(key=_ts)
+
+    for msg in recent:
         if not isinstance(msg, dict):
             continue
-        text = msg.get("text") or msg.get("message") or msg.get("content")
-        if not text:
-            continue
+
         author_block = msg.get("author") if isinstance(msg.get("author"), dict) else None
         role = None
         if author_block:
-            role = author_block.get("role") or author_block.get("type") or author_block.get("name")
+            role = (
+                author_block.get("role")
+                or author_block.get("type")
+                or author_block.get("name")
+                or author_block.get("author_type")
+            )
         if not role:
-            role = msg.get("from") or msg.get("sender")
+            role = (
+                msg.get("from")
+                or msg.get("sender")
+                or msg.get("author_type")
+                or msg.get("direction")
+            )
         role_lower = str(role or "customer").lower()
-        prefix = "Клиент"
         if "seller" in role_lower or "operator" in role_lower or "store" in role_lower:
-            prefix = "Вы"
-        lines.append(f"{prefix}: {text}")
+            author = "🏪 Продавец"
+        else:
+            author = "👤 Покупатель"
 
-    return "\n".join(lines)
+        dt_part = ""
+        ts_value = _ts(msg)
+        if ts_value:
+            dt_part = f" ({ts_value[:16]})"
+
+        text = _extract_text(msg)
+        if not text:
+            continue
+
+        lines.append(f"{author}{dt_part}:\n{text}")
+
+    if len(lines) == 2:
+        lines.append("В этом чате нет текстовых сообщений.")
+
+    body = "\n\n".join(lines)
+    max_len = 3500
+    if len(body) > max_len:
+        body = "…\n\n" + body[-max_len:]
+    return body
 
 
 async def _open_chat_history(
@@ -494,7 +602,7 @@ async def _open_chat_history(
         return
 
     with suppress(Exception):
-        await chat_read(chat_id)
+        await chat_read(chat_id, messages)
 
     history_text = _format_chat_history_text(chat_meta, messages)
     markup = chat_actions_keyboard(chat_id)
