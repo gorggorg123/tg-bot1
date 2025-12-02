@@ -494,7 +494,7 @@ async def _open_chat_history(
         return
 
     with suppress(Exception):
-        await chat_read(chat_id)
+        await chat_read(chat_id, messages)
 
     history_text = _format_chat_history_text(chat_meta, messages)
     markup = chat_actions_keyboard(chat_id)
