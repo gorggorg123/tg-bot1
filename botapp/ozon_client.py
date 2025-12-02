@@ -10,7 +10,7 @@ from urllib.parse import urlparse, unquote
 
 import httpx
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 try:  # ozonapi-async 0.19.x содержит seller_info, 0.1.0 — нет
     from ozonapi import SellerAPI
@@ -981,6 +981,13 @@ class ChatMessage(BaseModel):
     send_time: str | None = None
 
     model_config = ConfigDict(extra="ignore", protected_namespaces=(), populate_by_name=True)
+
+    @field_validator("message_id", mode="before")
+    @classmethod
+    def _coerce_message_id(cls, v):
+        if v is None:
+            raise ValueError("message_id is empty")
+        return str(v)
 
     def to_dict(self) -> dict:
         data = self.model_dump(exclude_none=True, by_alias=False)
