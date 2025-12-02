@@ -483,6 +483,18 @@ def _format_chat_history_text(chat_meta: dict | None, messages: list[dict], *, l
                             inner_str = inner.strip()
                             if inner_str and not _is_timestamp(inner_str):
                                 return inner_str
+            # Спец-обработка сообщений Ozon, где текст лежит в массиве "data"
+            data_val = d.get("data")
+            if isinstance(data_val, list):
+                for item in data_val:
+                    if isinstance(item, str):
+                        s = item.strip()
+                        if s and not _is_timestamp(s):
+                            return s
+                    if isinstance(item, dict):
+                        nested = _pick_from_dict(item)
+                        if nested:
+                            return nested
             return None
 
         if not isinstance(msg, dict):
