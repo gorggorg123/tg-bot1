@@ -438,10 +438,23 @@ def _format_chat_history_text(chat_meta: dict | None, messages: list[dict], *, l
     recent = list(messages[-max(1, limit):])
 
     def _ts(msg: dict) -> str:
-        for key in ("created_at", "send_time"):
+        for key in (
+            "created_at",
+            "send_time",
+            "sent_at",
+            "timestamp",
+            "time",
+            "createdAt",
+        ):
             value = msg.get(key)
+            if value is None:
+                continue
             if isinstance(value, str):
                 return value
+            try:
+                return str(value)
+            except Exception:
+                continue
         return ""
 
     recent.sort(key=_ts)
@@ -453,9 +466,19 @@ def _format_chat_history_text(chat_meta: dict | None, messages: list[dict], *, l
         author_block = msg.get("author") if isinstance(msg.get("author"), dict) else None
         role = None
         if author_block:
-            role = author_block.get("role") or author_block.get("type") or author_block.get("name")
+            role = (
+                author_block.get("role")
+                or author_block.get("type")
+                or author_block.get("name")
+                or author_block.get("author_type")
+            )
         if not role:
-            role = msg.get("from") or msg.get("sender")
+            role = (
+                msg.get("from")
+                or msg.get("sender")
+                or msg.get("author_type")
+                or msg.get("direction")
+            )
         role_lower = str(role or "customer").lower()
         if "seller" in role_lower or "operator" in role_lower or "store" in role_lower:
             author = "🏪 Продавец"
@@ -467,7 +490,7 @@ def _format_chat_history_text(chat_meta: dict | None, messages: list[dict], *, l
         if ts_value:
             dt_part = f" ({ts_value[:16]})"
 
-        text = msg.get("text") or msg.get("message") or msg.get("content")
+        text = msg.get("text") or msg.get("message") or msg.get("content") or msg.get("body")
         if text:
             text = str(text).strip()
         if not text:

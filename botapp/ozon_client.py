@@ -1058,19 +1058,59 @@ async def chat_list(*, limit: int = 10, offset: int = 0) -> list[dict]:
         )
 
     payload = data.get("result") if isinstance(data.get("result"), dict) else data
+    data_keys = list(data.keys()) if isinstance(data, dict) else []
+    payload_keys = list(payload.keys()) if isinstance(payload, dict) else []
+    logger.debug(
+        "chat_list payload received: status=%s data_keys=%s payload_type=%s payload_keys=%s",
+        status_code,
+        data_keys,
+        type(payload).__name__,
+        payload_keys,
+    )
+
+    def _log_validation_error(exc: ValidationError) -> None:
+        logger.warning("Failed to parse chat list payload: %s", exc)
+        try:
+            preview = str(payload)
+            if len(preview) > 500:
+                preview = preview[:500] + "..."
+            logger.warning("Chat list payload preview: %s", preview)
+        except Exception:
+            logger.warning("Unable to render chat list payload preview")
+
+    items_raw: list[dict] = []
     try:
         parsed = ChatListResponse.model_validate(payload)
+        items_raw = list(parsed.iter_items())
     except ValidationError as exc:
-        logger.warning("Failed to parse chat list payload: %s", exc)
+        _log_validation_error(exc)
+
+    if not items_raw:
+        if isinstance(payload, dict):
+            for key in ("chats", "chat_list", "items"):
+                maybe = payload.get(key)
+                if isinstance(maybe, list):
+                    items_raw = maybe
+                    break
+            if not items_raw and isinstance(payload.get("result"), list):
+                items_raw = payload.get("result")
+        elif isinstance(payload, list):
+            items_raw = payload
+
+    if not isinstance(items_raw, list):
+        logger.warning("Unexpected chat list payload structure: %s", type(items_raw).__name__)
         return []
 
     items: list[dict] = []
-    for raw in parsed.iter_items():
+    for raw in items_raw:
+        if not isinstance(raw, dict):
+            continue
         merged = _merge_nested_block(raw, "chat")
         try:
             items.append(ChatSummary.model_validate(merged).to_dict())
         except ValidationError as exc:
             logger.warning("Failed to normalize chat summary: %s", exc)
+            items.append(merged)
     return items
 
 
@@ -1089,19 +1129,69 @@ async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:
         )
 
     payload = data.get("result") if isinstance(data.get("result"), dict) else data
+    data_keys = list(data.keys()) if isinstance(data, dict) else []
+    payload_keys = list(payload.keys()) if isinstance(payload, dict) else []
+    logger.debug(
+        "chat_history payload received: status=%s data_keys=%s payload_type=%s payload_keys=%s",
+        status_code,
+        data_keys,
+        type(payload).__name__,
+        payload_keys,
+    )
+
+    def _log_validation_error(exc: ValidationError) -> None:
+        logger.warning("Failed to parse chat history payload: %s", exc)
+        try:
+            preview = str(payload)
+            if len(preview) > 500:
+                preview = preview[:500] + "..."
+            logger.warning("Chat history payload preview: %s", preview)
+        except Exception:
+            logger.warning("Unable to render chat history payload preview")
+
+    messages_raw: list[dict] = []
     try:
         parsed = ChatHistoryResponse.model_validate(payload)
+        messages_raw = list(parsed.iter_items())
     except ValidationError as exc:
-        logger.warning("Failed to parse chat history payload: %s", exc)
+        _log_validation_error(exc)
+
+    if not messages_raw:
+        if isinstance(payload, dict):
+            for key in ("messages", "chat_messages", "items"):
+                maybe = payload.get(key)
+                if isinstance(maybe, list):
+                    messages_raw = maybe
+                    break
+            if not messages_raw and isinstance(payload.get("result"), list):
+                messages_raw = payload.get("result")
+        elif isinstance(payload, list):
+            messages_raw = payload
+
+    if not isinstance(messages_raw, list):
+        logger.warning("Unexpected chat history payload structure: %s", type(messages_raw).__name__)
         return []
 
     messages: list[dict] = []
-    for raw in parsed.iter_items():
+    for raw in messages_raw:
+        if not isinstance(raw, dict):
+            continue
         merged = _merge_nested_block(raw, "message")
+        if not isinstance(merged, dict):
+            continue
         try:
             messages.append(ChatMessage.model_validate(merged).to_dict())
         except ValidationError as exc:
             logger.warning("Failed to normalize chat message: %s", exc)
+            msg_copy = dict(merged)
+            if "message_id" not in msg_copy and msg_copy.get("id") is not None:
+                msg_copy["message_id"] = str(msg_copy.get("id"))
+            if "text" not in msg_copy:
+                for key in ("message", "content", "body"):
+                    if key in msg_copy and msg_copy.get(key):
+                        msg_copy.setdefault("text", msg_copy.get(key))
+                        break
+            messages.append(msg_copy)
     return messages
 
 
