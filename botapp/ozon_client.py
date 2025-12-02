@@ -5,7 +5,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 from urllib.parse import urlparse, unquote
 
 import httpx
@@ -1105,9 +1105,27 @@ async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:
     return messages
 
 
-async def chat_read(chat_id: str) -> None:
+async def chat_read(chat_id: str, messages: Sequence[dict] | None = None) -> None:
+    """Mark chat messages as read up to the latest known message."""
+
+    if messages:
+        last_message_id: str | None = None
+        for raw in reversed(messages):
+            if not isinstance(raw, dict):
+                continue
+            message_id = raw.get("message_id") or raw.get("id")
+            if message_id:
+                last_message_id = str(message_id)
+                break
+        if not last_message_id:
+            logger.warning("Chat %s has messages without message_id, skip chat/read", chat_id)
+            return
+    else:
+        logger.info("No messages in chat %s, skip chat/read", chat_id)
+        return
+
     client = get_client()
-    body = {"chat_id": chat_id}
+    body = {"chat_id": chat_id, "message_id": last_message_id}
     status_code, data = await client._post_with_status("/v2/chat/read", body)
     if status_code >= 400:
         logger.warning("Failed to mark chat %s as read: %s", chat_id, data)
