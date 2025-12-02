@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import os
 from contextlib import suppress
 from datetime import datetime, timezone
@@ -416,7 +417,7 @@ async def _send_chats_list(
     await delete_section_message(user_id, SECTION_CHAT_PROMPT, active_bot, force=True)
 
 
-def _format_chat_history_text(chat_meta: dict | None, messages: list[dict]) -> str:
+def _format_chat_history_text(chat_meta: dict | None, messages: list[dict], *, limit: int = 20) -> str:
     buyer = None
     posting = None
     if isinstance(chat_meta, dict):
@@ -431,12 +432,100 @@ def _format_chat_history_text(chat_meta: dict | None, messages: list[dict]) -> s
     header = " ".join(header_parts)
 
     lines = [header, ""]
-    for msg in messages:
+    if not messages:
+        lines.append("История чата пуста.")
+        return "\n".join(lines)
+
+    recent = list(messages[-max(1, limit):])
+
+    def _ts(msg: dict) -> str:
+        if not isinstance(msg, dict):
+            return ""
+        for key in ("created_at", "send_time"):
+            value = msg.get(key)
+            if isinstance(value, str):
+                return value
+        raw = msg.get("_raw")
+        if isinstance(raw, dict):
+            for key in ("created_at", "send_time"):
+                value = raw.get(key)
+                if isinstance(value, str):
+                    return value
+        return ""
+
+    def _extract_text(msg: dict) -> str | None:
+        PREFERRED_KEYS = (
+            "text",
+            "message",
+            "content",
+            "body",
+            "value",
+            "text_html",
+            "textHtml",
+        )
+
+        def _is_timestamp(s: str) -> bool:
+            return bool(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:", s.strip()))
+
+        def _pick_from_dict(d: dict) -> str | None:
+            for key in PREFERRED_KEYS:
+                if key not in d:
+                    continue
+                value = d.get(key)
+                if isinstance(value, str):
+                    value_str = value.strip()
+                    if value_str and not _is_timestamp(value_str):
+                        return value_str
+                if isinstance(value, dict):
+                    for k2 in PREFERRED_KEYS:
+                        inner = value.get(k2)
+                        if isinstance(inner, str):
+                            inner_str = inner.strip()
+                            if inner_str and not _is_timestamp(inner_str):
+                                return inner_str
+            return None
+
+        if not isinstance(msg, dict):
+            return None
+
+        direct = _pick_from_dict(msg)
+        if direct:
+            return direct
+
+        root = msg.get("_raw")
+        if not isinstance(root, (dict, list)):
+            return None
+
+        queue: list[object] = [root]
+        seen: set[int] = set()
+
+        while queue:
+            cur = queue.pop(0)
+            obj_id = id(cur)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+
+            if isinstance(cur, dict):
+                candidate = _pick_from_dict(cur)
+                if candidate:
+                    return candidate
+                for v in cur.values():
+                    if isinstance(v, (dict, list)):
+                        queue.append(v)
+            elif isinstance(cur, list):
+                for v in cur:
+                    if isinstance(v, (dict, list)):
+                        queue.append(v)
+
+        return None
+
+    recent.sort(key=_ts)
+
+    for msg in recent:
         if not isinstance(msg, dict):
             continue
-        text = msg.get("text") or msg.get("message") or msg.get("content")
-        if not text:
-            continue
+
         author_block = msg.get("author") if isinstance(msg.get("author"), dict) else None
         role = None
         if author_block:
@@ -444,12 +533,45 @@ def _format_chat_history_text(chat_meta: dict | None, messages: list[dict]) -> s
         if not role:
             role = msg.get("from") or msg.get("sender")
         role_lower = str(role or "customer").lower()
-        prefix = "Клиент"
         if "seller" in role_lower or "operator" in role_lower or "store" in role_lower:
-            prefix = "Вы"
-        lines.append(f"{prefix}: {text}")
+            author = "🏪 Продавец"
+        else:
+            author = "👤 Покупатель"
 
-    return "\n".join(lines)
+        dt_part = ""
+        ts_value = _ts(msg)
+        if ts_value:
+            dt_part = f" ({ts_value[:16]})"
+
+        text = _extract_text(msg)
+        if not text:
+            continue
+
+        lines.append(f"{author}{dt_part}:\n{text}")
+
+    if len(lines) == 2 and recent:
+        sample = recent[-1]
+        raw = sample.get("_raw") or sample
+        if isinstance(raw, dict):
+            logger.info(
+                "No text found in chat history, sample message keys: %s, raw=%r",
+                list(raw.keys()),
+                raw,
+            )
+        else:
+            logger.info(
+                "No text found in chat history, sample message type: %r, value=%r",
+                type(raw),
+                raw,
+            )
+    if len(lines) == 2:
+        lines.append("В этом чате нет текстовых сообщений.")
+
+    body = "\n\n".join(lines)
+    max_len = 3500
+    if len(body) > max_len:
+        body = "…\n\n" + body[-max_len:]
+    return body
 
 
 async def _open_chat_history(
@@ -494,7 +616,7 @@ async def _open_chat_history(
         return
 
     with suppress(Exception):
-        await chat_read(chat_id)
+        await chat_read(chat_id, messages)
 
     history_text = _format_chat_history_text(chat_meta, messages)
     markup = chat_actions_keyboard(chat_id)
