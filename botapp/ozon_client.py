@@ -5,12 +5,12 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 from urllib.parse import urlparse, unquote
 
 import httpx
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 try:  # ozonapi-async 0.19.x содержит seller_info, 0.1.0 — нет
     from ozonapi import SellerAPI
@@ -916,47 +916,304 @@ def has_write_credentials() -> bool:
 # ---------- Chats ----------
 
 
+class ChatSummary(BaseModel):
+    chat_id: str | None = None
+    id: str | None = None
+    posting_number: str | None = None
+    order_id: str | None = None
+    buyer_name: str | None = None
+    client_name: str | None = None
+    customer_name: str | None = None
+    last_message: dict | str | None = None
+    last_message_text: str | None = None
+    last_message_time: str | None = None
+    updated_at: str | None = None
+    unread_count: int | None = None
+    is_unread: bool | None = None
+    has_unread: bool | None = None
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=(), populate_by_name=True)
+
+    def to_dict(self) -> dict:
+        data = self.model_dump(exclude_none=True, by_alias=False)
+        if not data.get("chat_id") and self.id:
+            data["chat_id"] = str(self.id)
+        if self.last_message is not None:
+            data["last_message"] = self.last_message
+        return data
+
+
+class ChatListResponse(BaseModel):
+    chats: list[dict] = Field(default_factory=list)
+    items: list[dict] | None = None
+    result: list[dict] | dict | None = None
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+    def iter_items(self):
+        candidates: list[list[dict]] = []
+        if self.chats:
+            candidates.append(self.chats)
+        if isinstance(self.items, list):
+            candidates.append(self.items)
+        if isinstance(self.result, list):
+            candidates.append(self.result)
+        elif isinstance(self.result, dict):
+            for key in ("chats", "items", "result"):
+                maybe_items = self.result.get(key)
+                if isinstance(maybe_items, list):
+                    candidates.append(maybe_items)
+
+        for bucket in candidates:
+            for item in bucket:
+                yield item
+
+
+class ChatMessage(BaseModel):
+    message_id: str | int | None = None
+    id: str | None = None
+    text: str | None = None
+    message: str | None = None
+    content: str | None = None
+    author: dict | str | None = None
+    sender: str | None = Field(default=None, alias="from")
+    created_at: str | None = None
+    send_time: str | None = None
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=(), populate_by_name=True)
+
+    def to_dict(self) -> dict:
+        data = self.model_dump(exclude_none=True, by_alias=False)
+        mid = data.get("message_id")
+        if mid is not None:
+            data["message_id"] = str(mid)
+        elif self.id:
+            data["message_id"] = str(self.id)
+        if not data.get("text"):
+            for key in ("message", "content"):
+                value = getattr(self, key, None)
+                if value:
+                    data["text"] = value
+                    break
+        if self.author is not None:
+            data["author"] = self.author
+        if self.sender and "from" not in data:
+            data["from"] = self.sender
+        return data
+
+
+class ChatHistoryResponse(BaseModel):
+    messages: list[dict] = Field(default_factory=list)
+    items: list[dict] | None = None
+    result: list[dict] | dict | None = None
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+    def iter_items(self):
+        candidates: list[list[dict]] = []
+        if self.messages:
+            candidates.append(self.messages)
+        if isinstance(self.items, list):
+            candidates.append(self.items)
+        if isinstance(self.result, list):
+            candidates.append(self.result)
+        elif isinstance(self.result, dict):
+            for key in ("messages", "items", "result"):
+                maybe_items = self.result.get(key)
+                if isinstance(maybe_items, list):
+                    candidates.append(maybe_items)
+
+        for bucket in candidates:
+            for item in bucket:
+                yield item
+
+
+def _merge_nested_block(item: dict, key: str) -> dict:
+    if not isinstance(item, dict):
+        return {}
+    nested = item.get(key)
+    if isinstance(nested, dict):
+        merged = {**item, **nested}
+        merged.pop(key, None)
+        return merged
+    return item
+
+
 async def chat_list(*, limit: int = 10, offset: int = 0) -> list[dict]:
     client = get_client()
-    body = {"limit": max(1, min(limit, 50)), "offset": max(0, offset)}
-    status_code, data = await client._post_with_status("/v2/chat/list", body)
+    body = {"limit": max(1, min(limit, 50)), "offset": max(0, offset), "filter": {}}
+    status_code, data = await client._post_with_status("/v3/chat/list", body)
     if status_code >= 400 or not isinstance(data, dict):
         message = None
         if isinstance(data, dict):
             message = data.get("message") or data.get("error")
+            if data.get("code") == 9:
+                logger.warning("Ozon chat list method is obsolete; check API version update")
         raise OzonAPIError(
             f"Ошибка Ozon API при получении списка чатов: HTTP {status_code} {message or data}"
         )
 
     payload = data.get("result") if isinstance(data.get("result"), dict) else data
-    items = payload.get("chats") if isinstance(payload, dict) else None
-    if not isinstance(items, list):
-        items = payload.get("result") if isinstance(payload, dict) else None
-    return items or []
+    data_keys = list(data.keys()) if isinstance(data, dict) else []
+    payload_keys = list(payload.keys()) if isinstance(payload, dict) else []
+    logger.debug(
+        "chat_list payload received: status=%s data_keys=%s payload_type=%s payload_keys=%s",
+        status_code,
+        data_keys,
+        type(payload).__name__,
+        payload_keys,
+    )
+
+    def _log_validation_error(exc: ValidationError) -> None:
+        logger.warning("Failed to parse chat list payload: %s", exc)
+        try:
+            preview = str(payload)
+            if len(preview) > 500:
+                preview = preview[:500] + "..."
+            logger.warning("Chat list payload preview: %s", preview)
+        except Exception:
+            logger.warning("Unable to render chat list payload preview")
+
+    items_raw: list[dict] = []
+    try:
+        parsed = ChatListResponse.model_validate(payload)
+        items_raw = list(parsed.iter_items())
+    except ValidationError as exc:
+        _log_validation_error(exc)
+
+    if not items_raw:
+        if isinstance(payload, dict):
+            for key in ("chats", "chat_list", "items"):
+                maybe = payload.get(key)
+                if isinstance(maybe, list):
+                    items_raw = maybe
+                    break
+            if not items_raw and isinstance(payload.get("result"), list):
+                items_raw = payload.get("result")
+        elif isinstance(payload, list):
+            items_raw = payload
+
+    if not isinstance(items_raw, list):
+        logger.warning("Unexpected chat list payload structure: %s", type(items_raw).__name__)
+        return []
+
+    items: list[dict] = []
+    for raw in items_raw:
+        if not isinstance(raw, dict):
+            continue
+        merged = _merge_nested_block(raw, "chat")
+        try:
+            items.append(ChatSummary.model_validate(merged).to_dict())
+        except ValidationError as exc:
+            logger.warning("Failed to normalize chat summary: %s", exc)
+            items.append(merged)
+    return items
 
 
 async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:
     client = get_client()
     body = {"chat_id": chat_id, "limit": max(1, min(limit, 50))}
-    status_code, data = await client._post_with_status("/v2/chat/history", body)
+    status_code, data = await client._post_with_status("/v3/chat/history", body)
     if status_code >= 400 or not isinstance(data, dict):
         message = None
         if isinstance(data, dict):
             message = data.get("message") or data.get("error")
+            if data.get("code") == 9:
+                logger.warning("Ozon chat history method is obsolete; check API version update")
         raise OzonAPIError(
             f"Ошибка Ozon API при получении истории чата: HTTP {status_code} {message or data}"
         )
 
     payload = data.get("result") if isinstance(data.get("result"), dict) else data
-    messages = payload.get("messages") if isinstance(payload, dict) else None
-    if not isinstance(messages, list):
-        messages = payload.get("result") if isinstance(payload, dict) else None
-    return messages or []
+    data_keys = list(data.keys()) if isinstance(data, dict) else []
+    payload_keys = list(payload.keys()) if isinstance(payload, dict) else []
+    logger.debug(
+        "chat_history payload received: status=%s data_keys=%s payload_type=%s payload_keys=%s",
+        status_code,
+        data_keys,
+        type(payload).__name__,
+        payload_keys,
+    )
+
+    def _log_validation_error(exc: ValidationError) -> None:
+        logger.warning("Failed to parse chat history payload: %s", exc)
+        try:
+            preview = str(payload)
+            if len(preview) > 500:
+                preview = preview[:500] + "..."
+            logger.warning("Chat history payload preview: %s", preview)
+        except Exception:
+            logger.warning("Unable to render chat history payload preview")
+
+    messages_raw: list[dict] = []
+    try:
+        parsed = ChatHistoryResponse.model_validate(payload)
+        messages_raw = list(parsed.iter_items())
+    except ValidationError as exc:
+        _log_validation_error(exc)
+
+    if not messages_raw:
+        if isinstance(payload, dict):
+            for container in (payload, payload.get("result") if isinstance(payload.get("result"), dict) else {}):
+                for key in ("messages", "items", "chat_messages", "result"):
+                    maybe = container.get(key) if isinstance(container, dict) else None
+                    if isinstance(maybe, list):
+                        messages_raw = maybe
+                        break
+                if messages_raw:
+                    break
+        elif isinstance(payload, list):
+            messages_raw = payload
+
+    if not isinstance(messages_raw, list):
+        logger.warning("Unexpected chat history payload structure: %s", type(messages_raw).__name__)
+        return []
+
+    messages: list[dict] = []
+    for raw in messages_raw:
+        if not isinstance(raw, dict):
+            continue
+        merged = _merge_nested_block(raw, "message")
+        if not isinstance(merged, dict):
+            continue
+        try:
+            normalized = ChatMessage.model_validate(merged).to_dict()
+        except ValidationError as exc:
+            logger.warning("Failed to normalize chat message: %s", exc)
+            normalized = dict(merged)
+            if "message_id" not in normalized and normalized.get("id") is not None:
+                normalized["message_id"] = str(normalized.get("id"))
+            if "text" not in normalized:
+                for key in ("message", "content", "body"):
+                    if key in normalized and normalized.get(key):
+                        normalized.setdefault("text", normalized.get(key))
+                        break
+        normalized.setdefault("_raw", merged)
+        messages.append(normalized)
+    return messages
 
 
-async def chat_read(chat_id: str) -> None:
+async def chat_read(chat_id: str, messages: Sequence[dict] | None = None) -> None:
+    """Mark chat messages as read up to the latest known message."""
+
+    if messages:
+        last_message_id: str | None = None
+        for raw in reversed(messages):
+            if not isinstance(raw, dict):
+                continue
+            message_id = raw.get("message_id") or raw.get("id")
+            if message_id:
+                last_message_id = str(message_id)
+                break
+        if not last_message_id:
+            logger.warning("Chat %s has messages without message_id, skip chat/read", chat_id)
+            return
+    else:
+        logger.info("No messages in chat %s, skip chat/read", chat_id)
+        return
+
     client = get_client()
-    body = {"chat_id": chat_id}
+    body = {"chat_id": chat_id, "from_message_id": last_message_id}
     status_code, data = await client._post_with_status("/v2/chat/read", body)
     if status_code >= 400:
         logger.warning("Failed to mark chat %s as read: %s", chat_id, data)
