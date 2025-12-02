@@ -971,7 +971,7 @@ class ChatListResponse(BaseModel):
 
 class ChatMessage(BaseModel):
     message_id: str | int | None = None
-    id: str | None = None
+    id: str | int | None = None
     text: str | None = None
     message: str | None = None
     content: str | None = None
@@ -987,7 +987,7 @@ class ChatMessage(BaseModel):
         mid = data.get("message_id")
         if mid is not None:
             data["message_id"] = str(mid)
-        elif self.id:
+        elif self.id is not None:
             data["message_id"] = str(self.id)
         if not data.get("text"):
             for key in ("message", "content"):
