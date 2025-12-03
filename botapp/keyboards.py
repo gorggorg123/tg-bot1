@@ -698,7 +698,7 @@ def review_draft_keyboard(
 
 
 def chats_list_keyboard(
-    *, items: list[tuple[str, str]], page: int, total_pages: int
+    *, items: list[tuple[str, str]], page: int, total_pages: int, unread_only: bool = False
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for chat_id, caption in items:
@@ -712,6 +712,14 @@ def chats_list_keyboard(
         )
 
     safe_total = max(total_pages, 1)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔎 Только непрочитанные" if not unread_only else "📄 Все чаты",
+                callback_data=ChatsCallbackData(action="filter", page=page).pack(),
+            )
+        ]
+    )
     rows.append(
         [
             InlineKeyboardButton(
@@ -758,8 +766,20 @@ def chat_actions_keyboard(chat_id: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="🔄 Обновить чат",
+                    callback_data=ChatsCallbackData(action="refresh", chat_id=chat_id).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="⬅️ К списку чатов",
                     callback_data=ChatsCallbackData(action="list", page=0).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ В главное меню",
+                    callback_data=MenuCallbackData(section="home", action="open").pack(),
                 )
             ],
         ]

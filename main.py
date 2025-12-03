@@ -1,7 +1,9 @@
 import asyncio
 import logging
-import re
+import math
 import os
+import re
+import textwrap
 from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Dict, Tuple
@@ -281,7 +283,8 @@ def _forget_question_answer(user_id: int, question_id: str) -> None:
     _question_answer_status.pop((user_id, question_id), None)
 
 
-CHAT_PAGE_SIZE = 5
+CHAT_PAGE_SIZE = 7  # показываем чуть больше чатов на страницу
+CHAT_LIST_LIMIT = 100  # верхняя граница одной выгрузки списка чатов
 
 
 def _truncate_text(text: str, limit: int = 80) -> str:
@@ -291,49 +294,313 @@ def _truncate_text(text: str, limit: int = 80) -> str:
     return cleaned[: limit - 1] + "…"
 
 
-def _parse_chat_caption(chat: dict) -> tuple[str | None, str]:
-    chat_id = None
-    if isinstance(chat, dict):
-        raw_id = chat.get("chat_id") or chat.get("id") or chat.get("chatId")
-        chat_id = str(raw_id) if raw_id else None
-    posting = (
-        chat.get("posting_number")
-        if isinstance(chat, dict)
-        else None
-    ) or (chat.get("order_id") if isinstance(chat, dict) else None)
-    buyer = None
-    if isinstance(chat, dict):
-        buyer = chat.get("buyer_name") or chat.get("client_name") or chat.get("customer_name")
-    last_message = None
-    if isinstance(chat, dict):
-        last_block = chat.get("last_message") or chat.get("lastMessage")
-        if isinstance(last_block, dict):
-            last_message = last_block.get("text") or last_block.get("message")
-        if last_message is None:
-            last_message = chat.get("last_message_text") or chat.get("lastMessageText")
-    unread = False
-    if isinstance(chat, dict):
-        unread = bool(chat.get("unread_count") or chat.get("is_unread") or chat.get("has_unread"))
+def _ts(msg: dict) -> str:
+    """Достать временную метку сообщения как строку."""
 
-    caption_parts = []
-    if unread:
-        caption_parts.append("★")
-    if posting:
-        caption_parts.append(str(posting))
-    caption_parts.append(buyer or "Покупатель")
-    if last_message:
-        caption_parts.append("— " + _truncate_text(str(last_message), limit=40))
-    caption = " ".join(caption_parts)
-    return chat_id, caption
-
-
-def _chat_sort_key(chat: dict) -> str:
-    if not isinstance(chat, dict):
+    if not isinstance(msg, dict):
         return ""
-    ts = chat.get("last_message_time") or chat.get("updated_at") or chat.get("updatedAt")
-    if isinstance(ts, str):
-        return ts
+    for key in ("created_at", "send_time"):
+        value = msg.get(key)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float)):
+            # В некоторых payload timestamp приходит числом
+            try:
+                return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+            except Exception:
+                continue
+
+    raw = msg.get("_raw")
+    if isinstance(raw, dict):
+        for key in ("created_at", "send_time"):
+            value = raw.get(key)
+            if isinstance(value, str):
+                return value
     return ""
+
+
+def _parse_ts(ts_value: str | None) -> datetime | None:
+    if not ts_value:
+        return None
+    try:
+        normalized = ts_value.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized)
+    except Exception:
+        return None
+
+
+def _extract_text(msg: dict) -> str | None:
+    """Достать текст сообщения из разных вложенных структур Ozon."""
+
+    PREFERRED_KEYS = (
+        "text",
+        "message",
+        "content",
+        "body",
+        "value",
+        "text_html",
+        "textHtml",
+    )
+
+    def _is_timestamp(s: str) -> bool:
+        return bool(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:", s.strip()))
+
+    def _pick_from_dict(d: dict) -> str | None:
+        for key in PREFERRED_KEYS:
+            if key not in d:
+                continue
+            value = d.get(key)
+            if isinstance(value, str):
+                value_str = value.strip()
+                if value_str and not _is_timestamp(value_str):
+                    return value_str
+            if isinstance(value, dict):
+                for k2 in PREFERRED_KEYS:
+                    inner = value.get(k2)
+                    if isinstance(inner, str):
+                        inner_str = inner.strip()
+                        if inner_str and not _is_timestamp(inner_str):
+                            return inner_str
+        # Спец-обработка сообщений Ozon, где текст лежит в массиве "data"
+        data_val = d.get("data")
+        if isinstance(data_val, list):
+            for item in data_val:
+                if isinstance(item, str):
+                    s = item.strip()
+                    if s and not _is_timestamp(s):
+                        return s
+                if isinstance(item, dict):
+                    nested = _pick_from_dict(item)
+                    if nested:
+                        return nested
+        return None
+
+    if not isinstance(msg, dict):
+        return None
+
+    direct = _pick_from_dict(msg)
+    if direct:
+        return direct
+
+    root = msg.get("_raw")
+    if not isinstance(root, (dict, list)):
+        return None
+
+    queue: list[object] = [root]
+    seen: set[int] = set()
+
+    while queue:
+        cur = queue.pop(0)
+        obj_id = id(cur)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+
+        if isinstance(cur, dict):
+            candidate = _pick_from_dict(cur)
+            if candidate:
+                return candidate
+            for v in cur.values():
+                if isinstance(v, (dict, list)):
+                    queue.append(v)
+        elif isinstance(cur, list):
+            for v in cur:
+                if isinstance(v, (dict, list)):
+                    queue.append(v)
+
+    return None
+
+
+def _detect_message_role(msg: dict) -> str:
+    """Вернуть роль автора сообщения (customer/seller/support/...)."""
+
+    user_block = msg.get("user") if isinstance(msg.get("user"), dict) else None
+    author_block = msg.get("author") if isinstance(msg.get("author"), dict) else None
+
+    role = None
+    if user_block:
+        role = user_block.get("type") or user_block.get("role") or user_block.get("name")
+
+    if not role and author_block:
+        role = (
+            author_block.get("role")
+            or author_block.get("type")
+            or author_block.get("name")
+            or author_block.get("author_type")
+        )
+
+    if not role:
+        role = (
+            msg.get("author_type")
+            or msg.get("from")
+            or msg.get("sender")
+            or msg.get("direction")
+        )
+
+    return str(role or "").lower()
+
+
+def _safe_chat_id(chat: dict) -> str | None:
+    if not isinstance(chat, dict):
+        return None
+    raw_id = chat.get("chat_id") or chat.get("id") or chat.get("chatId")
+    return str(raw_id) if raw_id not in (None, "") else None
+
+
+def _chat_posting(chat: dict) -> str | None:
+    if not isinstance(chat, dict):
+        return None
+    for key in ("posting_number", "postingNumber", "order_id", "orderId"):
+        val = chat.get(key)
+        if val not in (None, ""):
+            return str(val)
+    return None
+
+
+def _chat_buyer_name(chat: dict) -> str | None:
+    if not isinstance(chat, dict):
+        return None
+    candidates = [
+        chat.get("buyer_name"),
+        chat.get("client_name"),
+        chat.get("customer_name"),
+    ]
+    user_block = chat.get("user") if isinstance(chat.get("user"), dict) else None
+    if user_block:
+        candidates.extend(
+            [
+                user_block.get("name"),
+                user_block.get("phone"),
+                user_block.get("display_name"),
+            ]
+        )
+    for candidate in candidates:
+        if candidate not in (None, ""):
+            return str(candidate)
+    return None
+
+
+def _chat_unread_count(chat: dict) -> int:
+    if not isinstance(chat, dict):
+        return 0
+    for key in ("unread_count", "unreadCount"):
+        value = chat.get(key)
+        try:
+            return int(value)
+        except Exception:
+            continue
+    if chat.get("is_unread") or chat.get("has_unread"):
+        return 1
+    return 0
+
+
+def _chat_last_dt(chat: dict) -> datetime | None:
+    if not isinstance(chat, dict):
+        return None
+    ts_value = (
+        chat.get("last_message_time")
+        or chat.get("updated_at")
+        or chat.get("updatedAt")
+    )
+    if isinstance(ts_value, str):
+        parsed = _parse_ts(ts_value)
+        if parsed:
+            return parsed
+
+    last_block = chat.get("last_message") or chat.get("lastMessage")
+    if isinstance(last_block, dict):
+        ts_from_message = _parse_ts(_ts(last_block))
+        if ts_from_message:
+            return ts_from_message
+    return None
+
+
+def _chat_last_text(chat: dict) -> str | None:
+    if not isinstance(chat, dict):
+        return None
+    last_block = chat.get("last_message") or chat.get("lastMessage")
+    if isinstance(last_block, dict):
+        text = _extract_text(last_block) or last_block.get("text") or last_block.get("message")
+        if text:
+            return str(text)
+    text_field = chat.get("last_message_text") or chat.get("lastMessageText")
+    if text_field:
+        return str(text_field)
+    return None
+
+
+def _chat_message_count(chat: dict) -> int | None:
+    if not isinstance(chat, dict):
+        return None
+    for key in ("messages_count", "message_count", "messagesCount", "messageCount"):
+        value = chat.get(key)
+        try:
+            count = int(value)
+            if count >= 0:
+                return count
+        except Exception:
+            continue
+    return None
+
+
+def _chat_display(chat: dict) -> tuple[str | None, str, str, int, str, datetime | None]:
+    """Построить информативное название и превью чата."""
+
+    chat_id = _safe_chat_id(chat)
+    posting = _chat_posting(chat)
+    buyer = _chat_buyer_name(chat)
+    unread_count = _chat_unread_count(chat)
+    last_dt = _chat_last_dt(chat)
+    last_label = last_dt.strftime("%d.%m %H:%M") if last_dt else ""
+    last_text = _chat_last_text(chat)
+    msg_count = _chat_message_count(chat)
+
+    if buyer:
+        title = buyer
+        if posting:
+            title = f"{buyer} • заказ {posting}"
+    elif posting:
+        title = f"Заказ {posting}"
+        if last_label:
+            title = f"{title} • {last_label}"
+    else:
+        if last_label and msg_count:
+            title = f"Чат от {last_label} • {msg_count} сообщений"
+        elif last_label:
+            title = f"Чат от {last_label}"
+        elif msg_count:
+            title = f"Чат • {msg_count} сообщений"
+        else:
+            title = "Чат без названия"
+
+    short_title = _truncate_text(title, limit=24)
+    preview = _truncate_text(last_text, limit=60) if last_text else ""
+    return chat_id, title, short_title, unread_count, preview, last_dt
+
+
+def _chat_sort_key(chat: dict) -> tuple:
+    last_dt = _chat_last_dt(chat)
+    return (last_dt or datetime.min, chat.get("last_message_time") or "")
+
+
+def _describe_attachments(msg: dict) -> list[str]:
+    """Сформировать короткое описание вложений (фото/файлы) для истории."""
+
+    if not isinstance(msg, dict):
+        return []
+    attachments = msg.get("attachments") or msg.get("files")
+    lines: list[str] = []
+    if isinstance(attachments, list):
+        for item in attachments:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name") or item.get("file_name") or item.get("filename") or "файл"
+            url = item.get("url") or item.get("link") or item.get("download_url")
+            label = f"📎 {name}"
+            if url:
+                label = f"{label} ({url})"
+            lines.append(label)
+    return lines
 
 
 async def _send_chats_list(
@@ -345,9 +612,17 @@ async def _send_chats_list(
     callback: CallbackQuery | None = None,
     bot: Bot | None = None,
     chat_id: int | None = None,
+    unread_only: bool | None = None,
+    refresh: bool = False,
 ) -> None:
+    data = await state.get_data()
+    unread_flag = bool(unread_only if unread_only is not None else data.get("chats_unread_only"))
+
+    cached_list = data.get("chats_all") if isinstance(data.get("chats_all"), list) else None
+    need_reload = refresh or not isinstance(cached_list, list) or not cached_list
+
     try:
-        items_raw = await chat_list(limit=CHAT_PAGE_SIZE, offset=max(page, 0) * CHAT_PAGE_SIZE)
+        items_raw = await chat_list(limit=CHAT_LIST_LIMIT, offset=0) if need_reload else cached_list or []
     except OzonAPIError as exc:
         target = callback.message if callback else message
         if target:
@@ -372,32 +647,71 @@ async def _send_chats_list(
         return
 
     sorted_items = sorted(items_raw, key=_chat_sort_key, reverse=True)
-    captions: list[tuple[str, str]] = []
     cache: dict[str, dict] = {}
     for chat in sorted_items:
-        chat_id_val, caption = _parse_chat_caption(chat)
+        cid = _safe_chat_id(chat)
+        if cid:
+            cache[cid] = chat if isinstance(chat, dict) else {}
+
+    filtered_items = [chat for chat in sorted_items if not unread_flag or _chat_unread_count(chat) > 0]
+    total_count = len(sorted_items)
+    unread_total = sum(1 for chat in sorted_items if _chat_unread_count(chat) > 0)
+    total_pages = max(1, math.ceil(max(1, len(filtered_items)) / CHAT_PAGE_SIZE))
+    safe_page = max(0, min(page, total_pages - 1))
+    start = safe_page * CHAT_PAGE_SIZE
+    end = start + CHAT_PAGE_SIZE
+    page_slice = filtered_items[start:end]
+
+    display_rows: list[str] = []
+    keyboard_items: list[tuple[str, str]] = []
+    for idx, chat in enumerate(page_slice, start=start + 1):
+        chat_id_val, title, short_title, unread_count, preview, last_dt = _chat_display(chat)
         if not chat_id_val:
             continue
-        captions.append((chat_id_val, caption))
-        cache[chat_id_val] = chat if isinstance(chat, dict) else {}
+        line_parts = [f"{idx}) {title}"]
+        if unread_count > 0:
+            line_parts.append(f"🔴 {unread_count} непрочитанных")
+        if last_dt:
+            line_parts.append(last_dt.strftime("%d.%m %H:%M"))
+        if preview:
+            line_parts.append(f"\"{preview}\"")
+        display_rows.append(" • ".join(line_parts))
+        keyboard_items.append((chat_id_val, f"{idx}. {short_title}"))
 
-    await state.update_data(chats_cache=cache, chats_page=page)
-    total_pages = page + 1 + (1 if len(sorted_items) >= CHAT_PAGE_SIZE else 0)
+    lines = [
+        "🗨️ Активные чаты с покупателями",
+    ]
+    lines.append(f"Всего чатов: {total_count}, непрочитанных: {unread_total}.")
+    lines.append(
+        "Показываю только диалоги с покупателями. Служебные уведомления и чаты с поддержкой Ozon скрыты."
+    )
+    lines.append("")
 
-    lines = ["💬 Активные чаты с покупателями:" ]
-    if not captions:
-        lines.append("Нет активных диалогов")
+    if not display_rows:
+        lines.append("Нет активных диалогов" if not unread_flag else "Нет непрочитанных диалогов")
     else:
-        for idx, (cid, caption) in enumerate(captions, start=1 + page * CHAT_PAGE_SIZE):
-            lines.append(f"{idx}. {caption}")
+        lines.extend(display_rows)
+    lines.append("")
+    lines.append(f"Стр. {safe_page + 1}/{total_pages}")
 
-    markup = chats_list_keyboard(items=captions, page=page, total_pages=total_pages)
+    markup = chats_list_keyboard(
+        items=keyboard_items,
+        page=safe_page,
+        total_pages=total_pages,
+        unread_only=unread_flag,
+    )
     target = callback.message if callback else message
     active_bot = bot or (target.bot if target else None)
     active_chat = chat_id or (target.chat.id if target else None)
     if not active_bot or active_chat is None:
         return
 
+    await state.update_data(
+        chats_cache=cache,
+        chats_page=safe_page,
+        chats_unread_only=unread_flag,
+        chats_all=sorted_items,
+    )
     sent = await send_section_message(
         SECTION_CHATS_LIST,
         text="\n".join(lines),
@@ -417,182 +731,103 @@ async def _send_chats_list(
     await delete_section_message(user_id, SECTION_CHAT_PROMPT, active_bot, force=True)
 
 
-def _format_chat_history_text(chat_meta: dict | None, messages: list[dict], *, limit: int = 20) -> str:
-    buyer = None
-    posting = None
+def _format_chat_history_text(chat_meta: dict | None, messages: list[dict], *, limit: int = 30) -> str:
+    buyer = _chat_buyer_name(chat_meta or {}) if isinstance(chat_meta, dict) else None
+    posting = _chat_posting(chat_meta or {}) if isinstance(chat_meta, dict) else None
+    product = None
     if isinstance(chat_meta, dict):
-        buyer = chat_meta.get("buyer_name") or chat_meta.get("client_name") or chat_meta.get("customer_name")
-        posting = chat_meta.get("posting_number") or chat_meta.get("order_id")
+        product = chat_meta.get("product_name") or chat_meta.get("product_title")
 
-    header_parts = ["💬 Чат с покупателем"]
+    lines = ["💬 Чат с покупателем"]
     if buyer:
-        header_parts.append(str(buyer))
+        lines.append(f"Покупатель: {buyer}")
     if posting:
-        header_parts.append(f"(заказ {posting})")
-    header = " ".join(header_parts)
+        lines.append(f"Заказ: {posting}")
+    if product:
+        lines.append(f"Товар: {product}")
 
-    lines = [header, ""]
-    if not messages:
-        lines.append("История чата пуста.")
-        return "\n".join(lines)
+    unread_count = _chat_unread_count(chat_meta or {}) if isinstance(chat_meta, dict) else 0
+    has_unread = bool(chat_meta.get("is_unread") or chat_meta.get("has_unread")) if isinstance(chat_meta, dict) else False
+    if unread_count > 0:
+        lines.append(f"🔴 Непрочитанных сообщений: {unread_count}")
+    elif has_unread:
+        lines.append("🔴 Непрочитанные сообщения есть")
+    else:
+        lines.append("Все сообщения прочитаны.")
 
-    recent = list(messages[-max(1, limit):])
+    lines.append("")
 
-    def _ts(msg: dict) -> str:
-        if not isinstance(msg, dict):
-            return ""
-        for key in ("created_at", "send_time"):
-            value = msg.get(key)
-            if isinstance(value, str):
-                return value
-        raw = msg.get("_raw")
-        if isinstance(raw, dict):
-            for key in ("created_at", "send_time"):
-                value = raw.get(key)
-                if isinstance(value, str):
-                    return value
-        return ""
-
-    def _extract_text(msg: dict) -> str | None:
-        PREFERRED_KEYS = (
-            "text",
-            "message",
-            "content",
-            "body",
-            "value",
-            "text_html",
-            "textHtml",
-        )
-
-        def _is_timestamp(s: str) -> bool:
-            return bool(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:", s.strip()))
-
-        def _pick_from_dict(d: dict) -> str | None:
-            for key in PREFERRED_KEYS:
-                if key not in d:
-                    continue
-                value = d.get(key)
-                if isinstance(value, str):
-                    value_str = value.strip()
-                    if value_str and not _is_timestamp(value_str):
-                        return value_str
-                if isinstance(value, dict):
-                    for k2 in PREFERRED_KEYS:
-                        inner = value.get(k2)
-                        if isinstance(inner, str):
-                            inner_str = inner.strip()
-                            if inner_str and not _is_timestamp(inner_str):
-                                return inner_str
-            # Спец-обработка сообщений Ozon, где текст лежит в массиве "data"
-            data_val = d.get("data")
-            if isinstance(data_val, list):
-                for item in data_val:
-                    if isinstance(item, str):
-                        s = item.strip()
-                        if s and not _is_timestamp(s):
-                            return s
-                    if isinstance(item, dict):
-                        nested = _pick_from_dict(item)
-                        if nested:
-                            return nested
-            return None
-
-        if not isinstance(msg, dict):
-            return None
-
-        direct = _pick_from_dict(msg)
-        if direct:
-            return direct
-
-        root = msg.get("_raw")
-        if not isinstance(root, (dict, list)):
-            return None
-
-        queue: list[object] = [root]
-        seen: set[int] = set()
-
-        while queue:
-            cur = queue.pop(0)
-            obj_id = id(cur)
-            if obj_id in seen:
-                continue
-            seen.add(obj_id)
-
-            if isinstance(cur, dict):
-                candidate = _pick_from_dict(cur)
-                if candidate:
-                    return candidate
-                for v in cur.values():
-                    if isinstance(v, (dict, list)):
-                        queue.append(v)
-            elif isinstance(cur, list):
-                for v in cur:
-                    if isinstance(v, (dict, list)):
-                        queue.append(v)
-
-        return None
-
-    recent.sort(key=_ts)
-
-    for msg in recent:
+    prepared: list[dict] = []
+    for msg in messages:
         if not isinstance(msg, dict):
             continue
+        text = _extract_text(msg)
+        attachments = _describe_attachments(msg)
+        if not text and not attachments:
+            continue
 
-        author_block = msg.get("author") if isinstance(msg.get("author"), dict) else None
-        role = None
-        if author_block:
-            role = (
-                author_block.get("role")
-                or author_block.get("type")
-                or author_block.get("name")
-                or author_block.get("author_type")
-            )
-        if not role:
-            role = (
-                msg.get("from")
-                or msg.get("sender")
-                or msg.get("author_type")
-                or msg.get("direction")
-            )
-        role_lower = str(role or "customer").lower()
+        role_lower = _detect_message_role(msg)
+        if "crm" in role_lower or "support" in role_lower:
+            # Сервисные сообщения не показываем, чтобы не шуметь
+            continue
+
         if "seller" in role_lower or "operator" in role_lower or "store" in role_lower:
-            author = "🏪 Продавец"
+            author = "🧑‍🏭 Вы"
+        elif "courier" in role_lower:
+            author = "🚚 Курьер"
         else:
             author = "👤 Покупатель"
 
-        dt_part = ""
         ts_value = _ts(msg)
-        if ts_value:
-            dt_part = f" ({ts_value[:16]})"
-
-        text = _extract_text(msg)
-        if not text:
-            continue
-
-        lines.append(f"{author}{dt_part}:\n{text}")
-
-    if len(lines) == 2 and recent:
-        sample = recent[-1]
-        raw = sample.get("_raw") or sample
-        if isinstance(raw, dict):
-            logger.info(
-                "No text found in chat history, sample message keys: %s, raw=%r",
-                list(raw.keys()),
-                raw,
-            )
+        ts_dt = _parse_ts(ts_value)
+        ts_label = None
+        if ts_dt:
+            ts_safe = ts_dt.astimezone(timezone.utc) if ts_dt.tzinfo else ts_dt
+            ts_label = ts_safe.strftime("%d.%m %H:%M")
+        elif ts_value:
+            ts_label = ts_value[:16]
         else:
-            logger.info(
-                "No text found in chat history, sample message type: %r, value=%r",
-                type(raw),
-                raw,
-            )
-    if len(lines) == 2:
-        lines.append("В этом чате нет текстовых сообщений.")
+            ts_label = ""
 
-    body = "\n\n".join(lines)
+        wrapped: list[str] = []
+        if text:
+            for line in str(text).splitlines() or [""]:
+                stripped = line.strip()
+                if not stripped:
+                    wrapped.append("")
+                    continue
+                wrapped.extend(textwrap.wrap(stripped, width=78) or [stripped])
+        wrapped.extend(attachments)
+
+        prepared.append(
+            {
+                "author": author,
+                "text_lines": wrapped,
+                "ts": ts_dt.astimezone(timezone.utc).replace(tzinfo=None) if ts_dt else None,
+                "ts_raw": ts_value or "",
+                "ts_label": ts_label or "",
+            }
+        )
+
+    if not prepared:
+        lines.append("История чата пуста или нет текстовых сообщений.")
+    else:
+        prepared.sort(key=lambda item: (item.get("ts") or datetime.min, item.get("ts_raw") or ""))
+        trimmed = prepared[-max(1, limit) :]
+        for item in trimmed:
+            ts_label = item.get("ts_label") or ""
+            author = item.get("author") or "👤 Покупатель"
+            lines.append(f"[{ts_label}] {author}:")
+            lines.extend(item.get("text_lines") or [])
+            lines.append("")
+
+    lines.append("─────────────")
+    lines.append("Используйте кнопки ниже, чтобы ответить покупателю или обновить чат.")
+
+    body = "\n".join(lines).strip()
     max_len = 3500
     if len(body) > max_len:
-        body = "…\n\n" + body[-max_len:]
+        body = "…\n" + body[-max_len:]
     return body
 
 
@@ -2111,9 +2346,35 @@ async def cb_chats_list(
 ) -> None:
     await callback.answer()
     user_id = callback.from_user.id
-    page = callback_data.page or 0
+    page = int(callback_data.page or 0)
+    data = await state.get_data()
+    unread_only = bool(data.get("chats_unread_only"))
     await state.clear()
-    await _send_chats_list(user_id=user_id, state=state, page=page, callback=callback)
+    await _send_chats_list(
+        user_id=user_id,
+        state=state,
+        page=page,
+        callback=callback,
+        unread_only=unread_only,
+        refresh=True,
+    )
+
+
+@router.callback_query(ChatsCallbackData.filter(F.action == "filter"))
+async def cb_chats_filter(
+    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
+) -> None:
+    await callback.answer()
+    data = await state.get_data()
+    current_flag = bool(data.get("chats_unread_only"))
+    page = int(callback_data.page or data.get("chats_page") or 0)
+    await _send_chats_list(
+        user_id=callback.from_user.id,
+        state=state,
+        page=int(page),
+        callback=callback,
+        unread_only=not current_flag,
+    )
 
 
 @router.callback_query(ChatsCallbackData.filter(F.action == "open"))
@@ -2137,6 +2398,26 @@ async def cb_open_chat(
         chat_id=chat_id,
         state=state,
         callback=callback,
+    )
+
+
+@router.callback_query(ChatsCallbackData.filter(F.action == "refresh"))
+async def cb_chat_refresh(
+    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
+) -> None:
+    chat_id = callback_data.chat_id
+    if not chat_id:
+        await callback.answer("Не удалось определить чат", show_alert=True)
+        return
+
+    await callback.answer()
+
+    await _open_chat_history(
+        user_id=callback.from_user.id,
+        chat_id=chat_id,
+        state=state,
+        callback=callback,
+        bot=callback.bot,
     )
 
 
@@ -2165,16 +2446,15 @@ def _split_messages_by_role(messages: list[dict]) -> tuple[list[str], list[str]]
     for msg in messages:
         if not isinstance(msg, dict):
             continue
-        text = msg.get("text") or msg.get("message") or msg.get("content")
+        text = _extract_text(msg)
         if not text:
             continue
-        author_block = msg.get("author") if isinstance(msg.get("author"), dict) else None
-        role = None
-        if author_block:
-            role = author_block.get("role") or author_block.get("type") or author_block.get("name")
-        if not role:
-            role = msg.get("from") or msg.get("sender")
-        role_lower = str(role or "customer").lower()
+
+        role_lower = _detect_message_role(msg)
+        if "crm" in role_lower or "support" in role_lower:
+            # Сервисные сообщения не используем в промптах
+            continue
+
         if "seller" in role_lower or "operator" in role_lower or "store" in role_lower:
             seller.append(str(text))
         else:
