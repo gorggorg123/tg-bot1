@@ -1106,6 +1106,16 @@ async def chat_list(*, limit: int = 10, offset: int = 0) -> list[dict]:
         if not isinstance(raw, dict):
             continue
         merged = _merge_nested_block(raw, "chat")
+        # Показываем только чаты "покупатель ↔ продавец", служебные пропускаем
+        chat_type = (
+            merged.get("chat_type")
+            or merged.get("chatType")
+            or merged.get("type")
+        )
+        chat_type_str = str(chat_type or "").lower()
+        if chat_type_str and "buyer_seller" not in chat_type_str:
+            logger.debug("Skip non buyer chat: %s", merged)
+            continue
         try:
             items.append(ChatSummary.model_validate(merged).to_dict())
         except ValidationError as exc:
