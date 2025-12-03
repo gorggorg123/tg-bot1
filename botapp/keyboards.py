@@ -758,8 +758,20 @@ def chat_actions_keyboard(chat_id: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="🔄 Обновить чат",
+                    callback_data=ChatsCallbackData(action="refresh", chat_id=chat_id).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="⬅️ К списку чатов",
                     callback_data=ChatsCallbackData(action="list", page=0).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ В главное меню",
+                    callback_data=MenuCallbackData(section="home", action="open").pack(),
                 )
             ],
         ]
