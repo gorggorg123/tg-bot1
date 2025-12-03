@@ -1043,78 +1043,111 @@ def _merge_nested_block(item: dict, key: str) -> dict:
     return item
 
 
-async def chat_list(*, limit: int = 10, offset: int = 0) -> list[dict]:
+async def chat_list(*, limit: int = 100, offset: int = 0) -> list[dict]:
+    """Получить список чатов продавца.
+
+    Увеличиваем лимит до 100 и при необходимости подгружаем несколько страниц,
+    чтобы показать максимум живых диалогов за 1–2 запроса к API.
+    Служебные чаты (support/system/crm/notification) отфильтровываются мягко:
+    если тип пустой или неизвестен, чат всё равно остаётся в выдаче.
+    """
+
     client = get_client()
-    body = {"limit": max(1, min(limit, 50)), "offset": max(0, offset), "filter": {}}
-    status_code, data = await client._post_with_status("/v3/chat/list", body)
-    if status_code >= 400 or not isinstance(data, dict):
-        message = None
-        if isinstance(data, dict):
-            message = data.get("message") or data.get("error")
-            if data.get("code") == 9:
-                logger.warning("Ozon chat list method is obsolete; check API version update")
-        raise OzonAPIError(
-            f"Ошибка Ozon API при получении списка чатов: HTTP {status_code} {message or data}"
+    max_limit = max(1, min(limit or 100, 100))
+    offset_cur = max(0, offset)
+    remaining = max_limit
+    items_raw: list[dict] = []
+
+    while remaining > 0:
+        page_limit = min(50, remaining)
+        body = {"limit": page_limit, "offset": offset_cur, "filter": {}}
+        status_code, data = await client._post_with_status("/v3/chat/list", body)
+        if status_code >= 400 or not isinstance(data, dict):
+            message = None
+            if isinstance(data, dict):
+                message = data.get("message") or data.get("error")
+                if data.get("code") == 9:
+                    logger.warning("Ozon chat list method is obsolete; check API version update")
+            raise OzonAPIError(
+                f"Ошибка Ozon API при получении списка чатов: HTTP {status_code} {message or data}"
+            )
+
+        payload = data.get("result") if isinstance(data.get("result"), dict) else data
+        data_keys = list(data.keys()) if isinstance(data, dict) else []
+        payload_keys = list(payload.keys()) if isinstance(payload, dict) else []
+        logger.debug(
+            "chat_list payload received: status=%s data_keys=%s payload_type=%s payload_keys=%s",
+            status_code,
+            data_keys,
+            type(payload).__name__,
+            payload_keys,
         )
 
-    payload = data.get("result") if isinstance(data.get("result"), dict) else data
-    data_keys = list(data.keys()) if isinstance(data, dict) else []
-    payload_keys = list(payload.keys()) if isinstance(payload, dict) else []
-    logger.debug(
-        "chat_list payload received: status=%s data_keys=%s payload_type=%s payload_keys=%s",
-        status_code,
-        data_keys,
-        type(payload).__name__,
-        payload_keys,
-    )
+        def _log_validation_error(exc: ValidationError) -> None:
+            logger.warning("Failed to parse chat list payload: %s", exc)
+            try:
+                preview = str(payload)
+                if len(preview) > 500:
+                    preview = preview[:500] + "..."
+                logger.warning("Chat list payload preview: %s", preview)
+            except Exception:
+                logger.warning("Unable to render chat list payload preview")
 
-    def _log_validation_error(exc: ValidationError) -> None:
-        logger.warning("Failed to parse chat list payload: %s", exc)
+        page_raw: list[dict] = []
         try:
-            preview = str(payload)
-            if len(preview) > 500:
-                preview = preview[:500] + "..."
-            logger.warning("Chat list payload preview: %s", preview)
-        except Exception:
-            logger.warning("Unable to render chat list payload preview")
+            parsed = ChatListResponse.model_validate(payload)
+            page_raw = list(parsed.iter_items())
+        except ValidationError as exc:
+            _log_validation_error(exc)
 
-    items_raw: list[dict] = []
-    try:
-        parsed = ChatListResponse.model_validate(payload)
-        items_raw = list(parsed.iter_items())
-    except ValidationError as exc:
-        _log_validation_error(exc)
+        if not page_raw:
+            if isinstance(payload, dict):
+                for key in ("chats", "chat_list", "items"):
+                    maybe = payload.get(key)
+                    if isinstance(maybe, list):
+                        page_raw = maybe
+                        break
+                if not page_raw and isinstance(payload.get("result"), list):
+                    page_raw = payload.get("result")
+            elif isinstance(payload, list):
+                page_raw = payload
 
-    if not items_raw:
+        if not isinstance(page_raw, list):
+            logger.warning("Unexpected chat list payload structure: %s", type(page_raw).__name__)
+            break
+
+        items_raw.extend(page_raw)
+
+        has_next = False
         if isinstance(payload, dict):
-            for key in ("chats", "chat_list", "items"):
-                maybe = payload.get(key)
-                if isinstance(maybe, list):
-                    items_raw = maybe
-                    break
-            if not items_raw and isinstance(payload.get("result"), list):
-                items_raw = payload.get("result")
-        elif isinstance(payload, list):
-            items_raw = payload
+            has_next = bool(
+                payload.get("has_next")
+                or payload.get("hasNext")
+                or payload.get("has_more")
+                or payload.get("hasMore")
+            )
+            total = payload.get("total") or payload.get("total_count")
+            if isinstance(total, int) and total > 0:
+                has_next = has_next or offset_cur + len(page_raw) < total
 
-    if not isinstance(items_raw, list):
-        logger.warning("Unexpected chat list payload structure: %s", type(items_raw).__name__)
-        return []
+        remaining -= len(page_raw)
+        offset_cur += len(page_raw) or page_limit
+        if not has_next or len(page_raw) < page_limit or remaining <= 0:
+            break
 
     items: list[dict] = []
     for raw in items_raw:
         if not isinstance(raw, dict):
             continue
         merged = _merge_nested_block(raw, "chat")
-        # Показываем только чаты "покупатель ↔ продавец", служебные пропускаем
         chat_type = (
             merged.get("chat_type")
             or merged.get("chatType")
             or merged.get("type")
         )
         chat_type_str = str(chat_type or "").lower()
-        if chat_type_str and "buyer_seller" not in chat_type_str:
-            logger.debug("Skip non buyer chat: %s", merged)
+        if any(bad in chat_type_str for bad in ("support", "system", "notification", "crm")):
+            logger.debug("Skip service chat (%s): %s", chat_type_str or "empty", merged)
             continue
         try:
             items.append(ChatSummary.model_validate(merged).to_dict())
