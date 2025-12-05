@@ -58,6 +58,11 @@ class ChatsCallbackData(CallbackData, prefix="chats"):
     action: str
     chat_id: Optional[str] = None
     page: Optional[int] = None
+    
+
+class WarehouseCallbackData(CallbackData, prefix="warehouse"):
+    action: str
+    posting_number: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +124,15 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="🏬 Склад",
+                    callback_data=MenuCallbackData(
+                        section="warehouse",
+                        action="open",
+                    ).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="⚙️ Аккаунт Ozon",
                     callback_data=MenuCallbackData(
                         section="account",
@@ -144,6 +158,74 @@ def back_home_keyboard() -> InlineKeyboardMarkup:
                     ).pack(),
                 )
             ]
+        ]
+    )
+
+
+def warehouse_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📥 Приёмка",
+                    callback_data=WarehouseCallbackData(action="receive").pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📦 Отбор под заказ",
+                    callback_data=WarehouseCallbackData(action="pick").pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✅ Инвентаризация",
+                    callback_data=WarehouseCallbackData(action="inventory").pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⚠️ Риск остатков",
+                    callback_data=WarehouseCallbackData(action="risk").pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💡 Спросить ИИ",
+                    callback_data=WarehouseCallbackData(action="ask_ai").pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅ В меню",
+                    callback_data=MenuCallbackData(
+                        section="home", action="open"
+                    ).pack(),
+                )
+            ],
+        ]
+    )
+
+
+def pick_plan_keyboard(posting_number: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Отбор завершён",
+                    callback_data=WarehouseCallbackData(
+                        action="pick_confirm", posting_number=posting_number
+                    ).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data=WarehouseCallbackData(
+                        action="pick_cancel", posting_number=posting_number
+                    ).pack(),
+                )
+            ],
         ]
     )
 

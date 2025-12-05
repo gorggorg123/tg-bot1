@@ -46,6 +46,7 @@ from botapp.ai_client import (
     generate_answer_for_question,
 )
 from botapp.chats import router as chats_router
+from botapp.warehouse import router as warehouse_router
 from botapp.reviews import (
     ReviewCard,
     format_review_card_text,
@@ -90,6 +91,9 @@ from botapp.message_gc import (
     SECTION_CHAT_HISTORY,
     SECTION_CHATS_LIST,
     SECTION_CHAT_PROMPT,
+    SECTION_WAREHOUSE_MENU,
+    SECTION_WAREHOUSE_PLAN,
+    SECTION_WAREHOUSE_PROMPT,
     delete_message_safe,
     delete_section_message,
     send_section_message,
@@ -298,6 +302,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
             SECTION_CHATS_LIST,
             SECTION_CHAT_HISTORY,
             SECTION_CHAT_PROMPT,
+            SECTION_WAREHOUSE_MENU,
+            SECTION_WAREHOUSE_PLAN,
+            SECTION_WAREHOUSE_PROMPT,
         ],
         force=True,
     )
@@ -328,6 +335,9 @@ async def cmd_fin_today(message: Message, state: FSMContext) -> None:
             SECTION_CHATS_LIST,
             SECTION_CHAT_HISTORY,
             SECTION_CHAT_PROMPT,
+            SECTION_WAREHOUSE_MENU,
+            SECTION_WAREHOUSE_PLAN,
+            SECTION_WAREHOUSE_PROMPT,
         ],
         force=True,
     )
@@ -358,6 +368,9 @@ async def cmd_account(message: Message, state: FSMContext) -> None:
             SECTION_CHATS_LIST,
             SECTION_CHAT_HISTORY,
             SECTION_CHAT_PROMPT,
+            SECTION_WAREHOUSE_MENU,
+            SECTION_WAREHOUSE_PLAN,
+            SECTION_WAREHOUSE_PROMPT,
         ],
         force=True,
     )
@@ -388,6 +401,9 @@ async def cmd_fbo(message: Message, state: FSMContext) -> None:
             SECTION_CHATS_LIST,
             SECTION_CHAT_HISTORY,
             SECTION_CHAT_PROMPT,
+            SECTION_WAREHOUSE_MENU,
+            SECTION_WAREHOUSE_PLAN,
+            SECTION_WAREHOUSE_PROMPT,
         ],
         force=True,
     )
@@ -669,6 +685,9 @@ async def cb_home(
             SECTION_CHATS_LIST,
             SECTION_CHAT_HISTORY,
             SECTION_CHAT_PROMPT,
+            SECTION_WAREHOUSE_MENU,
+            SECTION_WAREHOUSE_PLAN,
+            SECTION_WAREHOUSE_PROMPT,
         ],
         force=True,
     )
@@ -1670,6 +1689,7 @@ async def handle_any(message: Message, state: FSMContext) -> None:
 def build_dispatcher() -> Dispatcher:
     dp = Dispatcher()
     dp.include_router(chats_router)
+    dp.include_router(warehouse_router)
     dp.include_router(router)
     return dp
 
