@@ -1259,6 +1259,58 @@ async def chat_send_message(chat_id: str, text: str) -> None:
         raise OzonAPIError("Ozon отклонил отправку сообщения в чат")
 
 
+async def get_posting_products(posting_number: str) -> list[str]:
+    """Fetch product titles for a posting number using Ozon API.
+
+    The helper is resilient to schema changes and returns an empty list on errors.
+    """
+
+    posting = (posting_number or "").strip()
+    if not posting:
+        return []
+
+    client = get_client()
+    body = {"posting_number": posting}
+    try:
+        status_code, data = await client._post_with_status("/v3/posting/fbs/get", body)
+    except Exception as exc:  # pragma: no cover - network/safety
+        logger.warning("Failed to load posting %s products: %s", posting, exc)
+        return []
+
+    if status_code >= 400 or not isinstance(data, (dict, list)):
+        logger.warning("Unexpected response for posting %s: %s", posting, data)
+        return []
+
+    payload = data.get("result") if isinstance(data, dict) else data
+
+    def _extract_products(container: dict | list | None) -> list[dict]:
+        if isinstance(container, list):
+            return [item for item in container if isinstance(item, dict)]
+        if isinstance(container, dict):
+            for key in ("products", "items"):
+                maybe = container.get(key)
+                if isinstance(maybe, list):
+                    return [item for item in maybe if isinstance(item, dict)]
+        return []
+
+    buckets: list[list[dict]] = []
+    if isinstance(payload, dict):
+        buckets.append(_extract_products(payload.get("posting") if isinstance(payload.get("posting"), dict) else payload))
+        buckets.append(_extract_products(payload.get("result") if isinstance(payload.get("result"), dict) else None))
+        buckets.append(_extract_products(payload))
+    elif isinstance(payload, list):
+        buckets.append(_extract_products(payload[0] if payload else None))
+
+    names: list[str] = []
+    for bucket in buckets:
+        for item in bucket:
+            name = item.get("name") or item.get("product_name") or item.get("offer_name")
+            if name:
+                names.append(str(name))
+
+    return names
+
+
 async def chat_start(posting_number: str) -> dict | None:
     client = get_write_client()
     if client is None:
