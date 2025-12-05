@@ -11,4 +11,14 @@ class ChatStates(StatesGroup):
     waiting_ai_confirm = State()
 
 
-__all__ = ["QuestionAnswerStates", "ChatStates"]
+class WarehouseStates(StatesGroup):
+    receive_product = State()
+    receive_quantity = State()
+    receive_location = State()
+    pick_posting_number = State()
+    inventory_wait_box = State()
+    inventory_wait_count = State()
+    ask_ai_question = State()
+
+
+__all__ = ["QuestionAnswerStates", "ChatStates", "WarehouseStates"]
