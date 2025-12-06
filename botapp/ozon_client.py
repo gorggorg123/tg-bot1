@@ -1116,26 +1116,36 @@ class OzonClient:
             )
 
         result = data.get("result") if isinstance(data, dict) else None
-        barcodes = result.get("barcodes") if isinstance(result, dict) else None
 
         parsed: list[str] = []
-        if isinstance(barcodes, list):
-            for entry in barcodes:
-                if isinstance(entry, str):
-                    parsed.append(entry)
-                elif isinstance(entry, dict):
-                    if entry.get("barcode"):
-                        parsed.append(str(entry["barcode"]))
-                    nested = entry.get("barcodes")
-                    if isinstance(nested, list):
-                        parsed.extend(str(val) for val in nested if val)
 
-        if not parsed and isinstance(result, dict):
-            fallback = result.get("barcodes_to_link")
-            if isinstance(fallback, list):
-                for entry in fallback:
-                    if isinstance(entry, dict) and entry.get("barcode"):
-                        parsed.append(str(entry["barcode"]))
+        def _collect(entry: Any) -> None:
+            if isinstance(entry, str):
+                parsed.append(entry)
+            elif isinstance(entry, dict):
+                if entry.get("barcode"):
+                    parsed.append(str(entry["barcode"]))
+                nested = entry.get("barcodes")
+                if isinstance(nested, list):
+                    for val in nested:
+                        if val:
+                            parsed.append(str(val))
+
+        if isinstance(result, dict):
+            barcodes = result.get("barcodes")
+            if isinstance(barcodes, list):
+                for entry in barcodes:
+                    _collect(entry)
+
+            if not parsed:
+                fallback = result.get("barcodes_to_link")
+                if isinstance(fallback, list):
+                    for entry in fallback:
+                        _collect(entry)
+
+        elif isinstance(result, list):
+            for item in result:
+                _collect(item)
 
         return parsed
 
