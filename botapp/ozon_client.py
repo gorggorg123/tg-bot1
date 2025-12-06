@@ -5,7 +5,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 from urllib.parse import urlparse, unquote
 
 import httpx
@@ -30,6 +30,8 @@ _product_not_found_warned: set[str] = set()
 _product_info_miss_cache: set[str] = set()
 _analytics_forbidden: bool = False
 _analytics_forbidden_logged: bool = False
+_stock_not_found_warned: set[str] = set()
+_product_list_warned: bool = False
 
 
 class QuestionItem(BaseModel):
@@ -896,6 +898,286 @@ class OzonClient:
     # back-compat
     get_account_info = get_seller_info
 
+    async def get_product_stocks(
+        self,
+        *,
+        offer_id: str | None = None,
+        sku: int | None = None,
+        product_id: str | None = None,
+    ) -> ProductStockInfo | None:
+        """Fetch stock info for a single product via /v4/product/info/stocks."""
+
+        body: Dict[str, Any] = {"filter": {}, "limit": 1}
+        if offer_id:
+            body["offer_id"] = [offer_id]
+            body["filter"]["offer_id"] = [offer_id]
+        if sku:
+            body["sku"] = [sku]
+            body["filter"]["sku"] = [sku]
+        if product_id:
+            body["product_id"] = [product_id]
+            body["filter"]["product_id"] = [product_id]
+
+        status_code, data = await self._post_with_status("/v4/product/info/stocks", body)
+        if status_code >= 400 or not isinstance(data, dict):
+            message = None
+            if isinstance(data, dict):
+                message = data.get("message") or data.get("error")
+            raise OzonAPIError(
+                f"Ошибка Ozon API при получении остатков: HTTP {status_code} {message or data}"
+            )
+
+        payload = data.get("result") if isinstance(data.get("result"), list) else data.get("result") or data
+        items = payload if isinstance(payload, list) else payload.get("items") if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            items = []
+
+        parsed: list[ProductStockInfo] = []
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                parsed.append(ProductStockInfo.model_validate(raw))
+            except ValidationError as exc:
+                logger.warning("Failed to parse product stock payload: %s", exc)
+                continue
+
+        if not parsed:
+            lookup_key = offer_id or str(sku or product_id)
+            if lookup_key and lookup_key not in _stock_not_found_warned:
+                logger.warning("No stock info returned for %s", lookup_key)
+                _stock_not_found_warned.add(lookup_key)
+            return None
+
+        return parsed[0]
+
+    async def get_product_stocks_by_warehouse_fbs(
+        self, *, offer_id: str | None = None, sku: int | None = None
+    ) -> list[StockItem]:
+        """Fetch FBS stocks by warehouse via /v1/product/info/stocks-by-warehouse/fbs."""
+
+        body: Dict[str, Any] = {"limit": 100, "offset": 0}
+        if offer_id:
+            body["offer_id"] = [offer_id]
+        if sku:
+            body["sku"] = [sku]
+
+        status_code, data = await self._post_with_status(
+            "/v1/product/info/stocks-by-warehouse/fbs", body
+        )
+        if status_code >= 400 or not isinstance(data, dict):
+            message = None
+            if isinstance(data, dict):
+                message = data.get("message") or data.get("error")
+            raise OzonAPIError(
+                f"Ошибка Ozon API при получении остатков по складам: HTTP {status_code} {message or data}"
+            )
+
+        payload = data.get("result") if isinstance(data.get("result"), dict) else data
+        items = payload.get("items") if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            items = []
+
+        stocks: list[StockItem] = []
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                stocks.append(StockItem.model_validate(raw))
+            except ValidationError as exc:
+                logger.warning("Failed to parse warehouse stock payload: %s", exc)
+                continue
+        return stocks
+
+    async def list_products(
+        self,
+        *,
+        limit: int = 100,
+        last_id: str | None = None,
+        visibility: str = "ALL",
+        offer_ids: Iterable[str] | None = None,
+        product_ids: Iterable[int] | None = None,
+    ) -> ProductListPage:
+        filter_: dict[str, Any] = {"visibility": visibility}
+        if offer_ids:
+            filter_["offer_id"] = list(offer_ids)
+        if product_ids:
+            filter_["product_id"] = list(product_ids)
+
+        body: Dict[str, Any] = {
+            "filter": filter_,
+            "limit": limit,
+            "last_id": last_id or "",
+        }
+
+        status_code, data = await self._post_with_status("/v3/product/list", body)
+        if status_code >= 400:
+            raise OzonAPIError(f"Product list failed with HTTP {status_code}: {data}")
+
+        items_raw = []
+        result = data.get("result") if isinstance(data, dict) else None
+        if isinstance(result, dict):
+            items_raw = result.get("items") if isinstance(result.get("items"), list) else []
+            last_id_val = result.get("last_id") if isinstance(result.get("last_id"), str) else None
+        elif isinstance(data, dict):
+            items_raw = data.get("items") if isinstance(data.get("items"), list) else []
+            last_id_val = data.get("last_id") if isinstance(data.get("last_id"), str) else None
+        else:
+            last_id_val = None
+
+        items: list[ProductListItem] = []
+        for raw in items_raw:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                items.append(ProductListItem.model_validate(raw))
+            except ValidationError as exc:
+                logger.warning("Failed to parse product list item: %s", exc)
+                continue
+
+        if not items and not _product_list_warned:
+            logger.warning("Product list returned no items")
+            globals()["_product_list_warned"] = True
+
+        return ProductListPage(items=items, last_id=last_id_val)
+
+    async def product_info_list(
+        self,
+        *,
+        product_ids: Sequence[int | str] | None = None,
+        offer_ids: Sequence[str] | None = None,
+        skus: Sequence[int | str] | None = None,
+    ) -> list[ProductInfoItem]:
+        """Wrapper for /v3/product/info/list.
+
+        Exactly one identifier group must be provided.
+        """
+
+        has_product_ids = bool(product_ids)
+        has_offer_ids = bool(offer_ids)
+        has_skus = bool(skus)
+
+        if (has_product_ids + has_offer_ids + has_skus) != 1:
+            raise ValueError("Provide exactly one of product_ids, offer_ids or skus")
+
+        if has_product_ids:
+            body: Dict[str, Any] = {
+                "product_id": [str(pid) for pid in product_ids]
+            }
+        elif has_offer_ids:
+            body = {"offer_id": list(offer_ids)}
+        else:
+            body = {"sku": [str(s) for s in skus]}
+
+        status_code, data = await self._post_with_status("/v3/product/info/list", body)
+        if status_code >= 400:
+            raise OzonAPIError(
+                f"Product info list failed with HTTP {status_code}: {data}"
+            )
+
+        payload = data.get("result") if isinstance(data, dict) else None
+        items_raw = []
+        if isinstance(payload, list):
+            items_raw = payload
+        elif isinstance(payload, dict):
+            items_raw = payload.get("items") if isinstance(payload.get("items"), list) else []
+
+        items: list[ProductInfoItem] = []
+        for raw in items_raw:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                items.append(ProductInfoItem.model_validate(raw))
+            except ValidationError as exc:
+                logger.warning("Failed to parse product info list item: %s", exc)
+                continue
+        return items
+
+    async def get_product_info_list(
+        self,
+        *,
+        product_ids: Sequence[int | str] | None = None,
+        offer_ids: Sequence[str] | None = None,
+        skus: Sequence[int | str] | None = None,
+    ) -> list[ProductInfoItem]:
+        return await self.product_info_list(
+            product_ids=product_ids, offer_ids=offer_ids, skus=skus
+        )
+
+    async def generate_barcodes(self, product_ids: list[int]) -> list[str]:
+        if not product_ids:
+            raise ValueError("generate_barcodes: product_ids must not be empty")
+
+        body: Dict[str, Any] = {"product_ids": product_ids}
+        status_code, data = await self._post_with_status("/v1/barcode/generate", body)
+        if status_code >= 400:
+            raise OzonAPIError(
+                f"Barcode generation failed with HTTP {status_code}: {data}"
+            )
+
+        result = data.get("result") if isinstance(data, dict) else None
+        barcodes = result.get("barcodes") if isinstance(result, dict) else None
+        if isinstance(barcodes, list):
+            return [str(code) for code in barcodes if code]
+        return []
+
+    async def add_barcode(self, offer_id: str, barcode: str) -> bool:
+        body: Dict[str, Any] = {"offer_id": offer_id, "barcodes": [barcode]}
+        status_code, data = await self._post_with_status("/v1/barcode/add", body)
+        if status_code >= 400:
+            logger.warning("Failed to attach barcode %s to %s: %s", barcode, offer_id, data)
+            return False
+        return True
+
+
+class StockItem(BaseModel):
+    """Normalized stock info for a product on a warehouse or by type."""
+
+    type: str | None = None
+    warehouse_id: str | None = None
+    present: int = 0
+    reserved: int = 0
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+
+class ProductStockInfo(BaseModel):
+    product_id: str | None = None
+    offer_id: str | None = None
+    sku: int | None = None
+    stocks: list[StockItem] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+
+class ProductListItem(BaseModel):
+    product_id: int | None = None
+    offer_id: str | None = None
+    name: str | None = None
+    sku: int | None = None
+    visibility: str | None = None
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+
+class ProductListPage(BaseModel):
+    items: list[ProductListItem] = Field(default_factory=list)
+    last_id: str | None = None
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+
+class ProductInfoItem(BaseModel):
+    product_id: str | None = None
+    offer_id: str | None = None
+    sku: int | None = None
+    name: str | None = None
+    barcode: str | None = None
+    barcodes: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+
 
 _client_read: OzonClient | None = None
 
@@ -1257,6 +1539,92 @@ async def chat_send_message(chat_id: str, text: str) -> None:
         )
     if isinstance(data, dict) and data.get("result") is False:
         raise OzonAPIError("Ozon отклонил отправку сообщения в чат")
+
+
+async def get_posting_products(posting_number: str) -> list[str]:
+    """Fetch product titles for a posting number using Ozon API.
+
+    The helper is resilient to schema changes and returns an empty list on errors.
+    """
+
+    posting = (posting_number or "").strip()
+    if not posting:
+        return []
+
+    client = get_client()
+    body = {"posting_number": posting}
+    try:
+        status_code, data = await client._post_with_status("/v3/posting/fbs/get", body)
+    except Exception as exc:  # pragma: no cover - network/safety
+        logger.warning("Failed to load posting %s products: %s", posting, exc)
+        return []
+
+    if status_code >= 400 or not isinstance(data, (dict, list)):
+        logger.warning("Unexpected response for posting %s: %s", posting, data)
+        return []
+
+    payload = data.get("result") if isinstance(data, dict) else data
+
+    def _extract_products(container: dict | list | None) -> list[dict]:
+        if isinstance(container, list):
+            return [item for item in container if isinstance(item, dict)]
+        if isinstance(container, dict):
+            for key in ("products", "items"):
+                maybe = container.get(key)
+                if isinstance(maybe, list):
+                    return [item for item in maybe if isinstance(item, dict)]
+        return []
+
+    buckets: list[list[dict]] = []
+    if isinstance(payload, dict):
+        buckets.append(_extract_products(payload.get("posting") if isinstance(payload.get("posting"), dict) else payload))
+        buckets.append(_extract_products(payload.get("result") if isinstance(payload.get("result"), dict) else None))
+        buckets.append(_extract_products(payload))
+    elif isinstance(payload, list):
+        buckets.append(_extract_products(payload[0] if payload else None))
+
+    names: list[str] = []
+    for bucket in buckets:
+        for item in bucket:
+            name = item.get("name") or item.get("product_name") or item.get("offer_name")
+            if name:
+                names.append(str(name))
+
+    return names
+
+
+async def get_posting_details(posting_number: str) -> tuple[dict | None, str | None]:
+    """Fetch posting details trying FBS first then FBO.
+
+    Returns a tuple of (payload, schema) where schema is ``"fbs"`` or ``"fbo"``
+    depending on which endpoint returned data.
+    """
+
+    posting = (posting_number or "").strip()
+    if not posting:
+        return None, None
+
+    client = get_client()
+    for path, schema in (("/v3/posting/fbs/get", "fbs"), ("/v2/posting/fbo/get", "fbo")):
+        try:
+            status_code, data = await client._post_with_status(path, {"posting_number": posting})
+        except Exception as exc:  # pragma: no cover - network/safety
+            logger.warning("Failed to load posting %s via %s: %s", posting, path, exc)
+            continue
+
+        if status_code >= 400 or not isinstance(data, (dict, list)):
+            continue
+
+        payload = data.get("result") if isinstance(data, dict) else data
+        if isinstance(payload, dict):
+            return payload, schema
+        if isinstance(payload, list) and payload:
+            maybe = payload[0]
+            if isinstance(maybe, dict):
+                return maybe, schema
+
+    logger.warning("Posting %s not found via FBS/FBO endpoints", posting)
+    return None, None
 
 
 async def chat_start(posting_number: str) -> dict | None:
