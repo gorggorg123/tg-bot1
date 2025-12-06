@@ -1117,9 +1117,27 @@ class OzonClient:
 
         result = data.get("result") if isinstance(data, dict) else None
         barcodes = result.get("barcodes") if isinstance(result, dict) else None
+
+        parsed: list[str] = []
         if isinstance(barcodes, list):
-            return [str(code) for code in barcodes if code]
-        return []
+            for entry in barcodes:
+                if isinstance(entry, str):
+                    parsed.append(entry)
+                elif isinstance(entry, dict):
+                    if entry.get("barcode"):
+                        parsed.append(str(entry["barcode"]))
+                    nested = entry.get("barcodes")
+                    if isinstance(nested, list):
+                        parsed.extend(str(val) for val in nested if val)
+
+        if not parsed and isinstance(result, dict):
+            fallback = result.get("barcodes_to_link")
+            if isinstance(fallback, list):
+                for entry in fallback:
+                    if isinstance(entry, dict) and entry.get("barcode"):
+                        parsed.append(str(entry["barcode"]))
+
+        return parsed
 
     async def add_barcode(self, offer_id: str, barcode: str) -> bool:
         body: Dict[str, Any] = {"offer_id": offer_id, "barcodes": [barcode]}
