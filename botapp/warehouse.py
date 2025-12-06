@@ -8,7 +8,7 @@ from typing import Any, Dict
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InputFile, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from botapp.keyboards import (
     MenuCallbackData,
@@ -49,7 +49,7 @@ from botapp.warehouse_models import (
     generate_movement_id,
 )
 from botapp.warehouse_ai import parse_production_text_to_items
-from botapp.labels import generate_barcodes_pdf
+from botapp.warehouse_labels import build_labels_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -355,53 +355,6 @@ async def handle_receive_quantity(message: Message, state: FSMContext) -> None:
     )
 
 
-async def _ensure_barcode(product: CatalogProduct) -> str | None:
-    if product.barcode:
-        return product.barcode
-
-    client = get_client()
-    try:
-        if product.ozon_product_id is not None:
-            info_list = await client.get_product_info_list(
-                product_ids=[product.ozon_product_id]
-            )
-        elif product.sku:
-            info_list = await client.get_product_info_list(offer_ids=[product.sku])
-        elif product.ozon_sku is not None:
-            info_list = await client.get_product_info_list(skus=[product.ozon_sku])
-        else:
-            info_list = []
-
-        info = next(iter(info_list), None)
-        if info:
-            barcode = info.barcode or next((b for b in info.barcodes if b), None)
-            if barcode:
-                product.barcode = barcode
-                await update_barcode_in_cache(product.sku, barcode)
-                return barcode
-    except Exception as exc:
-        logger.info("Failed to refresh product info for barcode: %s", exc)
-
-    try:
-        if product.ozon_product_id is None:
-            raise ValueError("Missing ozon_product_id for barcode generation")
-        barcodes = await client.generate_barcodes(
-            product_ids=[product.ozon_product_id]
-        )
-        barcode = barcodes[0] if barcodes else None
-        if barcode:
-            product.barcode = barcode
-            await update_barcode_in_cache(product.sku, barcode)
-            try:
-                await client.add_barcode(product.sku, barcode)
-            except Exception:
-                logger.info("Could not attach barcode %s to offer %s", barcode, product.sku)
-        return barcode
-    except Exception as exc:
-        logger.warning("Barcode generation failed: %s", exc)
-        return None
-
-
 def _catalog_to_product(item: CatalogProduct) -> Product:
     return Product(
         sku=item.sku,
@@ -456,25 +409,66 @@ async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbac
     total = STORE.total_quantity(stored_product.sku)
 
     if callback_data.action == "labels_yes":
-        barcode = await _ensure_barcode(product)
-        if not barcode:
+        client = get_client()
+
+        if product.ozon_product_id is not None:
+            try:
+                info_list = await client.get_product_info_list(
+                    product_ids=[product.ozon_product_id]
+                )
+                info = next(iter(info_list), None)
+                if info:
+                    barcode_value = info.barcode or next(
+                        (b for b in info.barcodes if b), None
+                    )
+                    if barcode_value:
+                        product.barcode = barcode_value
+                        await update_barcode_in_cache(product.sku, barcode_value)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to refresh product info for barcode: %s", exc)
+
+        if not product.barcode and product.ozon_product_id is not None:
+            try:
+                barcodes = await client.generate_barcodes(
+                    product_ids=[product.ozon_product_id]
+                )
+                barcode_value = barcodes[0] if barcodes else None
+                if barcode_value:
+                    product.barcode = barcode_value
+                    await update_barcode_in_cache(product.sku, barcode_value)
+                    try:
+                        await client.add_barcode(product.sku, barcode_value)
+                    except Exception:  # noqa: BLE001
+                        logger.info(
+                            "Could not attach barcode %s to offer %s",
+                            barcode_value,
+                            product.sku,
+                        )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Barcode generation failed: %s", exc)
+
+        if not product.barcode:
             await send_ephemeral_message(
                 callback,
                 text="Не удалось получить штрихкод, записали количество без файла.",
             )
         else:
-            product.barcode = barcode
-            pdf_path = await generate_barcodes_pdf(product, int(qty))
             try:
-                await callback.message.answer_document(
-                    InputFile(path=pdf_path),
-                    caption=f"Этикетки для {product.name}",
+                pdf_bytes = await build_labels_pdf(product, int(qty))
+                file = BufferedInputFile(
+                    pdf_bytes,
+                    filename=f"labels_{product.sku}_{qty}.pdf",
                 )
-            finally:
-                try:
-                    pdf_path.unlink()
-                except Exception:
-                    pass
+                await callback.message.answer_document(
+                    file,
+                    caption=f"Этикетки для {product.name} × {qty}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to build/send labels file: %s", exc)
+                await send_ephemeral_message(
+                    callback,
+                    text="Записал количество, но не смог сформировать файл этикеток.",
+                )
 
     await state.clear()
     await send_section_message(
