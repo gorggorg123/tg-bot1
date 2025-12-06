@@ -12,9 +12,12 @@ class ChatStates(StatesGroup):
 
 
 class WarehouseStates(StatesGroup):
-    receive_product = State()
-    receive_quantity = State()
-    receive_location = State()
+    receive_product_manual = State()
+    receive_search_name = State()
+    receive_search_sku = State()
+    receive_quantity_manual = State()
+    receive_ai_text = State()
+    receive_ai_confirm = State()
     pick_posting_number = State()
     inventory_wait_box = State()
     inventory_wait_count = State()

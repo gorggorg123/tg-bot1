@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class Product(BaseModel):
@@ -35,13 +35,19 @@ class Location(BaseModel):
     name: str | None = None
 
 
+def default_shop_location() -> Location:
+    """Return a default non-address storage location for the workshop."""
+
+    return Location(id="SHOP", name="Цех")
+
+
 class Box(BaseModel):
     """Physical box/bin/pallet on the warehouse that contains items of a single product."""
 
     id: str
     product: Product
     quantity: int
-    location: Location
+    location: Location = Field(default_factory=default_shop_location)
     created_at: datetime | None = None
     last_inventory_at: datetime | None = None
 
@@ -133,6 +139,7 @@ __all__ = [
     "ProductRepository",
     "BoxRepository",
     "MovementRepository",
+    "default_shop_location",
     "generate_box_id",
     "generate_movement_id",
     "sum_local_quantity",

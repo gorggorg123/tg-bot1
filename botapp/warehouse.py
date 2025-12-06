@@ -8,13 +8,18 @@ from typing import Any, Dict
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InputFile, Message
 
 from botapp.keyboards import (
     MenuCallbackData,
     WarehouseCallbackData,
     pick_plan_keyboard,
+    warehouse_ai_confirmation_keyboard,
+    warehouse_catalog_keyboard,
+    warehouse_labels_keyboard,
     warehouse_menu_keyboard,
+    warehouse_receive_keyboard,
+    warehouse_results_keyboard,
 )
 from botapp.message_gc import (
     SECTION_WAREHOUSE_MENU,
@@ -23,7 +28,15 @@ from botapp.message_gc import (
     delete_section_message,
     send_section_message,
 )
-from botapp.ozon_client import get_posting_details
+from botapp.ozon_client import get_client, get_posting_details
+from botapp.products_service import (
+    CatalogProduct,
+    find_by_sku,
+    get_catalog,
+    refresh_catalog_from_ozon,
+    search_by_name,
+    update_barcode_in_cache,
+)
 from botapp.states import WarehouseStates
 from botapp.utils import send_ephemeral_message
 from botapp.warehouse_models import (
@@ -31,9 +44,12 @@ from botapp.warehouse_models import (
     Location,
     Movement,
     Product,
+    default_shop_location,
     generate_box_id,
     generate_movement_id,
 )
+from botapp.warehouse_ai import parse_production_text_to_items
+from botapp.labels import generate_barcodes_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -80,12 +96,26 @@ class InMemoryWarehouseStore:
         self.products[product.sku] = product
         return product
 
+    def upsert_product(self, product: Product) -> Product:
+        existing = self.products.get(product.sku)
+        if existing:
+            merged = existing.model_copy(update=product.model_dump(exclude_none=True))
+            self.products[product.sku] = merged
+            return merged
+        self.products[product.sku] = product
+        return product
+
     def get_or_create_location(self, location_id: str, name: str | None = None) -> Location:
         if location_id in self.locations:
             return self.locations[location_id]
         location = Location(id=location_id, name=name)
         self.locations[location_id] = location
         return location
+
+    def default_location(self) -> Location:
+        return self.get_or_create_location(
+            default_shop_location().id, name=default_shop_location().name
+        )
 
     def list_boxes_for_product(self, sku: str) -> list[Box]:
         return [box for box in self.boxes.values() if box.product.sku == sku]
@@ -103,6 +133,9 @@ class InMemoryWarehouseStore:
 
     def delete_box(self, box_id: str) -> None:
         self.boxes.pop(box_id, None)
+
+    def total_quantity(self, sku: str) -> int:
+        return sum(box.quantity for box in self.list_boxes_for_product(sku))
 
 
 STORE = InMemoryWarehouseStore()
@@ -141,61 +174,153 @@ async def warehouse_ai_stub(callback: CallbackQuery) -> None:
 async def start_receive(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.clear()
-    await state.set_state(WarehouseStates.receive_product)
+    await state.set_state(WarehouseStates.receive_product_manual)
     await send_section_message(
         SECTION_WAREHOUSE_PROMPT,
-        text="Приёмка: отправьте SKU, название или штрих-код товара.",
+        text="📥 Приёмка: выберите режим.",
+        callback=callback,
+        reply_markup=warehouse_receive_keyboard(),
+        user_id=callback.from_user.id,
+    )
+
+
+@router.callback_query(WarehouseCallbackData.filter(F.action == "receive_back"))
+async def receive_back(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    await send_section_message(
+        SECTION_WAREHOUSE_MENU,
+        text="🏬 Раздел склада",
+        callback=callback,
+        reply_markup=warehouse_menu_keyboard(),
+        user_id=callback.from_user.id,
+    )
+
+
+async def _paginate_catalog(page: int, force: bool = False) -> tuple[list[tuple[str, str]], int]:
+    catalog = await (refresh_catalog_from_ozon(force=force) if force else get_catalog())
+    per_page = 8
+    total_pages = max((len(catalog) + per_page - 1) // per_page, 1)
+    safe_page = max(0, min(page, total_pages - 1))
+    start = safe_page * per_page
+    end = start + per_page
+    options: list[tuple[str, str]] = []
+    for item in catalog[start:end]:
+        text = f"{item.name[:40]} (SKU: {item.sku})"
+        data = WarehouseCallbackData(action="receive_choose", sku=item.sku).pack()
+        options.append((text, data))
+    return options, total_pages
+
+
+@router.callback_query(WarehouseCallbackData.filter(F.action.in_(
+    {"receive_list", "receive_list_refresh"}
+)))
+async def receive_list(callback: CallbackQuery, callback_data: WarehouseCallbackData, state: FSMContext) -> None:
+    await callback.answer()
+    page = callback_data.page or 0
+    force = callback_data.action == "receive_list_refresh"
+    options, total_pages = await _paginate_catalog(page, force=force)
+    await state.set_state(WarehouseStates.receive_product_manual)
+    await send_section_message(
+        SECTION_WAREHOUSE_PROMPT,
+        text="Выберите товар из каталога Ozon:",
+        callback=callback,
+        reply_markup=warehouse_catalog_keyboard(options, page, total_pages),
+        user_id=callback.from_user.id,
+    )
+
+
+@router.callback_query(WarehouseCallbackData.filter(F.action == "receive_search_name"))
+async def receive_search_name_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(WarehouseStates.receive_search_name)
+    await send_section_message(
+        SECTION_WAREHOUSE_PROMPT,
+        text="Отправьте часть названия товара",
         callback=callback,
         user_id=callback.from_user.id,
     )
 
 
-@router.message(WarehouseStates.receive_product, F.text)
-async def handle_receive_product(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
-    if text.lower() == "/cancel":
-        await state.clear()
-        await message.answer("Приёмка отменена.")
-        return
-    if not text:
-        await message.answer("Введите текст с SKU, штрих-кодом или названием.")
+@router.message(WarehouseStates.receive_search_name, F.text)
+async def receive_search_name(message: Message, state: FSMContext) -> None:
+    query = (message.text or "").strip()
+    results = await search_by_name(query)
+    if not results:
+        await message.answer("Товар не найден. Попробуйте ещё раз или вернитесь назад.")
         return
 
-    data = await state.get_data()
-    awaiting_new = data.get("awaiting_new_name")
-
-    if awaiting_new:
-        sku_raw = data.get("new_product_sku") or text
-        product = Product(sku=sku_raw, name=text)
-        STORE.save_product(product)
-        await state.update_data(product=product.model_dump(), awaiting_new_name=False)
-    else:
-        found = STORE.find_product(text)
-        if found:
-            await state.update_data(product=found.model_dump())
-        else:
-            await state.update_data(awaiting_new_name=True, new_product_sku=text)
-            await message.answer(
-                "Товар не найден. Введите название для нового товара или отправьте /cancel для отмены"
+    options = []
+    for item in results[:10]:
+        options.append(
+            (
+                f"{item.name[:40]} (SKU: {item.sku})",
+                WarehouseCallbackData(action="receive_choose", sku=item.sku).pack(),
             )
-            return
-
-    await state.set_state(WarehouseStates.receive_quantity)
+        )
+    await state.set_state(WarehouseStates.receive_product_manual)
     await send_section_message(
         SECTION_WAREHOUSE_PROMPT,
-        text="Сколько единиц принять на склад?",
+        text="Нашёл варианты:",
+        message=message,
+        reply_markup=warehouse_results_keyboard(options),
+        user_id=message.from_user.id,
+    )
+
+
+@router.callback_query(WarehouseCallbackData.filter(F.action == "receive_search_sku"))
+async def receive_search_sku_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(WarehouseStates.receive_search_sku)
+    await send_section_message(
+        SECTION_WAREHOUSE_PROMPT,
+        text="Отправьте артикул товара (SKU / offer_id)",
+        callback=callback,
+        user_id=callback.from_user.id,
+    )
+
+
+@router.message(WarehouseStates.receive_search_sku, F.text)
+async def receive_search_sku(message: Message, state: FSMContext) -> None:
+    sku = (message.text or "").strip()
+    item = await find_by_sku(sku)
+    if not item:
+        await message.answer("Товар не найден, попробуйте ещё раз.")
+        return
+    await state.update_data(selected_product=item.model_dump())
+    await state.set_state(WarehouseStates.receive_quantity_manual)
+    await send_section_message(
+        SECTION_WAREHOUSE_PROMPT,
+        text=f"Выбрали {item.name}. Сколько штук этого товара вы собрали?",
         message=message,
         user_id=message.from_user.id,
     )
 
 
-@router.message(WarehouseStates.receive_quantity, F.text)
+@router.callback_query(WarehouseCallbackData.filter(F.action == "receive_choose"))
+async def receive_choose(callback: CallbackQuery, callback_data: WarehouseCallbackData, state: FSMContext) -> None:
+    await callback.answer()
+    sku = callback_data.sku
+    if not sku:
+        await send_ephemeral_message(callback, "Не удалось определить товар.")
+        return
+    item = await find_by_sku(sku)
+    if not item:
+        await send_ephemeral_message(callback, "Товар не найден в каталоге, обновите список.")
+        return
+    await state.update_data(selected_product=item.model_dump())
+    await state.set_state(WarehouseStates.receive_quantity_manual)
+    await send_section_message(
+        SECTION_WAREHOUSE_PROMPT,
+        text=f"Сколько штук товара {item.name} вы собрали?",
+        callback=callback,
+        user_id=callback.from_user.id,
+    )
+
+
+@router.message(WarehouseStates.receive_quantity_manual, F.text)
 async def handle_receive_quantity(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
-    if text.lower() == "/cancel":
-        await state.clear()
-        await message.answer("Приёмка отменена.")
-        return
     try:
         qty = int(text)
         if qty <= 0:
@@ -204,66 +329,223 @@ async def handle_receive_quantity(message: Message, state: FSMContext) -> None:
         await message.answer("Введите целое положительное число.")
         return
 
+    data = await state.get_data()
+    product_raw = data.get("selected_product")
+    if not product_raw:
+        await message.answer("Не выбрали товар. Начните приёмку заново.")
+        await state.clear()
+        return
+
     await state.update_data(quantity=qty)
-    await state.set_state(WarehouseStates.receive_location)
     await send_section_message(
         SECTION_WAREHOUSE_PROMPT,
-        text="Укажите местоположение (например, A1-05-02) или отправьте \"-\" для пропуска.",
+        text=(
+            f"Сделать файл с {qty} этикетками со штрихкодами для этого товара?"
+        ),
         message=message,
+        reply_markup=warehouse_labels_keyboard(),
         user_id=message.from_user.id,
     )
 
 
-@router.message(WarehouseStates.receive_location, F.text)
-async def handle_receive_location(message: Message, state: FSMContext) -> None:
-    location_raw = (message.text or "").strip()
-    if location_raw.lower() == "/cancel":
-        await state.clear()
-        await message.answer("Приёмка отменена.")
-        return
-    location_id = "UNASSIGNED" if location_raw == "-" else (location_raw or "UNASSIGNED")
-    location_name = None if location_id != "UNASSIGNED" else "Без ячейки"
-    location = STORE.get_or_create_location(location_id, name=location_name)
+async def _ensure_barcode(product: CatalogProduct) -> str | None:
+    if product.barcode:
+        return product.barcode
 
-    data = await state.get_data()
-    product_data = data.get("product")
-    qty = data.get("quantity")
-    if not product_data or qty is None:
-        await message.answer("Не удалось определить товар, попробуйте начать приёмку заново.")
-        await state.clear()
-        return
+    client = get_client()
+    try:
+        info_list = await client.get_product_info_list(
+            product_ids=[product.ozon_product_id] if product.ozon_product_id else None,
+            offer_ids=[product.sku],
+            skus=[product.ozon_sku] if product.ozon_sku else None,
+        )
+        info = next(iter(info_list), None)
+        if info:
+            barcode = info.barcode or next((b for b in info.barcodes if b), None)
+            if barcode:
+                product.barcode = barcode
+                await update_barcode_in_cache(product.sku, barcode)
+                return barcode
+    except Exception as exc:
+        logger.info("Failed to refresh product info for barcode: %s", exc)
 
-    product = _deserialize_product(product_data)
+    try:
+        barcodes = await client.generate_barcodes(count=1)
+        barcode = barcodes[0] if barcodes else None
+        if barcode:
+            product.barcode = barcode
+            await update_barcode_in_cache(product.sku, barcode)
+            try:
+                await client.add_barcode(product.sku, barcode)
+            except Exception:
+                logger.info("Could not attach barcode %s to offer %s", barcode, product.sku)
+        return barcode
+    except Exception as exc:
+        logger.warning("Barcode generation failed: %s", exc)
+        return None
+
+
+def _catalog_to_product(item: CatalogProduct) -> Product:
+    return Product(
+        sku=item.sku,
+        name=item.name,
+        ozon_offer_id=item.sku,
+        ozon_sku=item.ozon_sku,
+        ozon_product_id=item.ozon_product_id,
+        barcode=item.barcode,
+    )
+
+
+async def _record_receipt(product: CatalogProduct, quantity: int) -> tuple[Product, Box]:
+    prod_model = _catalog_to_product(product)
+    stored = STORE.upsert_product(prod_model)
+    location = STORE.default_location()
     box_id = generate_box_id(set(STORE.boxes.keys()))
     box = Box(
         id=box_id,
-        product=product,
-        quantity=int(qty),
+        product=stored,
+        quantity=quantity,
         location=location,
         created_at=datetime.utcnow(),
     )
     STORE.save_box(box)
-
-    movement_id = generate_movement_id(set(STORE.movements.keys()))
     movement = Movement(
-        id=movement_id,
+        id=generate_movement_id(set(STORE.movements.keys())),
         type="RECEIPT",
-        product=product,
-        quantity=int(qty),
+        product=stored,
+        quantity=quantity,
         to_box=box,
         timestamp=datetime.utcnow(),
     )
     STORE.save_movement(movement)
+    return stored, box
+
+
+@router.callback_query(WarehouseCallbackData.filter(F.action == "labels"))
+async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbackData, state: FSMContext) -> None:
+    await callback.answer()
+    data = await state.get_data()
+    product_raw = data.get("selected_product")
+    qty = data.get("quantity")
+    if not product_raw or qty is None:
+        await send_ephemeral_message(callback, "Не выбрали товар или количество.")
+        await state.clear()
+        return
+    product = CatalogProduct.model_validate(product_raw)
+
+    stored_product, box = await _record_receipt(product, int(qty))
+    total = STORE.total_quantity(stored_product.sku)
+
+    if callback_data.decision == "yes":
+        barcode = await _ensure_barcode(product)
+        if not barcode:
+            await send_ephemeral_message(callback, "Не удалось получить штрихкод, записали количество без файла.")
+        else:
+            product.barcode = barcode
+            pdf_path = await generate_barcodes_pdf(product, int(qty))
+            try:
+                await callback.message.answer_document(
+                    InputFile(path=pdf_path),
+                    caption=f"Этикетки для {product.name}",
+                )
+            finally:
+                try:
+                    pdf_path.unlink()
+                except Exception:
+                    pass
 
     await state.clear()
     await send_section_message(
         SECTION_WAREHOUSE_PROMPT,
+        text=f"✅ Записал: {stored_product.name} — {qty} шт. Текущий остаток в цеху: {total} шт.",
+        callback=callback,
+        user_id=callback.from_user.id,
+    )
+
+
+@router.callback_query(WarehouseCallbackData.filter(F.action == "receive_ai"))
+async def receive_ai_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(WarehouseStates.receive_ai_text)
+    await send_section_message(
+        SECTION_WAREHOUSE_PROMPT,
         text=(
-            f"✅ Принято {qty} шт товара {product.name} в коробку {box.id} "
-            f"(место: {location.id})."
+            "Опишите текстом, что вы произвели (например: \"3 стеллажа Loft 3-ярусных, "
+            "2 обувницы с сиденьем и 1 кофейный столик\")."
         ),
+        callback=callback,
+        user_id=callback.from_user.id,
+    )
+
+
+@router.message(WarehouseStates.receive_ai_text, F.text)
+async def receive_ai_text(message: Message, state: FSMContext) -> None:
+    text = message.text or ""
+    catalog = await get_catalog()
+    items = await parse_production_text_to_items(text, catalog)
+    if not items:
+        await message.answer(
+            "Не удалось распознать товары. Попробуйте ещё раз или вернитесь к ручному режиму."
+        )
+        return
+
+    await state.update_data(ai_items=[{"sku": p.sku, "quantity": q} for p, q in items])
+    await state.set_state(WarehouseStates.receive_ai_confirm)
+
+    lines = ["Понял так:"]
+    for product, qty in items:
+        lines.append(f"• {product.name} — {qty} шт")
+    lines.append("Всё верно?")
+
+    await send_section_message(
+        SECTION_WAREHOUSE_PROMPT,
+        text="\n".join(lines),
         message=message,
+        reply_markup=warehouse_ai_confirmation_keyboard(),
         user_id=message.from_user.id,
+    )
+
+
+@router.callback_query(WarehouseCallbackData.filter(F.action == "receive_ai_confirm"))
+async def receive_ai_confirm(callback: CallbackQuery, callback_data: WarehouseCallbackData, state: FSMContext) -> None:
+    await callback.answer()
+    data = await state.get_data()
+    items_raw = data.get("ai_items") or []
+    if callback_data.decision == "no":
+        await state.set_state(WarehouseStates.receive_ai_text)
+        await send_section_message(
+            SECTION_WAREHOUSE_PROMPT,
+            text="Введите текст заново или вернитесь к ручному режиму.",
+            callback=callback,
+            user_id=callback.from_user.id,
+        )
+        return
+
+    catalog = await get_catalog()
+    catalog_map = {item.sku: item for item in catalog}
+    summary_lines = []
+    for entry in items_raw:
+        sku = entry.get("sku")
+        qty = int(entry.get("quantity") or 0)
+        if not sku or qty <= 0:
+            continue
+        product = catalog_map.get(sku)
+        if not product:
+            continue
+        stored_product, _ = await _record_receipt(product, qty)
+        total = STORE.total_quantity(stored_product.sku)
+        summary_lines.append(f"{stored_product.name} — {qty} шт (остаток: {total})")
+
+    await state.clear()
+    if not summary_lines:
+        await send_ephemeral_message(callback, "Не удалось записать приёмку.")
+        return
+
+    await send_section_message(
+        SECTION_WAREHOUSE_PROMPT,
+        text="✅ Записал:\n" + "\n".join(summary_lines),
+        callback=callback,
+        user_id=callback.from_user.id,
     )
 
 

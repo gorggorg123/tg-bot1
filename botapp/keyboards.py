@@ -63,6 +63,10 @@ class ChatsCallbackData(CallbackData, prefix="chats"):
 class WarehouseCallbackData(CallbackData, prefix="warehouse"):
     action: str
     posting_number: Optional[str] = None
+    page: Optional[int] = None
+    sku: Optional[str] = None
+    mode: Optional[str] = None
+    decision: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +205,144 @@ def warehouse_menu_keyboard() -> InlineKeyboardMarkup:
                     callback_data=MenuCallbackData(
                         section="home", action="open"
                     ).pack(),
+                )
+            ],
+        ]
+    )
+
+
+def warehouse_receive_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📂 Выбрать из списка",
+                    callback_data=WarehouseCallbackData(action="receive_list", page=0).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔍 Найти по названию",
+                    callback_data=WarehouseCallbackData(action="receive_search_name").pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔢 Найти по артикулу (SKU)",
+                    callback_data=WarehouseCallbackData(action="receive_search_sku").pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧠 Продиктовать текстом (ИИ)",
+                    callback_data=WarehouseCallbackData(action="receive_ai").pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅ Назад",
+                    callback_data=WarehouseCallbackData(action="receive_back").pack(),
+                )
+            ],
+        ]
+    )
+
+
+def warehouse_catalog_keyboard(
+    options: list[tuple[str, str]], page: int, total_pages: int
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for text, data in options:
+        rows.append([InlineKeyboardButton(text=text, callback_data=data)])
+
+    nav_row: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="⬅",
+                callback_data=WarehouseCallbackData(action="receive_list", page=page - 1).pack(),
+            )
+        )
+    nav_row.append(
+        InlineKeyboardButton(
+            text=f"Стр. {page + 1}/{max(total_pages, 1)}",
+            callback_data=WarehouseCallbackData(action="noop").pack(),
+        )
+    )
+    if page + 1 < total_pages:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="➡",
+                callback_data=WarehouseCallbackData(action="receive_list", page=page + 1).pack(),
+            )
+        )
+    rows.append(nav_row)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔄 Обновить каталог",
+                callback_data=WarehouseCallbackData(action="receive_list_refresh", page=page).pack(),
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅ Назад",
+                callback_data=WarehouseCallbackData(action="receive").pack(),
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def warehouse_results_keyboard(options: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for text, data in options:
+        rows.append([InlineKeyboardButton(text=text, callback_data=data)])
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅ Назад",
+                callback_data=WarehouseCallbackData(action="receive").pack(),
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def warehouse_labels_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Да, сделать файл",
+                    callback_data=WarehouseCallbackData(action="labels", decision="yes").pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Нет, только записать количество",
+                    callback_data=WarehouseCallbackData(action="labels", decision="no").pack(),
+                )
+            ],
+        ]
+    )
+
+
+def warehouse_ai_confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Да, всё верно",
+                    callback_data=WarehouseCallbackData(action="receive_ai_confirm", decision="yes").pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Нет, изменить",
+                    callback_data=WarehouseCallbackData(action="receive_ai_confirm", decision="no").pack(),
                 )
             ],
         ]

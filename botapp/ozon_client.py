@@ -31,6 +31,7 @@ _product_info_miss_cache: set[str] = set()
 _analytics_forbidden: bool = False
 _analytics_forbidden_logged: bool = False
 _stock_not_found_warned: set[str] = set()
+_product_list_warned: bool = False
 
 
 class QuestionItem(BaseModel):
@@ -988,6 +989,106 @@ class OzonClient:
                 continue
         return stocks
 
+    async def list_products(
+        self, *, limit: int = 100, last_id: str | None = None
+    ) -> ProductListPage:
+        body: Dict[str, Any] = {"limit": limit}
+        if last_id:
+            body["last_id"] = last_id
+
+        status_code, data = await self._post_with_status("/v3/product/list", body)
+        if status_code >= 400:
+            raise OzonAPIError(f"Product list failed with HTTP {status_code}: {data}")
+
+        items_raw = []
+        result = data.get("result") if isinstance(data, dict) else None
+        if isinstance(result, dict):
+            items_raw = result.get("items") if isinstance(result.get("items"), list) else []
+            last_id_val = result.get("last_id") if isinstance(result.get("last_id"), str) else None
+        elif isinstance(data, dict):
+            items_raw = data.get("items") if isinstance(data.get("items"), list) else []
+            last_id_val = data.get("last_id") if isinstance(data.get("last_id"), str) else None
+        else:
+            last_id_val = None
+
+        items: list[ProductListItem] = []
+        for raw in items_raw:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                items.append(ProductListItem.model_validate(raw))
+            except ValidationError as exc:
+                logger.warning("Failed to parse product list item: %s", exc)
+                continue
+
+        if not items and not _product_list_warned:
+            logger.warning("Product list returned no items")
+            globals()["_product_list_warned"] = True
+
+        return ProductListPage(items=items, last_id=last_id_val)
+
+    async def get_product_info_list(
+        self,
+        *,
+        product_ids: list[str] | None = None,
+        offer_ids: list[str] | None = None,
+        skus: list[int] | None = None,
+        limit: int = 100,
+    ) -> list[ProductInfoItem]:
+        body: Dict[str, Any] = {"limit": limit}
+        if product_ids:
+            body["product_id"] = product_ids
+        if offer_ids:
+            body["offer_id"] = offer_ids
+        if skus:
+            body["sku"] = skus
+
+        status_code, data = await self._post_with_status("/v3/product/info/list", body)
+        if status_code >= 400:
+            raise OzonAPIError(
+                f"Product info list failed with HTTP {status_code}: {data}"
+            )
+
+        payload = data.get("result") if isinstance(data, dict) else None
+        items_raw = []
+        if isinstance(payload, list):
+            items_raw = payload
+        elif isinstance(payload, dict):
+            items_raw = payload.get("items") if isinstance(payload.get("items"), list) else []
+
+        items: list[ProductInfoItem] = []
+        for raw in items_raw:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                items.append(ProductInfoItem.model_validate(raw))
+            except ValidationError as exc:
+                logger.warning("Failed to parse product info list item: %s", exc)
+                continue
+        return items
+
+    async def generate_barcodes(self, count: int = 1) -> list[str]:
+        body: Dict[str, Any] = {"count": count}
+        status_code, data = await self._post_with_status("/v1/barcode/generate", body)
+        if status_code >= 400:
+            raise OzonAPIError(
+                f"Barcode generation failed with HTTP {status_code}: {data}"
+            )
+
+        result = data.get("result") if isinstance(data, dict) else None
+        barcodes = result.get("barcodes") if isinstance(result, dict) else None
+        if isinstance(barcodes, list):
+            return [str(code) for code in barcodes if code]
+        return []
+
+    async def add_barcode(self, offer_id: str, barcode: str) -> bool:
+        body: Dict[str, Any] = {"offer_id": offer_id, "barcodes": [barcode]}
+        status_code, data = await self._post_with_status("/v1/barcode/add", body)
+        if status_code >= 400:
+            logger.warning("Failed to attach barcode %s to %s: %s", barcode, offer_id, data)
+            return False
+        return True
+
 
 class StockItem(BaseModel):
     """Normalized stock info for a product on a warehouse or by type."""
@@ -1005,6 +1106,34 @@ class ProductStockInfo(BaseModel):
     offer_id: str | None = None
     sku: int | None = None
     stocks: list[StockItem] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+
+class ProductListItem(BaseModel):
+    product_id: str | None = None
+    offer_id: str | None = None
+    name: str | None = None
+    sku: int | None = None
+    visibility: str | None = None
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+
+class ProductListPage(BaseModel):
+    items: list[ProductListItem] = Field(default_factory=list)
+    last_id: str | None = None
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+
+class ProductInfoItem(BaseModel):
+    product_id: str | None = None
+    offer_id: str | None = None
+    sku: int | None = None
+    name: str | None = None
+    barcode: str | None = None
+    barcodes: list[str] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="ignore", protected_namespaces=())
 
