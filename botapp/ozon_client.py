@@ -1187,6 +1187,17 @@ class ProductListItem(BaseModel):
 
     model_config = ConfigDict(extra="ignore", protected_namespaces=())
 
+    @field_validator("product_id", mode="before")
+    @classmethod
+    def _coerce_product_id(cls, value: Any) -> Any:
+        """Allow product_id to come as string without dropping the item."""
+        if value is None:
+            return value
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
+
 
 class ProductListPage(BaseModel):
     items: list[ProductListItem] = Field(default_factory=list)

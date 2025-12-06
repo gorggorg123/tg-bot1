@@ -422,7 +422,7 @@ async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbac
                         (b for b in info.barcodes if b), None
                     )
                     if barcode_value:
-                        product.barcode = barcode_value
+                        product.barcode = str(barcode_value)
                         await update_barcode_in_cache(product.sku, barcode_value)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to refresh product info for barcode: %s", exc)
@@ -434,10 +434,10 @@ async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbac
                 )
                 barcode_value = barcodes[0] if barcodes else None
                 if barcode_value:
-                    product.barcode = barcode_value
-                    await update_barcode_in_cache(product.sku, barcode_value)
+                    product.barcode = str(barcode_value)
+                    await update_barcode_in_cache(product.sku, product.barcode)
                     try:
-                        await client.add_barcode(product.sku, barcode_value)
+                        await client.add_barcode(product.sku, product.barcode)
                     except Exception:  # noqa: BLE001
                         logger.info(
                             "Could not attach barcode %s to offer %s",
