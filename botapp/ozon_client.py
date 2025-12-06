@@ -5,7 +5,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 from urllib.parse import urlparse, unquote
 
 import httpx
@@ -990,11 +990,25 @@ class OzonClient:
         return stocks
 
     async def list_products(
-        self, *, limit: int = 100, last_id: str | None = None
+        self,
+        *,
+        limit: int = 100,
+        last_id: str | None = None,
+        visibility: str = "ALL",
+        offer_ids: Iterable[str] | None = None,
+        product_ids: Iterable[int] | None = None,
     ) -> ProductListPage:
-        body: Dict[str, Any] = {"limit": limit}
-        if last_id:
-            body["last_id"] = last_id
+        filter_: dict[str, Any] = {"visibility": visibility}
+        if offer_ids:
+            filter_["offer_id"] = list(offer_ids)
+        if product_ids:
+            filter_["product_id"] = list(product_ids)
+
+        body: Dict[str, Any] = {
+            "filter": filter_,
+            "limit": limit,
+            "last_id": last_id or "",
+        }
 
         status_code, data = await self._post_with_status("/v3/product/list", body)
         if status_code >= 400:
