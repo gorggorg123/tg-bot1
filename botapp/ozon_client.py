@@ -1125,7 +1125,7 @@ class ProductStockInfo(BaseModel):
 
 
 class ProductListItem(BaseModel):
-    product_id: str | None = None
+    product_id: int | None = None
     offer_id: str | None = None
     name: str | None = None
     sku: int | None = None
