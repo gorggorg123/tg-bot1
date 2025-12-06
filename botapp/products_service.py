@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class CatalogProduct(BaseModel):
     sku: str
     name: str
-    ozon_product_id: str | None = None
+    ozon_product_id: int | None = None
     ozon_sku: int | None = None
     barcode: str | None = None
 
@@ -45,7 +45,7 @@ async def _fetch_product_list() -> list[ProductListItem]:
     return items
 
 
-async def _fetch_product_info_map(ids: list[str]) -> Dict[str, ProductInfoItem]:
+async def _fetch_product_info_map(ids: list[int]) -> Dict[str, ProductInfoItem]:
     client = get_client()
     info_map: Dict[str, ProductInfoItem] = {}
 
@@ -54,16 +54,31 @@ async def _fetch_product_info_map(ids: list[str]) -> Dict[str, ProductInfoItem]:
         chunk = ids[i : i + chunk_size]
         info_items = await client.get_product_info_list(product_ids=chunk)
         for info in info_items:
-            key = info.product_id or info.offer_id or str(info.sku or "")
-            if not key:
-                continue
-            info_map[key] = info
+            candidates: list[object] = []
+            if info.product_id is not None:
+                try:
+                    candidates.append(int(info.product_id))
+                except Exception:
+                    candidates.append(info.product_id)
+            if info.offer_id:
+                candidates.append(info.offer_id)
+            if info.sku is not None:
+                candidates.append(str(info.sku))
+
+            for key in candidates:
+                if key:
+                    info_map[key] = info
 
     return info_map
 
 
 def _to_catalog_product(item: ProductListItem, info_map: Dict[str, ProductInfoItem]) -> CatalogProduct:
-    lookup_keys = [k for k in (item.product_id, item.offer_id) if k]
+    lookup_keys: list[object] = []
+    if item.product_id is not None:
+        lookup_keys.append(item.product_id)
+        lookup_keys.append(str(item.product_id))
+    if item.offer_id:
+        lookup_keys.append(item.offer_id)
     info = next((info_map[k] for k in lookup_keys if k in info_map), None)
     name = (info.name if info else None) or item.name or item.offer_id or str(item.sku or "")
     barcode = None

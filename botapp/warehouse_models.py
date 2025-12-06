@@ -20,7 +20,7 @@ class Product(BaseModel):
     name: str
     ozon_offer_id: str | None = None
     ozon_sku: int | None = None
-    ozon_product_id: str | None = None
+    ozon_product_id: int | None = None
     barcode: str | None = None
     weight_kg: float | None = None
     length_cm: float | None = None
