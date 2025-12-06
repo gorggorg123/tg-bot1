@@ -9,6 +9,7 @@ from typing import Dict, List
 from pydantic import BaseModel
 
 from botapp.ozon_client import (
+    OzonAPIError,
     ProductInfoItem,
     ProductListItem,
     get_client,
@@ -45,41 +46,40 @@ async def _fetch_product_list() -> list[ProductListItem]:
     return items
 
 
-async def _fetch_product_info_map(ids: list[int]) -> Dict[str, ProductInfoItem]:
-    client = get_client()
-    info_map: Dict[str, ProductInfoItem] = {}
+async def _fetch_product_info_map(ids: list[int]) -> Dict[int, ProductInfoItem]:
+    """Load product info items keyed by product_id.
 
-    chunk_size = 40
+    Errors from Ozon API are logged and result in an empty map so that catalog
+    refresh continues without barcodes/details rather than breaking flows.
+    """
+
+    client = get_client()
+    info_map: Dict[int, ProductInfoItem] = {}
+
+    chunk_size = 1000
     for i in range(0, len(ids), chunk_size):
         chunk = ids[i : i + chunk_size]
-        info_items = await client.get_product_info_list(product_ids=chunk)
-        for info in info_items:
-            candidates: list[object] = []
-            if info.product_id is not None:
-                try:
-                    candidates.append(int(info.product_id))
-                except Exception:
-                    candidates.append(info.product_id)
-            if info.offer_id:
-                candidates.append(info.offer_id)
-            if info.sku is not None:
-                candidates.append(str(info.sku))
+        try:
+            info_items = await client.get_product_info_list(product_ids=chunk)
+        except OzonAPIError as exc:
+            logger.warning("Failed to fetch product info list: %s", exc)
+            return {}
 
-            for key in candidates:
-                if key:
-                    info_map[key] = info
+        for info in info_items:
+            try:
+                pid = int(info.product_id) if info.product_id is not None else None
+            except (TypeError, ValueError):
+                pid = None
+
+            if pid is None:
+                continue
+            info_map[pid] = info
 
     return info_map
 
 
-def _to_catalog_product(item: ProductListItem, info_map: Dict[str, ProductInfoItem]) -> CatalogProduct:
-    lookup_keys: list[object] = []
-    if item.product_id is not None:
-        lookup_keys.append(item.product_id)
-        lookup_keys.append(str(item.product_id))
-    if item.offer_id:
-        lookup_keys.append(item.offer_id)
-    info = next((info_map[k] for k in lookup_keys if k in info_map), None)
+def _to_catalog_product(item: ProductListItem, info_map: Dict[int, ProductInfoItem]) -> CatalogProduct:
+    info = info_map.get(item.product_id) if item.product_id is not None else None
     name = (info.name if info else None) or item.name or item.offer_id or str(item.sku or "")
     barcode = None
     if info:

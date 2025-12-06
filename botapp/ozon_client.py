@@ -1044,24 +1044,30 @@ class OzonClient:
     async def product_info_list(
         self,
         *,
-        product_ids: list[int] | None = None,
-        offer_ids: list[str] | None = None,
-        skus: list[int] | None = None,
-        limit: int = 100,
+        product_ids: Sequence[int | str] | None = None,
+        offer_ids: Sequence[str] | None = None,
+        skus: Sequence[int | str] | None = None,
     ) -> list[ProductInfoItem]:
-        filter_: Dict[str, list[Any]] = {}
-        if product_ids:
-            filter_["product_id"] = product_ids
-        elif offer_ids:
-            filter_["offer_id"] = offer_ids
-        elif skus:
-            filter_["sku"] = skus
-        else:
-            raise ValueError(
-                "product_info_list: need at least one of product_ids/offer_ids/skus"
-            )
+        """Wrapper for /v3/product/info/list.
 
-        body: Dict[str, Any] = {"filter": filter_, "limit": limit}
+        Exactly one identifier group must be provided.
+        """
+
+        has_product_ids = bool(product_ids)
+        has_offer_ids = bool(offer_ids)
+        has_skus = bool(skus)
+
+        if (has_product_ids + has_offer_ids + has_skus) != 1:
+            raise ValueError("Provide exactly one of product_ids, offer_ids or skus")
+
+        if has_product_ids:
+            body: Dict[str, Any] = {
+                "product_id": [str(pid) for pid in product_ids]
+            }
+        elif has_offer_ids:
+            body = {"offer_id": list(offer_ids)}
+        else:
+            body = {"sku": [str(s) for s in skus]}
 
         status_code, data = await self._post_with_status("/v3/product/info/list", body)
         if status_code >= 400:
@@ -1090,13 +1096,12 @@ class OzonClient:
     async def get_product_info_list(
         self,
         *,
-        product_ids: list[int] | None = None,
-        offer_ids: list[str] | None = None,
-        skus: list[int] | None = None,
-        limit: int = 100,
+        product_ids: Sequence[int | str] | None = None,
+        offer_ids: Sequence[str] | None = None,
+        skus: Sequence[int | str] | None = None,
     ) -> list[ProductInfoItem]:
         return await self.product_info_list(
-            product_ids=product_ids, offer_ids=offer_ids, skus=skus, limit=limit
+            product_ids=product_ids, offer_ids=offer_ids, skus=skus
         )
 
     async def generate_barcodes(self, product_ids: list[int]) -> list[str]:

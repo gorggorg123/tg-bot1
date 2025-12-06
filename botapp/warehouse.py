@@ -361,13 +361,17 @@ async def _ensure_barcode(product: CatalogProduct) -> str | None:
 
     client = get_client()
     try:
-        info_list = await client.product_info_list(
-            product_ids=[product.ozon_product_id]
-            if product.ozon_product_id is not None
-            else None,
-            offer_ids=[product.sku],
-            skus=[product.ozon_sku] if product.ozon_sku else None,
-        )
+        if product.ozon_product_id is not None:
+            info_list = await client.get_product_info_list(
+                product_ids=[product.ozon_product_id]
+            )
+        elif product.sku:
+            info_list = await client.get_product_info_list(offer_ids=[product.sku])
+        elif product.ozon_sku is not None:
+            info_list = await client.get_product_info_list(skus=[product.ozon_sku])
+        else:
+            info_list = []
+
         info = next(iter(info_list), None)
         if info:
             barcode = info.barcode or next((b for b in info.barcodes if b), None)
@@ -381,7 +385,9 @@ async def _ensure_barcode(product: CatalogProduct) -> str | None:
     try:
         if product.ozon_product_id is None:
             raise ValueError("Missing ozon_product_id for barcode generation")
-        barcodes = await client.generate_barcodes(product_ids=[product.ozon_product_id])
+        barcodes = await client.generate_barcodes(
+            product_ids=[product.ozon_product_id]
+        )
         barcode = barcodes[0] if barcodes else None
         if barcode:
             product.barcode = barcode
@@ -452,7 +458,10 @@ async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbac
     if callback_data.action == "labels_yes":
         barcode = await _ensure_barcode(product)
         if not barcode:
-            await send_ephemeral_message(callback, "Не удалось получить штрихкод, записали количество без файла.")
+            await send_ephemeral_message(
+                callback,
+                text="Не удалось получить штрихкод, записали количество без файла.",
+            )
         else:
             product.barcode = barcode
             pdf_path = await generate_barcodes_pdf(product, int(qty))
