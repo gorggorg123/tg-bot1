@@ -1041,21 +1041,27 @@ class OzonClient:
 
         return ProductListPage(items=items, last_id=last_id_val)
 
-    async def get_product_info_list(
+    async def product_info_list(
         self,
         *,
-        product_ids: list[str] | None = None,
+        product_ids: list[int] | None = None,
         offer_ids: list[str] | None = None,
         skus: list[int] | None = None,
         limit: int = 100,
     ) -> list[ProductInfoItem]:
-        body: Dict[str, Any] = {"limit": limit}
+        filter_: Dict[str, list[Any]] = {}
         if product_ids:
-            body["product_id"] = product_ids
-        if offer_ids:
-            body["offer_id"] = offer_ids
-        if skus:
-            body["sku"] = skus
+            filter_["product_id"] = product_ids
+        elif offer_ids:
+            filter_["offer_id"] = offer_ids
+        elif skus:
+            filter_["sku"] = skus
+        else:
+            raise ValueError(
+                "product_info_list: need at least one of product_ids/offer_ids/skus"
+            )
+
+        body: Dict[str, Any] = {"filter": filter_, "limit": limit}
 
         status_code, data = await self._post_with_status("/v3/product/info/list", body)
         if status_code >= 400:
@@ -1081,8 +1087,23 @@ class OzonClient:
                 continue
         return items
 
-    async def generate_barcodes(self, count: int = 1) -> list[str]:
-        body: Dict[str, Any] = {"count": count}
+    async def get_product_info_list(
+        self,
+        *,
+        product_ids: list[int] | None = None,
+        offer_ids: list[str] | None = None,
+        skus: list[int] | None = None,
+        limit: int = 100,
+    ) -> list[ProductInfoItem]:
+        return await self.product_info_list(
+            product_ids=product_ids, offer_ids=offer_ids, skus=skus, limit=limit
+        )
+
+    async def generate_barcodes(self, product_ids: list[int]) -> list[str]:
+        if not product_ids:
+            raise ValueError("generate_barcodes: product_ids must not be empty")
+
+        body: Dict[str, Any] = {"product_ids": product_ids}
         status_code, data = await self._post_with_status("/v1/barcode/generate", body)
         if status_code >= 400:
             raise OzonAPIError(

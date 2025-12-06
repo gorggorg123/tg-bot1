@@ -230,10 +230,8 @@ async def _send_questions_list(
         target = callback.message if callback else message
         if target:
             await send_ephemeral_message(
-                target.bot,
-                target.chat.id,
+                callback or target,
                 f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
-                user_id=user_id,
             )
         logger.warning("Unable to load questions list: %s", exc)
         return
@@ -241,10 +239,8 @@ async def _send_questions_list(
         target = callback.message if callback else message
         if target:
             await send_ephemeral_message(
-                target.bot,
-                target.chat.id,
+                callback or target,
                 "⚠️ Не удалось получить список вопросов. Попробуйте позже.",
-                user_id=user_id,
             )
         logger.exception("Unexpected error while loading questions list")
         return

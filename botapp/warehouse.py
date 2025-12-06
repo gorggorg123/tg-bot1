@@ -361,8 +361,10 @@ async def _ensure_barcode(product: CatalogProduct) -> str | None:
 
     client = get_client()
     try:
-        info_list = await client.get_product_info_list(
-            product_ids=[product.ozon_product_id] if product.ozon_product_id else None,
+        info_list = await client.product_info_list(
+            product_ids=[product.ozon_product_id]
+            if product.ozon_product_id is not None
+            else None,
             offer_ids=[product.sku],
             skus=[product.ozon_sku] if product.ozon_sku else None,
         )
@@ -377,7 +379,9 @@ async def _ensure_barcode(product: CatalogProduct) -> str | None:
         logger.info("Failed to refresh product info for barcode: %s", exc)
 
     try:
-        barcodes = await client.generate_barcodes(count=1)
+        if product.ozon_product_id is None:
+            raise ValueError("Missing ozon_product_id for barcode generation")
+        barcodes = await client.generate_barcodes(product_ids=[product.ozon_product_id])
         barcode = barcodes[0] if barcodes else None
         if barcode:
             product.barcode = barcode
