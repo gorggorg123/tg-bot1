@@ -62,11 +62,8 @@ class ChatsCallbackData(CallbackData, prefix="chats"):
 
 class WarehouseCallbackData(CallbackData, prefix="warehouse"):
     action: str
-    posting_number: Optional[str] = None
+    product_id: Optional[int] = None
     page: Optional[int] = None
-    sku: Optional[str] = None
-    mode: Optional[str] = None
-    decision: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -317,13 +314,13 @@ def warehouse_labels_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text="✅ Да, сделать файл",
-                    callback_data=WarehouseCallbackData(action="labels", decision="yes").pack(),
+                    callback_data=WarehouseCallbackData(action="labels_yes").pack(),
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="❌ Нет, только записать количество",
-                    callback_data=WarehouseCallbackData(action="labels", decision="no").pack(),
+                    callback_data=WarehouseCallbackData(action="labels_no").pack(),
                 )
             ],
         ]
@@ -336,13 +333,13 @@ def warehouse_ai_confirmation_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text="✅ Да, всё верно",
-                    callback_data=WarehouseCallbackData(action="receive_ai_confirm", decision="yes").pack(),
+                    callback_data=WarehouseCallbackData(action="receive_ai_confirm_yes").pack(),
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="❌ Нет, изменить",
-                    callback_data=WarehouseCallbackData(action="receive_ai_confirm", decision="no").pack(),
+                    callback_data=WarehouseCallbackData(action="receive_ai_confirm_no").pack(),
                 )
             ],
         ]
@@ -355,17 +352,13 @@ def pick_plan_keyboard(posting_number: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text="✅ Отбор завершён",
-                    callback_data=WarehouseCallbackData(
-                        action="pick_confirm", posting_number=posting_number
-                    ).pack(),
+                    callback_data=WarehouseCallbackData(action="pick_confirm").pack(),
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="❌ Отмена",
-                    callback_data=WarehouseCallbackData(
-                        action="pick_cancel", posting_number=posting_number
-                    ).pack(),
+                    callback_data=WarehouseCallbackData(action="pick_cancel").pack(),
                 )
             ],
         ]

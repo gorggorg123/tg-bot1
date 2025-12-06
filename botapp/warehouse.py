@@ -207,7 +207,11 @@ async def _paginate_catalog(page: int, force: bool = False) -> tuple[list[tuple[
     options: list[tuple[str, str]] = []
     for item in catalog[start:end]:
         text = f"{item.name[:40]} (SKU: {item.sku})"
-        data = WarehouseCallbackData(action="receive_choose", sku=item.sku).pack()
+        if item.ozon_product_id is None:
+            continue
+        data = WarehouseCallbackData(
+            action="receive_choose", product_id=item.ozon_product_id
+        ).pack()
         options.append((text, data))
     return options, total_pages
 
@@ -255,7 +259,9 @@ async def receive_search_name(message: Message, state: FSMContext) -> None:
         options.append(
             (
                 f"{item.name[:40]} (SKU: {item.sku})",
-                WarehouseCallbackData(action="receive_choose", sku=item.sku).pack(),
+                WarehouseCallbackData(
+                    action="receive_choose", product_id=item.ozon_product_id
+                ).pack(),
             )
         )
     await state.set_state(WarehouseStates.receive_product_manual)
@@ -300,12 +306,13 @@ async def receive_search_sku(message: Message, state: FSMContext) -> None:
 @router.callback_query(WarehouseCallbackData.filter(F.action == "receive_choose"))
 async def receive_choose(callback: CallbackQuery, callback_data: WarehouseCallbackData, state: FSMContext) -> None:
     await callback.answer()
-    sku = callback_data.sku
-    if not sku:
+    product_id = callback_data.product_id
+    if product_id is None:
         await send_ephemeral_message(callback, "Не удалось определить товар.")
         return
-    item = await find_by_sku(sku)
-    if not item:
+    catalog = await get_catalog()
+    item = next((p for p in catalog if p.ozon_product_id == product_id), None)
+    if item is None:
         await send_ephemeral_message(callback, "Товар не найден в каталоге, обновите список.")
         return
     await state.update_data(selected_product=item.model_dump())
@@ -421,7 +428,9 @@ async def _record_receipt(product: CatalogProduct, quantity: int) -> tuple[Produ
     return stored, box
 
 
-@router.callback_query(WarehouseCallbackData.filter(F.action == "labels"))
+@router.callback_query(
+    WarehouseCallbackData.filter(F.action.in_({"labels_yes", "labels_no"}))
+)
 async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbackData, state: FSMContext) -> None:
     await callback.answer()
     data = await state.get_data()
@@ -436,7 +445,7 @@ async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbac
     stored_product, box = await _record_receipt(product, int(qty))
     total = STORE.total_quantity(stored_product.sku)
 
-    if callback_data.decision == "yes":
+    if callback_data.action == "labels_yes":
         barcode = await _ensure_barcode(product)
         if not barcode:
             await send_ephemeral_message(callback, "Не удалось получить штрихкод, записали количество без файла.")
@@ -506,12 +515,16 @@ async def receive_ai_text(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.callback_query(WarehouseCallbackData.filter(F.action == "receive_ai_confirm"))
+@router.callback_query(
+    WarehouseCallbackData.filter(
+        F.action.in_({"receive_ai_confirm_yes", "receive_ai_confirm_no"})
+    )
+)
 async def receive_ai_confirm(callback: CallbackQuery, callback_data: WarehouseCallbackData, state: FSMContext) -> None:
     await callback.answer()
     data = await state.get_data()
     items_raw = data.get("ai_items") or []
-    if callback_data.decision == "no":
+    if callback_data.action == "receive_ai_confirm_no":
         await state.set_state(WarehouseStates.receive_ai_text)
         await send_section_message(
             SECTION_WAREHOUSE_PROMPT,
@@ -716,7 +729,7 @@ async def confirm_pick(callback: CallbackQuery, callback_data: WarehouseCallback
     await callback.answer()
     data = await state.get_data()
     plan = data.get("pick_plan") or []
-    posting_number = callback_data.posting_number or data.get("posting_number") or ""
+    posting_number = data.get("posting_number") or ""
     _apply_pick_plan(posting_number, plan)
     await state.clear()
     await delete_section_message(callback.from_user.id, SECTION_WAREHOUSE_PLAN, callback.message.bot)
