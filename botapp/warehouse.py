@@ -38,7 +38,7 @@ from botapp.products_service import (
     update_barcode_in_cache,
 )
 from botapp.states import WarehouseStates
-from botapp.utils import send_ephemeral_message
+from botapp.utils import send_ephemeral_from_callback, send_ephemeral_message
 from botapp.warehouse_models import (
     Box,
     Location,
@@ -161,13 +161,13 @@ async def open_warehouse(callback: CallbackQuery, callback_data: MenuCallbackDat
 @router.callback_query(WarehouseCallbackData.filter(F.action == "risk"))
 async def warehouse_risk_stub(callback: CallbackQuery) -> None:
     await callback.answer()
-    await send_ephemeral_message(callback, "Скоро покажем риск остатков.")
+    await send_ephemeral_from_callback(callback, "Скоро покажем риск остатков.")
 
 
 @router.callback_query(WarehouseCallbackData.filter(F.action == "ask_ai"))
 async def warehouse_ai_stub(callback: CallbackQuery) -> None:
     await callback.answer()
-    await send_ephemeral_message(callback, "ИИ-помощник для склада появится позже.")
+    await send_ephemeral_from_callback(callback, "ИИ-помощник для склада появится позже.")
 
 
 @router.callback_query(WarehouseCallbackData.filter(F.action == "receive"))
@@ -308,12 +308,12 @@ async def receive_choose(callback: CallbackQuery, callback_data: WarehouseCallba
     await callback.answer()
     product_id = callback_data.product_id
     if product_id is None:
-        await send_ephemeral_message(callback, "Не удалось определить товар.")
+        await send_ephemeral_from_callback(callback, "Не удалось определить товар.")
         return
     catalog = await get_catalog()
     item = next((p for p in catalog if p.ozon_product_id == product_id), None)
     if item is None:
-        await send_ephemeral_message(callback, "Товар не найден в каталоге, обновите список.")
+        await send_ephemeral_from_callback(callback, "Товар не найден в каталоге, обновите список.")
         return
     await state.update_data(selected_product=item.model_dump())
     await state.set_state(WarehouseStates.receive_quantity_manual)
@@ -400,7 +400,7 @@ async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbac
     product_raw = data.get("selected_product")
     qty = data.get("quantity")
     if not product_raw or qty is None:
-        await send_ephemeral_message(callback, "Не выбрали товар или количество.")
+        await send_ephemeral_from_callback(callback, "Не выбрали товар или количество.")
         await state.clear()
         return
     product = CatalogProduct.model_validate(product_raw)
@@ -448,9 +448,9 @@ async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbac
                 logger.warning("Barcode generation failed: %s", exc)
 
         if not product.barcode:
-            await send_ephemeral_message(
+            await send_ephemeral_from_callback(
                 callback,
-                text="Не удалось получить штрихкод, записали количество без файла.",
+                "Не удалось получить штрихкод, записали количество без файла.",
             )
         else:
             try:
@@ -465,9 +465,9 @@ async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbac
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Failed to build/send labels file: %s", exc)
-                await send_ephemeral_message(
+                await send_ephemeral_from_callback(
                     callback,
-                    text="Записал количество, но не смог сформировать файл этикеток.",
+                    "Записал количество, но не смог сформировать файл этикеток.",
                 )
 
     await state.clear()
@@ -558,7 +558,7 @@ async def receive_ai_confirm(callback: CallbackQuery, callback_data: WarehouseCa
 
     await state.clear()
     if not summary_lines:
-        await send_ephemeral_message(callback, "Не удалось записать приёмку.")
+        await send_ephemeral_from_callback(callback, "Не удалось записать приёмку.")
         return
 
     await send_section_message(
@@ -751,7 +751,7 @@ async def cancel_pick(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.clear()
     await delete_section_message(callback.from_user.id, SECTION_WAREHOUSE_PLAN, callback.message.bot)
-    await send_ephemeral_message(callback, "Отбор отменён.")
+    await send_ephemeral_from_callback(callback, "Отбор отменён.")
 
 
 @router.callback_query(WarehouseCallbackData.filter(F.action == "inventory"))
