@@ -934,21 +934,14 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
         await callback.answer()
         if not review_id:
             await send_ephemeral_message(
-                callback.message.bot,
-                callback.message.chat.id,
+                callback,
                 "Не удалось определить ID отзыва, попробуйте обновить список.",
-                user_id=user_id,
             )
             return
 
         review, _ = await get_review_by_id(user_id, category, review_id)
         if not review:
-            await send_ephemeral_message(
-                callback.message.bot,
-                callback.message.chat.id,
-                "Отзыв не найден, обновите список.",
-                user_id=user_id,
-            )
+            await send_ephemeral_message(callback, "Отзыв не найден, обновите список.")
             return
 
         final_answer = await _get_local_answer(user_id, review.id)
@@ -959,20 +952,15 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
 
         if not final_answer:
             await send_ephemeral_message(
-                callback.message.bot,
-                callback.message.chat.id,
+                callback,
                 "Нет сохранённого текста ответа. Сначала сгенерируйте или введите ответ.",
-                user_id=user_id,
             )
             return
 
         client = get_write_client()
         if not client:
             await send_ephemeral_message(
-                callback.message.bot,
-                callback.message.chat.id,
-                "Отправка на Ozon недоступна: не задан OZON_API_KEY.",
-                user_id=user_id,
+                callback, "Отправка на Ozon недоступна: не задан OZON_API_KEY."
             )
             return
 
@@ -983,10 +971,8 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
             _local_answers[(user_id, review.id)] = final_answer
             _local_answer_status[(user_id, review.id)] = "error"
             await send_ephemeral_message(
-                callback.message.bot,
-                callback.message.chat.id,
+                callback,
                 "Не удалось отправить ответ в Ozon. Проверьте права API‑ключа OZON_API_KEY в личном кабинете Ozon или попробуйте позже.",
-                user_id=user_id,
             )
             return
 
@@ -994,12 +980,7 @@ async def cb_reviews(callback: CallbackQuery, callback_data: ReviewsCallbackData
         _local_answer_status[(user_id, review.id)] = "sent"
         mark_review_answered(review.id, user_id, final_answer)
         await refresh_reviews(user_id)
-        await send_ephemeral_message(
-            callback.message.bot,
-            callback.message.chat.id,
-            "Ответ отправлен в Ozon ✅",
-            user_id=user_id,
-        )
+        await send_ephemeral_message(callback, "Ответ отправлен в Ozon ✅")
         await _send_review_card(
             user_id=user_id,
             category=category,
