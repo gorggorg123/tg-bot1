@@ -461,6 +461,12 @@ async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbac
         )
 
         if not product.barcode:
+            product.barcode = product.sku or str(stored_product.sku)
+            logger.info(
+                "Warehouse labels: using synthetic internal barcode %s for product %s",
+                product.barcode,
+                product.name,
+            )
             await send_ephemeral_from_callback(
                 callback,
                 "Не удалось получить штрихкод от Ozon для этого товара. Этикетки не сформированы.",
