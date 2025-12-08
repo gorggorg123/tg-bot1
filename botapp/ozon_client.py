@@ -1241,6 +1241,17 @@ class ProductInfoItem(BaseModel):
         extra="ignore", protected_namespaces=(), populate_by_name=True
     )
 
+    @field_validator("product_id", mode="before")
+    @classmethod
+    def _coerce_product_id(cls, value: Any) -> Any:
+        """Allow integer IDs while keeping the field as string internally."""
+        if value is None:
+            return value
+        try:
+            return str(value)
+        except Exception:
+            return value
+
 
 
 _client_read: OzonClient | None = None
