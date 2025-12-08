@@ -1069,18 +1069,35 @@ class OzonClient:
         else:
             body = {"sku": [str(s) for s in skus]}
 
+        logger.debug(
+            "Ozon /v3/product/info/list request: %s", body,
+        )
         status_code, data = await self._post_with_status("/v3/product/info/list", body)
+        logger.info(
+            "Ozon /v3/product/info/list HTTP %s, payload keys=%s",
+            status_code,
+            list(data.keys()) if isinstance(data, dict) else None,
+        )
         if status_code >= 400:
             raise OzonAPIError(
                 f"Product info list failed with HTTP {status_code}: {data}"
             )
 
-        payload = data.get("result") if isinstance(data, dict) else None
-        items_raw = []
-        if isinstance(payload, list):
-            items_raw = payload
-        elif isinstance(payload, dict):
-            items_raw = payload.get("items") if isinstance(payload.get("items"), list) else []
+        payload_candidates: list[Any] = []
+        if isinstance(data, dict):
+            payload_candidates.append(data.get("result"))
+            payload_candidates.append(data)
+
+        items_raw: list[Any] = []
+        for payload in payload_candidates:
+            if isinstance(payload, list):
+                items_raw = payload
+                break
+            if isinstance(payload, dict):
+                maybe_items = payload.get("items")
+                if isinstance(maybe_items, list):
+                    items_raw = maybe_items
+                    break
 
         items: list[ProductInfoItem] = []
         for raw in items_raw:
@@ -1109,7 +1126,13 @@ class OzonClient:
             raise ValueError("generate_barcodes: product_ids must not be empty")
 
         body: Dict[str, Any] = {"product_ids": product_ids}
+        logger.debug("Ozon /v1/barcode/generate request: %s", body)
         status_code, data = await self._post_with_status("/v1/barcode/generate", body)
+        logger.info(
+            "Ozon /v1/barcode/generate HTTP %s, payload keys=%s",
+            status_code,
+            list(data.keys()) if isinstance(data, dict) else None,
+        )
         if status_code >= 400:
             raise OzonAPIError(
                 f"Barcode generation failed with HTTP {status_code}: {data}"
@@ -1207,14 +1230,27 @@ class ProductListPage(BaseModel):
 
 
 class ProductInfoItem(BaseModel):
-    product_id: str | None = None
+    product_id: str | None = Field(default=None, alias="id")
     offer_id: str | None = None
     sku: int | None = None
     name: str | None = None
     barcode: str | None = None
     barcodes: list[str] = Field(default_factory=list)
 
-    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+    model_config = ConfigDict(
+        extra="ignore", protected_namespaces=(), populate_by_name=True
+    )
+
+    @field_validator("product_id", mode="before")
+    @classmethod
+    def _coerce_product_id(cls, value: Any) -> Any:
+        """Allow integer IDs while keeping the field as string internally."""
+        if value is None:
+            return value
+        try:
+            return str(value)
+        except Exception:
+            return value
 
 
 
