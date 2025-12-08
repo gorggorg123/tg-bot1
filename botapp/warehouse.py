@@ -28,7 +28,7 @@ from botapp.message_gc import (
     delete_section_message,
     send_section_message,
 )
-from botapp.ozon_client import get_client, get_posting_details
+from botapp.ozon_client import OzonClient, get_client, get_posting_details
 from botapp.products_service import (
     CatalogProduct,
     find_by_sku,
@@ -391,6 +391,95 @@ async def _record_receipt(product: CatalogProduct, quantity: int) -> tuple[Produ
     return stored, box
 
 
+async def ensure_ozon_barcode(client: OzonClient, product: CatalogProduct) -> str | None:
+    """
+    Попробовать получить штрихкод для товара ИСКЛЮЧИТЕЛЬНО из Ozon.
+
+    1. Если в product.barcode уже есть значение — вернуть его.
+    2. Если есть ozon_product_id:
+       2.1) запросить /v3/product/info/list и попытаться взять barcode/barcodes;
+       2.2) если пусто — вызвать /v1/barcode/generate;
+       2.3) затем снова запросить /v3/product/info/list.
+    3. Ошибки логируются, но не приводят к синтетическим штрихкодам.
+    4. При успешном получении обновляем product.barcode и локальный кэш.
+    """
+
+    if product.barcode:
+        return product.barcode
+
+    if product.ozon_product_id is None:
+        logger.info(
+            "ensure_ozon_barcode: product %s has no ozon_product_id, skipping fetch",
+            product.sku,
+        )
+        return None
+
+    def _pick_barcode(items: list[Any]) -> str | None:
+        for info in items:
+            candidate = getattr(info, "barcode", None) or next(
+                (b for b in getattr(info, "barcodes", []) if b), None
+            )
+            if candidate:
+                return str(candidate)
+        return None
+
+    barcode_value: str | None = None
+
+    try:
+        try:
+            info_list = await client.get_product_info_list(
+                product_ids=[product.ozon_product_id]
+            )
+            barcode_value = _pick_barcode(info_list)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to fetch product info for barcode: %s", exc)
+
+        if not barcode_value:
+            try:
+                barcodes = await client.generate_barcodes(
+                    product_ids=[product.ozon_product_id]
+                )
+                generated = barcodes[0] if barcodes else None
+                if generated:
+                    barcode_value = str(generated)
+                    try:
+                        await client.add_barcode(product.sku, barcode_value)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.info(
+                            "Could not attach barcode %s to offer %s: %s",
+                            barcode_value,
+                            product.sku,
+                            exc,
+                        )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Barcode generation failed: %s", exc)
+
+        if not barcode_value:
+            try:
+                info_list = await client.get_product_info_list(
+                    product_ids=[product.ozon_product_id]
+                )
+                barcode_value = _pick_barcode(info_list)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to re-fetch product info after barcode generation: %s",
+                    exc,
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("ensure_ozon_barcode failed for product %s: %s", product.sku, exc)
+        return None
+
+    if barcode_value:
+        product.barcode = barcode_value
+        try:
+            await update_barcode_in_cache(product.sku, barcode_value)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to update barcode cache for %s: %s", product.sku, exc)
+        return barcode_value
+
+    return None
+
+
 @router.callback_query(
     WarehouseCallbackData.filter(F.action.in_({"labels_yes", "labels_no"}))
 )
@@ -416,57 +505,16 @@ async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbac
 
     if callback_data.action == "labels_yes":
         client = get_client()
-
-        if product.ozon_product_id is not None:
-            try:
-                info_list = await client.get_product_info_list(
-                    product_ids=[product.ozon_product_id]
-                )
-                info = next(iter(info_list), None)
-                if info:
-                    barcode_value = info.barcode or next(
-                        (b for b in info.barcodes if b), None
-                    )
-                    if barcode_value:
-                        product.barcode = str(barcode_value)
-                        await update_barcode_in_cache(product.sku, barcode_value)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to refresh product info for barcode: %s", exc)
-
-        if not product.barcode and product.ozon_product_id is not None:
-            try:
-                barcodes = await client.generate_barcodes(
-                    product_ids=[product.ozon_product_id]
-                )
-                barcode_value = barcodes[0] if barcodes else None
-                if barcode_value:
-                    product.barcode = str(barcode_value)
-                    await update_barcode_in_cache(product.sku, product.barcode)
-                    try:
-                        await client.add_barcode(product.sku, product.barcode)
-                    except Exception:  # noqa: BLE001
-                        logger.info(
-                            "Could not attach barcode %s to offer %s",
-                            barcode_value,
-                            product.sku,
-                        )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Barcode generation failed: %s", exc)
+        barcode_value = await ensure_ozon_barcode(client, product)
 
         logger.info(
-            "Warehouse labels: final Ozon barcode for product %s is %s (qty=%s)",
+            "Warehouse labels: final Ozon barcode for product %s is %r (qty=%s)",
             product.name,
-            product.barcode,
+            barcode_value,
             qty,
         )
 
-        if not product.barcode:
-            product.barcode = product.sku or str(stored_product.sku)
-            logger.info(
-                "Warehouse labels: using synthetic internal barcode %s for product %s",
-                product.barcode,
-                product.name,
-            )
+        if not barcode_value:
             await send_ephemeral_from_callback(
                 callback,
                 "Не удалось получить штрихкод от Ozon для этого товара. Этикетки не сформированы.",
@@ -483,6 +531,7 @@ async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbac
             )
             return
 
+        product.barcode = barcode_value
         try:
             pdf_bytes = await build_labels_pdf(product, int(qty))
             file = BufferedInputFile(
