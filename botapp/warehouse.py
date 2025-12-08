@@ -399,6 +399,12 @@ async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbac
     data = await state.get_data()
     product_raw = data.get("selected_product")
     qty = data.get("quantity")
+    logger.info(
+        "Warehouse labels: action=%s, product_raw=%r, qty=%r",
+        callback_data.action,
+        product_raw,
+        qty,
+    )
     if not product_raw or qty is None:
         await send_ephemeral_from_callback(callback, "Не выбрали товар или количество.")
         await state.clear()
@@ -447,6 +453,13 @@ async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbac
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Barcode generation failed: %s", exc)
 
+        logger.info(
+            "Warehouse labels: final barcode for product %s is %r (qty=%s)",
+            product.sku,
+            product.barcode,
+            qty,
+        )
+
         if not product.barcode:
             await send_ephemeral_from_callback(
                 callback,
@@ -464,7 +477,13 @@ async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbac
                     caption=f"Этикетки для {product.name} × {qty}",
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.exception("Failed to build/send labels file: %s", exc)
+                logger.exception(
+                    "Failed to build/send labels file for sku=%s, barcode=%r, qty=%s: %s",
+                    product.sku,
+                    product.barcode,
+                    qty,
+                    exc,
+                )
                 await send_ephemeral_from_callback(
                     callback,
                     "Записал количество, но не смог сформировать файл этикеток.",

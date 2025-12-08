@@ -35,6 +35,13 @@ async def build_labels_pdf(product: CatalogProduct, quantity: int) -> bytes:
     label_height = 50 * mm
     font_name = _get_primary_font()
 
+    logger.info(
+        "Building labels PDF: product=%s, barcode=%r, quantity=%s",
+        product.sku,
+        product.barcode,
+        quantity,
+    )
+
     barcode_buffer = None
     image_reader = None
     try:
@@ -118,14 +125,21 @@ def _safe_draw_string(
 
     safe_font = font_name or "Helvetica"
     try:
-        pdf_canvas.setFont(safe_font + ("-Bold" if bold and not font_name else ""), font_size)
+        pdf_canvas.setFont(
+            safe_font + ("-Bold" if bold and not font_name else ""), font_size
+        )
         pdf_canvas.drawString(x, y, text or "")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Falling back to ASCII-only labels: {}", exc)
         sanitized = (text or "").encode("latin-1", "ignore").decode("latin-1")
         fallback_font = "Helvetica-Bold" if bold else "Helvetica"
-        pdf_canvas.setFont(fallback_font, font_size)
-        pdf_canvas.drawString(x, y, sanitized)
+        try:
+            pdf_canvas.setFont(fallback_font, font_size)
+            pdf_canvas.drawString(x, y, sanitized)
+        except Exception as fallback_exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to render even sanitized label text: %s", fallback_exc
+            )
 
 
 def _get_primary_font() -> str | None:
