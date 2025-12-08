@@ -469,8 +469,19 @@ async def handle_labels(callback: CallbackQuery, callback_data: WarehouseCallbac
             )
             await send_ephemeral_from_callback(
                 callback,
-                "Не удалось получить штрихкод от Ozon, печатаю этикетки с внутренним кодом товара (по SKU).",
+                "Не удалось получить штрихкод от Ozon для этого товара. Этикетки не сформированы.",
             )
+            await state.clear()
+            await send_section_message(
+                SECTION_WAREHOUSE_PROMPT,
+                text=(
+                    f"✅ Записал: {stored_product.name} — {qty} шт. "
+                    f"Текущий остаток в цеху: {total} шт."
+                ),
+                callback=callback,
+                user_id=callback.from_user.id,
+            )
+            return
 
         try:
             pdf_bytes = await build_labels_pdf(product, int(qty))
