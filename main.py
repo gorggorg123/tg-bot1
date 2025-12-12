@@ -228,19 +228,31 @@ async def _send_questions_list(
             user_id=user_id, category=category, page=page
         )
     except OzonAPIError as exc:
-        target = callback.message if callback else message
-        if target:
+        if callback:
             await send_ephemeral_message(
-                callback or target,
+                callback,
+                None,
+                f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
+            )
+        elif bot and chat_id:
+            await send_ephemeral_message(
+                bot,
+                chat_id,
                 f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
             )
         logger.warning("Unable to load questions list: %s", exc)
         return
     except Exception:
-        target = callback.message if callback else message
-        if target:
+        if callback:
             await send_ephemeral_message(
-                callback or target,
+                callback,
+                None,
+                "⚠️ Не удалось получить список вопросов. Попробуйте позже.",
+            )
+        elif bot and chat_id:
+            await send_ephemeral_message(
+                bot,
+                chat_id,
                 "⚠️ Не удалось получить список вопросов. Попробуйте позже.",
             )
         logger.exception("Unexpected error while loading questions list")

@@ -470,8 +470,10 @@ def _status_badge_question(q: Question) -> tuple[str, str]:
 
 
 def _pick_short_product_label_question(q: Question) -> str:
-    product_name = (getattr(q, "product_name", None) or "").strip()
-    sku = (getattr(q, "sku", None) or "").strip()
+    raw_product_name = getattr(q, "product_name", None)
+    product_name = str(raw_product_name).strip() if raw_product_name is not None else ""
+    raw_sku = getattr(q, "sku", None)
+    sku = str(raw_sku).strip() if raw_sku not in (None, "") else ""
     if product_name:
         return product_name[:50] + ("…" if len(product_name) > 50 else "")
     if sku:
