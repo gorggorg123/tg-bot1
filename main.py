@@ -69,6 +69,7 @@ from botapp.questions import (
     format_question_card_text,
     get_question_by_index,
     get_question_index,
+    get_questions_pretty_period,
     get_questions_table,
     ensure_question_answer_text,
     refresh_questions,
@@ -639,7 +640,11 @@ async def _send_question_card(
 
     await ensure_question_answer_text(resolved_question)
 
-    text = format_question_card_text(resolved_question, answer_override=answer_override)
+    period_title = get_questions_pretty_period(user_id)
+
+    text = format_question_card_text(
+        resolved_question, answer_override=answer_override, period_title=period_title
+    )
     markup = question_card_keyboard(
         category=category,
         page=page,

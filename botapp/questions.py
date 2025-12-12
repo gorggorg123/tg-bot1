@@ -51,6 +51,8 @@ class QuestionsSession:
     unanswered: List[Question] = field(default_factory=list)
     answered: List[Question] = field(default_factory=list)
 
+    pretty_period: str = ""
+
     # Текущие страницы по категориям (для возможной навигации)
     page: Dict[str, int] = field(
         default_factory=lambda: {"all": 0, "unanswered": 0, "answered": 0}
@@ -264,6 +266,20 @@ async def refresh_questions(user_id: int, category: str) -> List[Question]:
     session.loaded_at = datetime.utcnow()
     session.tokens.clear()
 
+    dates_msk = []
+    for q in questions:
+        created = _parse_date(getattr(q, "created_at", None))
+        msk = _to_msk(created)
+        if msk:
+            dates_msk.append(msk)
+
+    if dates_msk:
+        start = min(dates_msk)
+        end = max(dates_msk)
+        session.pretty_period = f"{start:%d.%m.%Y} 00:00 — {end:%d.%m.%Y %H:%M} (МСК)"
+    else:
+        session.pretty_period = "период не определён"
+
     return _filter_by_category(questions, category)
 
 
@@ -322,75 +338,24 @@ async def get_questions_table(
     category: str,
     page: int = 0,
 ) -> tuple[str, List[tuple[str, str, int]], int, int]:
-    """Вернуть (text, items, current_page, total_pages) для списка вопросов.
+    """Вернуть (text, items, current_page, total_pages) для списка вопросов."""
 
-    text  — многострочный текст для сообщения.
-    items — список (label, question_id, absolute_index) для клавиатуры.
-    """
     questions = _get_cached_questions(user_id, category)
     if not questions:
         questions = await refresh_questions(user_id, category)
 
-    total = len(questions)
-    total_pages = max((total - 1) // QUESTIONS_PAGE_SIZE + 1, 1)
+    session = _get_session(user_id)
+    pretty_period = session.pretty_period or "период не определён"
 
-    safe_page = max(0, min(page, total_pages - 1))
-    start = safe_page * QUESTIONS_PAGE_SIZE
-    end = start + QUESTIONS_PAGE_SIZE
-    page_items = questions[start:end]
+    text, items, safe_page, total_pages = build_questions_table(
+        cards=questions,
+        pretty_period=pretty_period,
+        category=(category or "all").lower(),
+        page=page,
+        page_size=QUESTIONS_PAGE_SIZE,
+    )
 
-    lines: List[str] = ["❓ Вопросы покупателей"]
-
-    pretty_category = {
-        "all": "Все",
-        "unanswered": "Без ответа",
-        "answered": "С ответом",
-    }.get((category or "all").lower(), category)
-
-    lines.append(f"Категория: {pretty_category}")
-    lines.append("✅ — есть ответ, ❗ — нет ответа")
-
-    if not page_items:
-        lines.append("")
-        lines.append("Нет вопросов в этой категории.")
-    else:
-        lines.append("")
-        for idx, q in enumerate(page_items, start=start + 1):
-            created = _parse_date(getattr(q, "created_at", None))
-            created_text = _fmt_dt_msk(created) or "—"
-            age_text = _human_age(created)
-            status_icon = "✅" if getattr(q, "has_answer", False) else "❗"
-            product_name = (getattr(q, "product_name", None) or "").strip() or "—"
-
-            lines.append(
-                f"{idx}. {status_icon} "
-                f"{created_text} ({age_text or '—'}) | "
-                f"Товар: {product_name[:70]}"
-            )
-
-    # Для клавиатуры: label, question_id, абсолютный индекс
-    items: List[tuple[str, str, int]] = []
-
-    for rel_idx, q in enumerate(page_items):
-        created = _parse_date(getattr(q, "created_at", None))
-        created_text = _fmt_dt_msk(created) or "—"
-        age_text = _human_age(created)
-        status_icon = "✅" if getattr(q, "has_answer", False) else "❗"
-        product_name = (getattr(q, "product_name", None) or "").strip() or "—"
-
-        label = (
-            f"{status_icon} {created_text} "
-            f"({age_text or '—'}) | Товар: {product_name[:40]}"
-        )
-
-        question_id = getattr(q, "id", None)
-        if not question_id:
-            # На всякий случай, если вдруг нет id
-            continue
-
-        items.append((label, str(question_id), start + rel_idx))
-
-    return "\n".join(lines), items, safe_page, total_pages
+    return text, items, safe_page, total_pages
 
 
 # ---------------------------------------------------------------------------
@@ -441,41 +406,124 @@ def format_question_card_text(
     question: Question,
     answer_override: Optional[str] = None,
     answers_count: Optional[int] = None,
+    *,
+    period_title: str,
 ) -> str:
     """Собираем человекочитаемую карточку вопроса для Telegram."""
 
     created = _parse_date(getattr(question, "created_at", None))
     product_name = getattr(question, "product_name", None) or "—"
-    status_raw = (getattr(question, "status", None) or "").upper()
-    status_text = (
-        "Ответ дан" if getattr(question, "has_answer", False) or status_raw == "PROCESSED" else "Без ответа"
-    )
-    answers_count = getattr(question, "answers_count", None)
+    status_icon, status_text = _status_badge_question(question)
+
+    sku_part = ""
+    if getattr(question, "sku", None):
+        sku_part = f" (SKU: {question.sku})"
+
+    header_date = _fmt_dt_msk(created) or "—"
 
     lines: List[str] = [
-        "❓ Вопрос покупателя",
-        f"Товар: {product_name}",
-        f"Дата: {_fmt_dt_msk(created)} (МСК)",
-        f"Статус: {status_text}",
-        f"Статус Ozon: {status_raw or '—'}",
-        f"Ответов: {answers_count if answers_count is not None else '—'}",
+        f"❓ • {header_date} • {period_title}",
+        f"Позиция: {product_name}{sku_part}",
+        f"ID вопроса: {getattr(question, 'id', '—')}",
         "",
-        "Вопрос:",
-        getattr(question, "question_text", None) or
-        getattr(question, "text", None) or
-        getattr(question, "message", None) or
-        "—",
+        "Текст вопроса:",
+        getattr(question, "question_text", None)
+        or getattr(question, "text", None)
+        or getattr(question, "message", None)
+        or "—",
+        "",
+        f"Статус: {status_icon} {status_text}",
+        "",
+        "Ответ продавца:",
     ]
 
     answer_text = (
         (answer_override or "").strip()
         or (getattr(question, "answer_text", None) or "").strip()
-        or "ответ пока не задан"
     )
 
-    lines.extend(["", "Текущий ответ ITOM:", answer_text])
+    if not answer_text:
+        answer_text = "Ответа продавца пока нет."
+
+    lines.append(answer_text)
 
     return "\n".join(lines)
+
+
+def _slice_questions(items: List[Question], page: int, page_size: int) -> tuple[List[Question], int, int]:
+    total = len(items)
+    total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+    safe_page = max(0, min(page, total_pages - 1))
+    start = safe_page * page_size
+    end = start + page_size
+    return items[start:end], safe_page, total_pages
+
+
+def _status_badge_question(q: Question) -> tuple[str, str]:
+    if (
+        getattr(q, "has_answer", False)
+        or (getattr(q, "answer_text", None) or "").strip()
+        or (getattr(q, "status", "") or "").upper() == "PROCESSED"
+    ):
+        return "✅", "Ответ есть"
+    return "✏️", "Без ответа"
+
+
+def _pick_short_product_label_question(q: Question) -> str:
+    product_name = (getattr(q, "product_name", None) or "").strip()
+    sku = (getattr(q, "sku", None) or "").strip()
+    if product_name:
+        return product_name[:50] + ("…" if len(product_name) > 50 else "")
+    if sku:
+        return f"Артикул: {sku}"
+    return "—"
+
+
+def build_questions_table(
+    *,
+    cards: List[Question],
+    pretty_period: str,
+    category: str,
+    page: int = 0,
+    page_size: int = QUESTIONS_PAGE_SIZE,
+) -> tuple[str, List[tuple[str, str, int]], int, int]:
+    """Собрать текст таблицы и кнопки для списка вопросов."""
+
+    slice_items, safe_page, total_pages = _slice_questions(cards, page, page_size)
+    rows: List[str] = [f"❓ Вопросы ({category})", pretty_period, "", f"Страница {safe_page + 1}/{total_pages}"]
+    items: List[tuple[str, str, int]] = []
+
+    for idx, q in enumerate(slice_items):
+        global_index = safe_page * page_size + idx
+        status_icon, status_text = _status_badge_question(q)
+        product_short = _pick_short_product_label_question(q)
+        snippet = (getattr(q, "question_text", None) or getattr(q, "text", None) or "").strip()
+        if len(snippet) > 50:
+            snippet = snippet[:47] + "…"
+        created_at = _parse_date(getattr(q, "created_at", None))
+        date_part = _fmt_dt_msk(created_at) or "дата неизвестна"
+        age = _human_age(created_at)
+        age_part = f" ({age})" if age else ""
+        status_label = status_text.upper() if status_text else ""
+        label = (
+            f"{status_icon} | {date_part}{age_part} | "
+            f"Товар: {product_short} | {status_label or 'СТАТУС НЕИЗВЕСТЕН'}"
+        )
+        if snippet:
+            label = f"{label} | {snippet}"
+
+        question_id = getattr(q, "id", None)
+        if not question_id:
+            continue
+        items.append((label, str(question_id), global_index))
+
+    text = "\n".join(rows)
+    return text, items, safe_page, total_pages
+
+
+def get_questions_pretty_period(user_id: int) -> str:
+    session = _get_session(user_id)
+    return session.pretty_period or ""
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +557,7 @@ __all__ = [
     "get_questions_table",
     "get_question_by_index",
     "get_question_index",
+    "get_questions_pretty_period",
     "find_question",
     "resolve_question_id",
     "format_question_card_text",
