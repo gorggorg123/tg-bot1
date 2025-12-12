@@ -822,18 +822,17 @@ def questions_list_keyboard(
             ]
         )
 
-    active_cat = (category or "all").lower()
     filter_row = [
         InlineKeyboardButton(
-            text=("✅ Все" if active_cat == "all" else "Все"),
+            text="Все",
             callback_data=QuestionsCallbackData(action="list", category="all", page=0).pack(),
         ),
         InlineKeyboardButton(
-            text=("✅ Без ответа" if active_cat == "unanswered" else "Без ответа"),
+            text="Без ответа",
             callback_data=QuestionsCallbackData(action="list", category="unanswered", page=0).pack(),
         ),
         InlineKeyboardButton(
-            text=("✅ С ответом" if active_cat == "answered" else "С ответом"),
+            text="С ответом",
             callback_data=QuestionsCallbackData(action="list", category="answered", page=0).pack(),
         ),
     ]
