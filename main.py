@@ -69,6 +69,7 @@ from botapp.questions import (
     format_question_card_text,
     get_question_by_index,
     get_question_index,
+    get_questions_pretty_period,
     get_questions_table,
     ensure_question_answer_text,
     refresh_questions,
@@ -227,19 +228,31 @@ async def _send_questions_list(
             user_id=user_id, category=category, page=page
         )
     except OzonAPIError as exc:
-        target = callback.message if callback else message
-        if target:
+        if callback:
             await send_ephemeral_message(
-                callback or target,
+                callback,
+                None,
+                f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
+            )
+        elif bot and chat_id:
+            await send_ephemeral_message(
+                bot,
+                chat_id,
                 f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
             )
         logger.warning("Unable to load questions list: %s", exc)
         return
     except Exception:
-        target = callback.message if callback else message
-        if target:
+        if callback:
             await send_ephemeral_message(
-                callback or target,
+                callback,
+                None,
+                "⚠️ Не удалось получить список вопросов. Попробуйте позже.",
+            )
+        elif bot and chat_id:
+            await send_ephemeral_message(
+                bot,
+                chat_id,
                 "⚠️ Не удалось получить список вопросов. Попробуйте позже.",
             )
         logger.exception("Unexpected error while loading questions list")
@@ -639,7 +652,11 @@ async def _send_question_card(
 
     await ensure_question_answer_text(resolved_question)
 
-    text = format_question_card_text(resolved_question, answer_override=answer_override)
+    period_title = get_questions_pretty_period(user_id)
+
+    text = format_question_card_text(
+        resolved_question, answer_override=answer_override, period_title=period_title
+    )
     markup = question_card_keyboard(
         category=category,
         page=page,

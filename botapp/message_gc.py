@@ -169,6 +169,28 @@ async def send_section_message(
             )
             return edited
         except TelegramBadRequest as exc:
+            lower_exc = str(exc).lower()
+            if "message is not modified" in lower_exc:
+                logger.debug(
+                    "Section '%s' message %s for user %s is unchanged; keeping as-is",
+                    section,
+                    stored.message_id,
+                    active_user,
+                )
+                _remember_message(
+                    active_user,
+                    section,
+                    stored.chat_id,
+                    stored.message_id,
+                    persistent=stored.persistent or persistent,
+                )
+                if callback and callback.message and callback.message.message_id == stored.message_id:
+                    return callback.message
+                if message and message.message_id == stored.message_id:
+                    return message
+                fallback = callback.message if callback and callback.message else message
+                return fallback
+
             logger.info(
                 "Cannot edit previous section '%s' message %s for user %s: %s",
                 section,
@@ -201,6 +223,22 @@ async def send_section_message(
                     await delete_message_safe(active_bot, stored.chat_id, stored.message_id)
             return edited
         except TelegramBadRequest as exc:
+            lower_exc = str(exc).lower()
+            if "message is not modified" in lower_exc:
+                logger.debug(
+                    "Callback message for section '%s' in chat %s unchanged; keeping",
+                    section,
+                    active_chat,
+                )
+                _remember_message(
+                    active_user,
+                    section,
+                    active_chat,
+                    callback.message.message_id,
+                    persistent=persistent,
+                )
+                return callback.message
+
             logger.info(
                 "Callback message edit failed for section '%s' in chat %s: %s",
                 section,
