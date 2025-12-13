@@ -14,6 +14,7 @@ from botapp.ozon_client import (
     ProductListItem,
     get_client,
 )
+from botapp.persist import get_persist_dir, load_json, save_json_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,61 @@ class CatalogProduct(BaseModel):
 
 _catalog_cache: list[CatalogProduct] = []
 _catalog_updated_at: datetime | None = None
+_catalog_loaded_from_disk = False
+_PERSIST_PATH = get_persist_dir() / "products_catalog.json"
 _CATALOG_TTL = timedelta(minutes=15)
+
+
+def _is_cache_fresh() -> bool:
+    if not _catalog_cache or not _catalog_updated_at:
+        return False
+    return datetime.utcnow() - _catalog_updated_at < _CATALOG_TTL
+
+
+def _load_catalog_from_disk() -> bool:
+    """Attempt to hydrate the in-memory cache from persisted JSON."""
+
+    global _catalog_cache, _catalog_updated_at, _catalog_loaded_from_disk
+
+    _catalog_loaded_from_disk = True
+    data = load_json(_PERSIST_PATH)
+    if not data:
+        return False
+
+    items = data.get("items")
+    if not isinstance(items, list):
+        return False
+
+    saved_at_raw = data.get("saved_at")
+    saved_at: datetime | None = None
+    if saved_at_raw:
+        try:
+            saved_at = datetime.fromisoformat(saved_at_raw)
+        except ValueError:
+            saved_at = None
+
+    if saved_at is None:
+        try:
+            saved_at = datetime.utcfromtimestamp(_PERSIST_PATH.stat().st_mtime)
+        except OSError:
+            saved_at = None
+
+    if saved_at and datetime.utcnow() - saved_at > _CATALOG_TTL:
+        return False
+
+    loaded: list[CatalogProduct] = []
+    for raw in items:
+        try:
+            loaded.append(CatalogProduct(**raw))
+        except Exception as exc:  # pragma: no cover - best effort load
+            logger.debug("Skip malformed cached product: %s", exc)
+
+    if not loaded:
+        return False
+
+    _catalog_cache = loaded
+    _catalog_updated_at = saved_at or datetime.utcnow()
+    return True
 
 
 async def _fetch_product_list() -> list[ProductListItem]:
@@ -121,11 +176,22 @@ async def refresh_catalog_from_ozon(force: bool = False) -> list[CatalogProduct]
 
     _catalog_cache = [_to_catalog_product(item, info_map) for item in filtered]
     _catalog_updated_at = now
+    try:
+        payload = {
+            "saved_at": now.isoformat(),
+            "items": [item.model_dump() for item in _catalog_cache],
+        }
+        save_json_atomic(_PERSIST_PATH, payload)
+    except Exception as exc:  # pragma: no cover - defensive persistence
+        logger.warning("Failed to persist product catalog: %s", exc)
     return _catalog_cache
 
 
 async def get_catalog(force_refresh: bool = False) -> list[CatalogProduct]:
-    if not _catalog_cache or force_refresh:
+    if not _catalog_cache and not _catalog_loaded_from_disk:
+        _load_catalog_from_disk()
+
+    if force_refresh or not _catalog_cache or not _is_cache_fresh():
         return await refresh_catalog_from_ozon(force=force_refresh)
     return _catalog_cache
 

@@ -1,8 +1,10 @@
 # botapp/ozon_client.py
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
@@ -305,7 +307,58 @@ class OzonClient:
 
         suffix = path if path.startswith("/") else f"/{path}"
         url = f"{BASE_URL}{suffix}"
-        r = await self._http_client.post(url, json=json)
+        max_attempts = 4
+        backoffs = [0.5, 1.0, 2.0, 4.0]
+        r: httpx.Response | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                r = await self._http_client.post(url, json=json)
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as exc:
+                if attempt >= max_attempts:
+                    raise
+
+                delay = (backoffs[min(attempt - 1, len(backoffs) - 1)] + random.uniform(0, 0.25))
+                logger.warning(
+                    "Ozon %s retry %s/%s after %.2fs due to %s",
+                    suffix,
+                    attempt,
+                    max_attempts,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            status = r.status_code
+            retryable_status = status == 429 or status in {500, 502, 503, 504}
+            if retryable_status and attempt < max_attempts:
+                retry_after_header = r.headers.get("Retry-After") if status == 429 else None
+                retry_after: float | None = None
+                if retry_after_header:
+                    try:
+                        retry_after = float(retry_after_header)
+                    except Exception:
+                        retry_after = None
+
+                delay = retry_after if retry_after is not None else backoffs[min(attempt - 1, len(backoffs) - 1)]
+                delay += random.uniform(0, 0.25)
+                logger.warning(
+                    "Ozon %s retry %s/%s on HTTP %s in %.2fs",
+                    suffix,
+                    attempt,
+                    max_attempts,
+                    status,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            break
+
+        if r is None:
+            raise RuntimeError("HTTP client did not return a response")
+
         status = r.status_code
         try:
             data = r.json()
@@ -1400,7 +1453,9 @@ def _merge_nested_block(item: dict, key: str) -> dict:
     return item
 
 
-async def chat_list(*, limit: int = 100, offset: int = 0) -> list[dict]:
+async def chat_list(
+    *, limit: int = 100, offset: int = 0, include_service: bool = False
+) -> list[dict]:
     """Получить список чатов продавца.
 
     Увеличиваем лимит до 100 и при необходимости подгружаем несколько страниц,
@@ -1503,9 +1558,10 @@ async def chat_list(*, limit: int = 100, offset: int = 0) -> list[dict]:
             or merged.get("type")
         )
         chat_type_str = str(chat_type or "").lower()
-        if any(bad in chat_type_str for bad in ("support", "system", "notification", "crm")):
-            logger.debug("Skip service chat (%s): %s", chat_type_str or "empty", merged)
-            continue
+        if not include_service:
+            if any(bad in chat_type_str for bad in ("support", "system", "notification", "crm")):
+                logger.debug("Skip service chat (%s): %s", chat_type_str or "empty", merged)
+                continue
         try:
             items.append(ChatSummary.model_validate(merged).to_dict())
         except ValidationError as exc:
@@ -1566,6 +1622,20 @@ async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:
         normalized.setdefault("_raw", merged)
         messages.append(normalized)
     return messages
+
+
+async def download_with_auth(url: str) -> bytes:
+    """Скачать файл с Ozon API с учётом авторизационных заголовков."""
+
+    client = get_client()
+    response = await client._http_client.get(url)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:  # pragma: no cover - сеть/HTTP
+        logger.warning("Ozon %s -> HTTP %s", url, response.status_code)
+        raise OzonAPIError(f"Не удалось скачать вложение: {exc}") from exc
+
+    return await response.aread()
 
 
 async def chat_read(chat_id: str, messages: Sequence[dict] | None = None) -> None:

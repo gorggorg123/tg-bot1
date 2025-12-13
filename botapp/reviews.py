@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Tuple
 
 from .ai_client import AIClientError, generate_review_reply
 from .ozon_client import OzonClient, get_client
+from .text_utils import safe_strip, safe_str
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,7 @@ def _parse_date(value: Any) -> datetime | None:
         except Exception:
             return None
 
-    txt = str(value).strip()
+    txt = safe_strip(value)
     if not txt:
         return None
 
@@ -204,7 +205,7 @@ def _msk_range_last_days(days: int = DEFAULT_RECENT_DAYS) -> Tuple[datetime, dat
 
 
 def _has_answer_payload(review: ReviewCard) -> bool:
-    return bool((review.answer_text or "").strip() or review.answered)
+    return bool(safe_strip(review.answer_text) or review.answered)
 
 
 def _status_badge(review: ReviewCard) -> tuple[str, str]:
@@ -212,7 +213,7 @@ def _status_badge(review: ReviewCard) -> tuple[str, str]:
 
     if is_answered(review):
         return "✅", "Ответ есть"
-    status = (review.status or "").strip()
+    status = safe_strip(review.status)
     if status:
         return "✏️", status
     return "✏️", "Без ответа"
@@ -221,7 +222,7 @@ def _status_badge(review: ReviewCard) -> tuple[str, str]:
 def _status_answered(status: str | None) -> bool:
     if not status:
         return False
-    norm = status.strip().upper()
+    norm = safe_strip(status).upper()
     if not norm:
         return False
     if norm.startswith("UNANSWER") or "NOT_ANSWER" in norm or norm.startswith("NO_ANSWER"):
@@ -462,7 +463,7 @@ def _merge_review_payload(card: ReviewCard, payload: Dict[str, Any]) -> None:
 
 def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
     rating = int(raw.get("rating") or raw.get("grade") or 0)
-    text = (raw.get("text") or raw.get("comment") or "").strip()
+    text = safe_strip(raw.get("text") or raw.get("comment") or "")
     text = str(text)
     if len(text) > MAX_REVIEW_LEN:
         text = text[: MAX_REVIEW_LEN - 1] + "…"
@@ -478,14 +479,16 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
     answer_text = ""
     answer_created_at = None
     if isinstance(answer_payload, dict):
-        answer_text = str(answer_payload.get("text") or answer_payload.get("comment") or "").strip()
+        answer_text = safe_strip(
+            answer_payload.get("text") or answer_payload.get("comment") or ""
+        )
         answer_created_at = _parse_date(
             answer_payload.get("created_at")
             or answer_payload.get("createdAt")
             or answer_payload.get("date")
         )
     elif isinstance(answer_payload, str):
-        answer_text = answer_payload.strip()
+        answer_text = safe_strip(answer_payload)
 
     answered_flag = raw.get("answered") or raw.get("has_answer") or raw.get("is_answered")
     status_field = (
@@ -523,11 +526,11 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
         raw.get("productTitle"),
         raw.get("name"),
     ]
-    product_name = next((str(v).strip() for v in product_name_fields if v not in (None, "")), None)
+    product_name = next((safe_strip(v) for v in product_name_fields if v not in (None, "")), None)
 
     # NEW: приводим идентификаторы к строкам, чтобы избежать ошибок .strip() для int
-    offer_id = str(offer_id_raw).strip() if offer_id_raw is not None else None
-    product_id = str(product_id_raw).strip() if product_id_raw is not None else None
+    offer_id = safe_strip(offer_id_raw) if offer_id_raw is not None else None
+    product_id = safe_strip(product_id_raw) if product_id_raw is not None else None
 
     created_candidates = [
         raw.get("created_at"),
@@ -565,7 +568,7 @@ def _normalize_review(raw: Dict[str, Any]) -> ReviewCard:
         answered=answered,
         answer_text=answer_text or None,
         answer_created_at=answer_created_at,
-        status=str(status_field).strip() if status_field not in (None, "") else None,
+        status=safe_strip(status_field) if status_field not in (None, "") else None,
     )
 
 
@@ -604,10 +607,12 @@ async def refresh_review_from_api(card: ReviewCard, client: OzonClient) -> None:
         if not isinstance(comment, dict):
             continue
         author = comment.get("author") or {}
-        role = (author.get("role") or author.get("type") or comment.get("author_role") or "").strip().lower()
+        role = safe_strip(
+            author.get("role") or author.get("type") or comment.get("author_role") or ""
+        ).lower()
         if role and "seller" not in role and role not in {"merchant", "store"}:
             continue
-        text = str(comment.get("text") or comment.get("comment") or "").strip()
+        text = safe_strip(comment.get("text") or comment.get("comment") or "")
         created = _parse_date(
             comment.get("created_at")
             or comment.get("createdAt")
@@ -650,7 +655,7 @@ def _product_article(card: ReviewCard) -> tuple[str | None, str | None]:
 
 
 def _pick_product_label(card: ReviewCard) -> str:
-    product = (card.product_name or "").strip()
+    product = safe_strip(card.product_name)
     article_label, article_value = _product_article(card)
 
     if product and article_label and article_value:
@@ -671,7 +676,7 @@ def _pick_short_product_label(card: ReviewCard) -> str:
     """Короткое имя товара для таблицы."""
 
     name_raw = card.product_name
-    name = str(name_raw).strip() if name_raw is not None else ""
+    name = safe_strip(name_raw) if name_raw is not None else ""
 
     article_label, article_value = _product_article(card)
 
@@ -1031,7 +1036,7 @@ def build_reviews_table(
         status_icon, status_text = _status_badge(card)
         stars = f"{card.rating}★" if card.rating else "—"
         product_short = _pick_short_product_label(card)
-        snippet = (card.text or "").strip()
+    snippet = safe_strip(card.text)
         if len(snippet) > 50:
             snippet = snippet[:47] + "…"
         date_part = _fmt_dt_msk(card.created_at) or "дата неизвестна"
@@ -1240,7 +1245,7 @@ def _collect_review_sku(
         raw_fields.get("sku"),
     ]
     sku_raw = next((v for v in sku_candidates if v not in (None, "")), None)
-    sku = str(sku_raw).strip() if sku_raw is not None else None
+    sku = safe_strip(sku_raw) if sku_raw is not None else None
 
     product_id_orig = review.get("product_id") or product_block.get("product_id") or raw_fields.get("product_id")
 
