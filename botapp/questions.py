@@ -511,10 +511,19 @@ def build_questions_table(
 ) -> tuple[str, List[tuple[str, str, int]], int, int]:
     """Собрать текст таблицы и кнопки для списка вопросов."""
 
+    SNIPPET_MAX_LEN = 100
+    TELEGRAM_TEXT_LIMIT = 4096
+
     slice_items, safe_page, total_pages = _slice_questions(cards, page, page_size)
+    category_label = {
+        "unanswered": "Без ответа",
+        "answered": "С ответом",
+    }.get((category or "all").lower(), "Все")
     rows: List[str] = [
-        f"❓ Вопросы ({category})",
-        pretty_period,
+        "❓ Вопросы покупателей",
+        f"Период: {pretty_period}",
+        "",
+        f"Категория: {category_label}",
         "",
         f"Страница {safe_page + 1}/{total_pages}",
         "",
@@ -524,12 +533,16 @@ def build_questions_table(
     for idx, q in enumerate(slice_items, start=1):
         global_index = safe_page * page_size + (idx - 1)
         status_icon, status_text = _status_badge_question(q)
-        product_short = _pick_short_product_label_question(q)
-        snippet = safe_strip(
-            getattr(q, "question_text", None) or getattr(q, "text", None) or ""
+        product_short = safe_str(_pick_short_product_label_question(q))
+        snippet_raw = safe_strip(
+            getattr(q, "question_text", None)
+            or getattr(q, "text", None)
+            or getattr(q, "message", None)
+            or ""
         )
-        if len(snippet) > 50:
-            snippet = snippet[:47] + "…"
+        snippet = snippet_raw or "—"
+        if len(snippet) > SNIPPET_MAX_LEN:
+            snippet = snippet[: SNIPPET_MAX_LEN - 1] + "…"
         created_at = _parse_date(getattr(q, "created_at", None))
         date_part = _fmt_dt_msk(created_at) or "дата неизвестна"
         age = _human_age(created_at)
@@ -539,8 +552,7 @@ def build_questions_table(
             f"{idx}) {status_icon} {date_part}{age_part} | "
             f"Товар: {product_short} | {status_label or 'СТАТУС НЕИЗВЕСТЕН'}"
         )
-        if snippet:
-            line = f"{line} | Вопрос: {snippet}"
+        line = f"{line} | Вопрос: {snippet}"
         rows.append(line)
 
         question_id = getattr(q, "id", None)
@@ -550,6 +562,30 @@ def build_questions_table(
         items.append((button_label, safe_str(question_id), global_index))
 
     text = "\n".join(rows)
+    if len(text) > TELEGRAM_TEXT_LIMIT:
+        truncated_rows: List[str] = []
+        current_length = 0
+        suffix = " (обрезано)"
+
+        for row in rows:
+            if not truncated_rows:
+                projected_length = len(row)
+            else:
+                projected_length = current_length + 1 + len(row)
+
+            if projected_length > TELEGRAM_TEXT_LIMIT - len(suffix):
+                break
+
+            truncated_rows.append(row)
+            current_length = projected_length
+
+        if truncated_rows:
+            truncated_rows[-1] = f"{truncated_rows[-1]}{suffix}"
+        else:
+            truncated_rows.append(suffix.strip())
+
+        text = "\n".join(truncated_rows)
+
     return text, items, safe_page, total_pages
 
 
