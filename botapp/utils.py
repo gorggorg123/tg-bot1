@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
+
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, Message
 
 __all__ = ["send_ephemeral_message", "send_ephemeral_from_callback", "safe_edit_text"]
+
+logger = logging.getLogger(__name__)
 
 
 async def send_ephemeral_message(
@@ -57,22 +61,74 @@ async def send_ephemeral_message(
         pass
 
 
-async def safe_edit_text(message: Message, text: str, *, reply_markup=None):
-    """Edit a message without crashing on common race conditions.
+async def safe_edit_text(
+    message: Message,
+    text: str,
+    *,
+    reply_markup=None,
+    section: str | None = None,
+    user_id: int | None = None,
+    bot: Bot | None = None,
+    persistent: bool = False,
+):
+    """Edit a message safely and keep section bindings in sync.
 
-    * Silently ignores "message is not modified" to avoid noisy warnings.
-    * If the message is gone ("message to edit not found"), returns None so caller
-      can decide to send a fresh message instead.
+    - Ignores ``message is not modified`` to avoid noisy crashes.
+    - If the message disappeared, sends a new one and refreshes the section
+      binding in ``message_gc`` (so navigation keeps working).
+    - Logs any other Telegram errors and re-raises them for visibility.
     """
 
+    from botapp import message_gc
+
+    target_user = user_id or (message.from_user.id if message.from_user else None)
+    target_chat = message.chat.id
     try:
-        return await message.edit_text(text, reply_markup=reply_markup)
+        edited = await message.edit_text(text, reply_markup=reply_markup)
+        if section and target_user is not None:
+            stored = message_gc.get_section_message(target_user, section)
+            message_gc.remember_section_message(
+                target_user,
+                section,
+                target_chat,
+                edited.message_id,
+                persistent=persistent or (stored.persistent if stored else False),
+            )
+        return edited
     except TelegramBadRequest as exc:
         lower_exc = str(exc).lower()
         if "message is not modified" in lower_exc:
+            if section and target_user is not None:
+                stored = message_gc.get_section_message(target_user, section)
+                message_gc.remember_section_message(
+                    target_user,
+                    section,
+                    target_chat,
+                    stored.message_id if stored else message.message_id,
+                    persistent=persistent or (stored.persistent if stored else False),
+                )
             return message
         if "message to edit not found" in lower_exc:
-            return None
+            active_bot = bot or message.bot
+            if not active_bot:
+                return None
+            fresh = await active_bot.send_message(
+                target_chat, text, reply_markup=reply_markup
+            )
+            if section and target_user is not None:
+                message_gc.remember_section_message(
+                    target_user,
+                    section,
+                    target_chat,
+                    fresh.message_id,
+                    persistent=persistent,
+                )
+            return fresh
+
+        logger.warning("Failed to edit message %s: %s", message.message_id, exc)
+        raise
+    except Exception:
+        logger.exception("Unexpected error while editing message %s", message.message_id)
         raise
 
 

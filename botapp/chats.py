@@ -4,7 +4,7 @@ import logging
 import math
 import textwrap
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict
 
 from aiogram import Bot, F, Router
@@ -46,7 +46,7 @@ from botapp.ozon_client import (
     chat_send_message,
     get_posting_products,
 )
-from botapp.utils import send_ephemeral_message
+from botapp.utils import safe_edit_text, send_ephemeral_message
 
 try:
     from botapp.states import ChatStates
@@ -61,6 +61,7 @@ router = Router()
 
 CHAT_PAGE_SIZE = 7  # показываем чуть больше чатов на страницу
 CHAT_LIST_LIMIT = 100  # верхняя граница одной выгрузки списка чатов
+MOSCOW_TZ = timezone(timedelta(hours=3))
 
 
 def _truncate_text(text: str, limit: int = 80) -> str:
@@ -396,7 +397,16 @@ def _chat_display(chat: dict) -> tuple[str | None, str, str, int, str, datetime 
     buyer = _chat_buyer_name(chat)
     unread_count = _chat_unread_count(chat)
     last_dt = _chat_last_dt(chat)
-    last_label = last_dt.strftime("%d.%m %H:%M") if last_dt else ""
+    last_dt_msk = None
+    if last_dt:
+        try:
+            base_dt = last_dt
+            if not base_dt.tzinfo:
+                base_dt = base_dt.replace(tzinfo=timezone.utc)
+            last_dt_msk = base_dt.astimezone(MOSCOW_TZ)
+        except Exception:
+            last_dt_msk = last_dt
+    last_label = last_dt_msk.strftime("%d.%m %H:%M") if last_dt_msk else ""
     last_text = _chat_last_text(chat)
     msg_count = _chat_message_count(chat)
 
@@ -533,7 +543,7 @@ async def _send_chats_list(
     total_count = len(buyer_items)
     unread_total = sum(1 for chat in buyer_items if _chat_unread_count(chat) > 0)
     total_pages = max(1, math.ceil(max(1, len(filtered_items)) / CHAT_PAGE_SIZE))
-    safe_page = max(0, min(page, total_pages - 1))
+    safe_page = 0 if page >= total_pages else max(0, min(page, total_pages - 1))
     start = safe_page * CHAT_PAGE_SIZE
     end = start + CHAT_PAGE_SIZE
     page_slice = filtered_items[start:end]
@@ -544,7 +554,7 @@ async def _send_chats_list(
         chat_id_val, title, short_title, unread_count, preview, last_dt = _chat_display(chat)
         if not chat_id_val:
             continue
-        badge = "🔴" if unread_count > 0 else "⚪"
+        badge = f"🔴{unread_count}" if unread_count > 0 else "⚪"
         ts_label = last_dt.strftime("%d.%m %H:%M") if last_dt else ""
         preview_label = f'"{preview}"' if preview else ""
         line_parts = [
@@ -553,31 +563,28 @@ async def _send_chats_list(
             preview_label,
         ]
         display_rows.append(" | ".join([part for part in line_parts if part]))
-        kb_caption = " | ".join(
-            [
-                f"{badge}{unread_count if unread_count else ''}",
-                _truncate_text(title, limit=26),
-                ts_label,
-                preview_label,
-            ]
-        ).replace("||", "|")
+        kb_parts = [badge, _truncate_text(title, limit=30)]
+        if ts_label:
+            kb_parts.append(ts_label)
+        if preview_label:
+            kb_parts.append(preview_label)
+        kb_caption = " | ".join(kb_parts)
         keyboard_items.append((chat_id_val, kb_caption))
 
     lines = ["💬 Чаты с покупателями"]
+    lines.append(f"Всего: {total_count} | Непрочитано: {unread_total}")
     lines.append(
-        f"Всего: {total_count} | Непрочитано: {unread_total}" +
-        (" | Фильтр: все" if show_service else " | Фильтр: только покупатели")
+        "Фильтр: "
+        + ("все" if show_service else "только покупатели")
+        + f" | Только непрочитанные: {'ON' if unread_flag else 'OFF'}"
     )
-    lines.append(f"Только непрочитанные: {'ON' if unread_flag else 'OFF'}")
+    lines.append(f"Стр. {safe_page + 1}/{total_pages}")
     lines.append("")
 
     if not display_rows:
         lines.append("Нет активных диалогов" if not unread_flag else "Нет непрочитанных диалогов")
     else:
         lines.extend(display_rows)
-    lines.append("")
-    lines.append(f"Стр. {safe_page + 1}/{total_pages}")
-
     markup = chats_list_keyboard(
         items=keyboard_items,
         page=safe_page,
@@ -598,16 +605,28 @@ async def _send_chats_list(
         chats_all=sorted_items,
         chats_show_service=show_service,
     )
-    sent = await send_section_message(
-        SECTION_CHATS_LIST,
-        text="\n".join(lines),
-        reply_markup=markup,
-        message=message,
-        callback=callback,
-        bot=bot,
-        chat_id=chat_id,
-        user_id=user_id,
-    )
+    rendered_text = "\n".join(lines)
+    sent = None
+    if target and not chat_id:
+        sent = await safe_edit_text(
+            target,
+            rendered_text,
+            reply_markup=markup,
+            section=SECTION_CHATS_LIST,
+            user_id=user_id,
+            bot=active_bot,
+        )
+    if not sent:
+        sent = await send_section_message(
+            SECTION_CHATS_LIST,
+            text=rendered_text,
+            reply_markup=markup,
+            message=message,
+            callback=callback,
+            bot=bot,
+            chat_id=chat_id,
+            user_id=user_id,
+        )
     await delete_section_message(
         user_id,
         SECTION_CHAT_HISTORY,
@@ -676,8 +695,10 @@ def _format_chat_history_text(
         ts_dt = _parse_ts(ts_value)
         ts_label = None
         if ts_dt:
-            ts_safe = ts_dt.astimezone(timezone.utc) if ts_dt.tzinfo else ts_dt
-            ts_label = ts_safe.strftime("%d.%m %H:%M")
+            ts_safe = ts_dt
+            if not ts_safe.tzinfo:
+                ts_safe = ts_safe.replace(tzinfo=timezone.utc)
+            ts_label = ts_safe.astimezone(MOSCOW_TZ).strftime("%d.%m %H:%M")
         elif ts_value:
             ts_label = ts_value[:16]
         else:
@@ -803,16 +824,27 @@ async def _open_chat_history(
         return
 
     await state.update_data(chat_history=messages, current_chat_id=chat_id, chats_cache=cache)
-    await send_section_message(
-        SECTION_CHAT_HISTORY,
-        text=history_text,
-        reply_markup=markup,
-        message=message,
-        callback=callback,
-        bot=bot,
-        chat_id=chat_id_override,
-        user_id=user_id,
-    )
+    sent = None
+    if target and chat_id_override is None:
+        sent = await safe_edit_text(
+            target,
+            history_text,
+            reply_markup=markup,
+            section=SECTION_CHAT_HISTORY,
+            user_id=user_id,
+            bot=active_bot,
+        )
+    if not sent:
+        sent = await send_section_message(
+            SECTION_CHAT_HISTORY,
+            text=history_text,
+            reply_markup=markup,
+            message=message,
+            callback=callback,
+            bot=bot,
+            chat_id=chat_id_override,
+            user_id=user_id,
+        )
     await delete_section_message(user_id, SECTION_CHAT_PROMPT, active_bot, force=True)
 
 
@@ -868,7 +900,7 @@ async def cb_chats_filter(
     await callback.answer()
     data = await state.get_data()
     current_flag = bool(data.get("chats_unread_only"))
-    page = int(callback_data.page or data.get("chats_page") or 0)
+    page = 0
     await _send_chats_list(
         user_id=callback.from_user.id,
         state=state,
@@ -885,7 +917,7 @@ async def cb_chats_service_toggle(
     await callback.answer()
     data = await state.get_data()
     current_flag = bool(data.get("chats_show_service"))
-    page = int(callback_data.page or data.get("chats_page") or 0)
+    page = 0
     await state.update_data(chats_show_service=not current_flag)
     await _send_chats_list(
         user_id=callback.from_user.id,
