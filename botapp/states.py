@@ -9,6 +9,7 @@ class QuestionAnswerStates(StatesGroup):
 class ChatStates(StatesGroup):
     waiting_manual = State()
     waiting_ai_confirm = State()
+    waiting_reprompt = State()
 
 
 class WarehouseStates(StatesGroup):

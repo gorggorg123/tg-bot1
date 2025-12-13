@@ -1638,6 +1638,24 @@ async def download_with_auth(url: str) -> bytes:
     return await response.aread()
 
 
+async def download_chat_file(url: str) -> tuple[bytes, str]:
+    """Скачать файл чата с учётом авторизации и вернуть содержимое и мета."""
+
+    client = get_client()
+    response = await client._http_client.get(url)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:  # pragma: no cover - сеть/HTTP
+        logger.warning("Ozon %s -> HTTP %s", url, response.status_code)
+        raise OzonAPIError(f"Не удалось скачать вложение: {exc}") from exc
+
+    content = await response.aread()
+    meta = response.headers.get("Content-Type") or ""
+    if not meta:
+        meta = response.headers.get("Content-Disposition") or ""
+    return content, meta
+
+
 async def chat_read(chat_id: str, messages: Sequence[dict] | None = None) -> None:
     """Mark chat messages as read up to the latest known message."""
 

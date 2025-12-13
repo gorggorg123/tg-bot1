@@ -4,6 +4,7 @@ import hashlib
 import logging
 import math
 import os
+import re
 import textwrap
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
@@ -14,14 +15,14 @@ from urllib.parse import urlparse
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, FSInputFile, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
 
 from botapp.chats_ai import suggest_chat_reply
 from botapp.keyboards import (
     ChatsCallbackData,
     MenuCallbackData,
     chat_actions_keyboard,
-    chat_ai_confirm_keyboard,
+    chat_draft_keyboard,
     chats_list_keyboard,
     main_menu_keyboard,
 )
@@ -48,6 +49,7 @@ from botapp.ozon_client import (
     chat_list,
     chat_read,
     chat_send_message,
+    download_chat_file,
     download_with_auth,
     get_posting_products,
 )
@@ -59,6 +61,7 @@ except Exception:  # pragma: no cover - fallback for import issues during deploy
     class ChatStates(StatesGroup):
         waiting_manual = State()
         waiting_ai_confirm = State()
+        waiting_reprompt = State()
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +73,11 @@ MOSCOW_TZ = timezone(timedelta(hours=3))
 ATTACH_AUTOSEND_LIMIT = 10
 ATTACH_CACHE_DIR = Path(os.getenv("ATTACH_CACHE_DIR", "/tmp/ozon_chat_cache"))
 ATTACH_CACHE_TTL = timedelta(hours=12)
+ATTACH_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # 20 MB
+SYSTEM_NUMBER_RE = re.compile(r"^(?:[#№]\s*)?\d{6,}(?:[-\s]\d+)*$", re.IGNORECASE)
+INLINE_FILE_RE = re.compile(r"https?://[^\s)]+/v2/chat/file/[^\s)]+", re.IGNORECASE)
+INLINE_MD_IMAGE_RE = re.compile(r"!\[\]\((https?://[^)]+/v2/chat/file/[^)]+)\)", re.IGNORECASE)
+DRAFT_HEADER = "📄 Черновик ответа"
 
 
 def _truncate_text(text: str, limit: int = 80) -> str:
@@ -123,7 +131,89 @@ def _ts(msg: dict) -> str:
     return ""
 
 
+def _strip_inline_file_links(text: str) -> tuple[str, list[str]]:
+    if not isinstance(text, str):
+        return "", []
+
+    found: list[str] = []
+
+    def _add(url: str) -> None:
+        if url not in found:
+            found.append(url)
+
+    def _replace_md(match: re.Match[str]) -> str:
+        _add(match.group(1))
+        return ""
+
+    without_md = INLINE_MD_IMAGE_RE.sub(_replace_md, text)
+
+    def _replace_plain(match: re.Match[str]) -> str:
+        _add(match.group(0))
+        return ""
+
+    cleaned = INLINE_FILE_RE.sub(_replace_plain, without_md)
+    return cleaned, found
+
+
+def _inline_summary(photo_count: int, file_count: int) -> str:
+    parts: list[str] = []
+    if photo_count:
+        parts.append(f"📎 Фото: {photo_count}")
+    if file_count:
+        parts.append(f"📎 Файл: {file_count}")
+    return " ".join(parts)
+
+
+def _build_inline_attachments(urls: list[str]) -> tuple[list[dict], int, int]:
+    attachments: list[dict] = []
+    seen: set[str] = set()
+    photo_count = 0
+    file_count = 0
+
+    for url in urls:
+        normalized = _normalize_attachment(url)
+        if not normalized:
+            continue
+        ext = Path(urlparse(url).path).suffix.lower()
+        normalized["kind"] = "photo" if ext in (".jpg", ".jpeg", ".png") else "file"
+        key_val = normalized.get("cache_key") or normalized.get("url") or normalized.get("name")
+        if key_val and key_val in seen:
+            continue
+        if key_val:
+            seen.add(key_val)
+        attachments.append(normalized)
+        if normalized.get("kind") == "photo":
+            photo_count += 1
+        else:
+            file_count += 1
+
+    return attachments, photo_count, file_count
+
+
 def _extract_text(msg: dict) -> str | None:
+    inline_key = "_inline_file_urls"
+
+    def _store_inline(urls: list[str]) -> None:
+        if not isinstance(msg, dict) or not urls:
+            return
+        existing = msg.get(inline_key) if isinstance(msg.get(inline_key), list) else []
+        for url in urls:
+            if url not in existing:
+                existing.append(url)
+        msg[inline_key] = existing
+
+    def _clean_value(raw: str) -> str | None:
+        cleaned, urls = _strip_inline_file_links(raw)
+        _store_inline(urls)
+        candidate = cleaned.strip()
+        if candidate:
+            return candidate
+        if urls:
+            _, photo_count, file_count = _build_inline_attachments(urls)
+            summary = _inline_summary(photo_count, file_count)
+            if summary:
+                return summary
+        return None
     def _pick_from_dict(d: dict) -> str | None:
         PREFERRED_KEYS = (
             "text",
@@ -140,22 +230,27 @@ def _extract_text(msg: dict) -> str | None:
         for key in PREFERRED_KEYS:
             value = d.get(key)
             if isinstance(value, str) and value.strip() and not _is_timestamp(value.strip()):
-                value_str = value.strip()
-                return value_str
+                cleaned = _clean_value(value.strip())
+                if cleaned:
+                    return cleaned
             if isinstance(value, dict):
                 for k2 in PREFERRED_KEYS:
                     inner = value.get(k2)
                     if isinstance(inner, str):
                         inner_str = inner.strip()
                         if inner_str and not _is_timestamp(inner_str):
-                            return inner_str
+                            cleaned = _clean_value(inner_str)
+                            if cleaned:
+                                return cleaned
         data_val = d.get("data")
         if isinstance(data_val, list):
             for item in data_val:
                 if isinstance(item, str):
                     s = item.strip()
                     if s and not _is_timestamp(s):
-                        return s
+                        cleaned = _clean_value(s)
+                        if cleaned:
+                            return cleaned
                 if isinstance(item, dict):
                     nested = _pick_from_dict(item)
                     if nested:
@@ -383,6 +478,37 @@ def _chat_last_text(chat: dict) -> str | None:
     return None
 
 
+def _looks_like_system_number(text: str | None) -> bool:
+    if not isinstance(text, str):
+        return False
+    return bool(SYSTEM_NUMBER_RE.match(text.strip()))
+
+
+def _chat_snippet(chat: dict, *, history: list[dict] | None = None) -> str:
+    last_text = _chat_last_text(chat)
+    if last_text and not _looks_like_system_number(last_text):
+        return _truncate_text(last_text, limit=50)
+
+    history_source = history if isinstance(history, list) else None
+    if history_source:
+        for msg in reversed(history_source):
+            if not isinstance(msg, dict):
+                continue
+            text = _extract_text(msg) or msg.get("text") or msg.get("message")
+            if not text:
+                continue
+            if _looks_like_system_number(str(text)):
+                continue
+            cleaned = str(text).strip()
+            if cleaned:
+                return _truncate_text(cleaned, limit=50)
+
+    if last_text and _looks_like_system_number(last_text):
+        return "(служебное)"
+
+    return ""
+
+
 def _chat_message_count(chat: dict) -> int | None:
     if not isinstance(chat, dict):
         return None
@@ -397,7 +523,9 @@ def _chat_message_count(chat: dict) -> int | None:
     return None
 
 
-def _chat_display(chat: dict) -> tuple[str | None, str, str, int, str, datetime | None]:
+def _chat_display(
+    chat: dict, *, history: list[dict] | None = None
+) -> tuple[str | None, str, str, int, str, datetime | None]:
     """Построить информативное название и превью чата."""
 
     chat_id = _safe_chat_id(chat)
@@ -415,7 +543,7 @@ def _chat_display(chat: dict) -> tuple[str | None, str, str, int, str, datetime 
         except Exception:
             last_dt_msk = last_dt
     last_label = last_dt_msk.strftime("%d.%m %H:%M") if last_dt_msk else ""
-    last_text = _chat_last_text(chat)
+    preview = _chat_snippet(chat, history=history)
     msg_count = _chat_message_count(chat)
 
     fallback_buyer = None
@@ -444,7 +572,6 @@ def _chat_display(chat: dict) -> tuple[str | None, str, str, int, str, datetime 
             title = "Чат без названия"
 
     short_title = _truncate_text(title, limit=64)
-    preview = _truncate_text(last_text, limit=60) if last_text else ""
     return chat_id, title, short_title, unread_count, preview, last_dt
 
 
@@ -597,7 +724,9 @@ def _resolve_author(role_lower: str) -> tuple[str, str]:
     return "buyer", "👤 Покупатель"
 
 
-def _normalize_chat_messages(messages: list[dict]) -> tuple[list[dict], list[dict]]:
+def _normalize_chat_messages(
+    messages: list[dict], *, show_service: bool = False
+) -> tuple[list[dict], list[dict]]:
     prepared: list[dict] = []
     attachments_all: list[dict] = []
     attachments_seen: set[str] = set()
@@ -606,9 +735,30 @@ def _normalize_chat_messages(messages: list[dict]) -> tuple[list[dict], list[dic
         if not isinstance(msg, dict):
             continue
         text = _extract_text(msg) or ""
+        inline_urls = msg.get("_inline_file_urls") if isinstance(msg, dict) else []
+        inline_urls = inline_urls if isinstance(inline_urls, list) else []
+
+        inline_attachments, inline_photos, inline_files = _build_inline_attachments(
+            inline_urls
+        )
+
         attachments = _extract_message_attachments(msg)
+        if inline_attachments:
+            attachments.extend(inline_attachments)
+
         if not text and not attachments:
             continue
+
+        if inline_attachments:
+            summary = _inline_summary(inline_photos, inline_files)
+            base_text = text.strip()
+            if base_text:
+                text = base_text if not summary else f"{base_text}\n{summary}"
+            else:
+                text = summary or text
+            if show_service and inline_urls:
+                urls_block = "\n".join(inline_urls)
+                text = (text + "\n" + urls_block).strip()
 
         role_lower = _detect_message_role(msg)
         author_kind, author_label = _resolve_author(role_lower)
@@ -704,6 +854,72 @@ async def _send_chat_attachments(
             logger.warning("Failed to send attachment %s: %s", filename, exc)
 
 
+def _register_attachment_tokens(
+    chat_id: str, attachments: list[dict], existing: dict | None
+) -> tuple[list[tuple[str, dict]], dict]:
+    tokens_map: dict[str, dict] = existing if isinstance(existing, dict) else {}
+    chat_tokens: dict[str, dict] = {}
+
+    for att in attachments:
+        url = att.get("url") if isinstance(att, dict) else None
+        if not url:
+            continue
+        name = att.get("name") if isinstance(att, dict) else None
+        size = att.get("size") if isinstance(att, dict) else None
+        kind = att.get("kind") if isinstance(att, dict) else None
+
+        token_source = f"{chat_id}:{url}"
+        token = hashlib.sha256(token_source.encode("utf-8", errors="ignore")).hexdigest()[:8]
+        suffix = 0
+        while token in chat_tokens and chat_tokens[token].get("url") != url:
+            suffix += 1
+            token = hashlib.sha256(
+                f"{token_source}:{suffix}".encode("utf-8", errors="ignore")
+            ).hexdigest()[:8]
+
+        chat_tokens[token] = {
+            "url": url,
+            "name": name or "вложение",
+            "size": size,
+            "kind": kind or "file",
+        }
+
+    tokens_map[chat_id] = chat_tokens
+    tokens_list = list(chat_tokens.items())
+    return tokens_list, tokens_map
+
+
+def _get_chat_drafts(data: dict | None) -> dict[str, str]:
+    drafts = data.get("chat_drafts") if isinstance(data, dict) else None
+    return drafts if isinstance(drafts, dict) else {}
+
+
+def _get_chat_draft(data: dict | None, chat_id: str | None) -> str | None:
+    if not chat_id:
+        return None
+    drafts = _get_chat_drafts(data)
+    draft = drafts.get(chat_id)
+    if isinstance(draft, str) and draft.strip():
+        return draft
+    return None
+
+
+async def _store_chat_draft(state: FSMContext, chat_id: str, text: str) -> str:
+    data = await state.get_data()
+    drafts = _get_chat_drafts(data)
+    drafts[chat_id] = text
+    await state.update_data(chat_drafts=drafts)
+    return text
+
+
+async def _drop_chat_draft(state: FSMContext, chat_id: str) -> None:
+    data = await state.get_data()
+    drafts = _get_chat_drafts(data)
+    if chat_id in drafts:
+        drafts.pop(chat_id, None)
+        await state.update_data(chat_drafts=drafts)
+
+
 def _collect_product_names(cache: Dict[str, list[str]], posting: str) -> list[str]:
     if posting in cache:
         return cache[posting]
@@ -771,16 +987,54 @@ async def _send_chats_list(
         return
 
     sorted_items = sorted(items_raw, key=_chat_sort_key, reverse=True)
+    total_loaded = len(sorted_items)
+
+    def _filter_service(chat: dict) -> bool:
+        if show_service:
+            return True
+
+        merged: dict = {}
+        raw = chat.get("_raw") if isinstance(chat, dict) else None
+        if isinstance(raw, dict):
+            merged.update(raw)
+        if isinstance(chat, dict):
+            merged.update(chat)
+
+        buyer_id = merged.get("buyer_id") or merged.get("buyerId")
+        buyer_name = merged.get("buyer_name") or merged.get("buyerName")
+        has_buyer = bool(buyer_id) or (isinstance(buyer_name, str) and buyer_name.strip())
+
+        service_words = ("support", "system", "notification", "ozon")
+        type_candidates = [
+            merged.get("chat_category"),
+            merged.get("category"),
+            merged.get("type"),
+            merged.get("chat_type"),
+        ]
+        has_service_marker = any(
+            isinstance(value, str) and any(word in value.lower() for word in service_words)
+            for value in type_candidates
+        )
+
+        return has_buyer and not has_service_marker
+
+    service_filtered = [chat for chat in sorted_items if _filter_service(chat if isinstance(chat, dict) else {})]
+    logger.debug(
+        "Chats list filter applied (show_service=%s): total=%s, after_filter=%s",
+        show_service,
+        total_loaded,
+        len(service_filtered),
+    )
+
     cache: dict[str, dict] = {}
-    for chat in sorted_items:
+    for chat in service_filtered:
         cid = _safe_chat_id(chat)
         if cid:
             cache[cid] = chat if isinstance(chat, dict) else {}
 
-    buyer_items = [chat for chat in sorted_items if show_service or is_buyer_chat(chat)]
-    filtered_items = [chat for chat in buyer_items if not unread_flag or _chat_unread_count(chat) > 0]
-    total_count = len(buyer_items)
-    unread_total = sum(1 for chat in buyer_items if _chat_unread_count(chat) > 0)
+    filtered_items = [chat for chat in service_filtered if not unread_flag or _chat_unread_count(chat) > 0]
+    total_count = len(service_filtered)
+    unread_total = sum(1 for chat in service_filtered if _chat_unread_count(chat) > 0)
     total_pages = max(1, math.ceil(max(1, len(filtered_items)) / CHAT_PAGE_SIZE))
     safe_page = 0 if page >= total_pages else max(0, min(page, total_pages - 1))
     start = safe_page * CHAT_PAGE_SIZE
@@ -789,25 +1043,30 @@ async def _send_chats_list(
 
     display_rows: list[str] = []
     keyboard_items: list[tuple[str, str]] = []
+    history_cache = data.get("chat_history") if isinstance(data.get("chat_history"), list) else None
+    history_chat_id = data.get("current_chat_id")
     for idx, chat in enumerate(page_slice, start=start + 1):
-        chat_id_val, title, short_title, unread_count, preview, last_dt = _chat_display(chat)
+        cid_history = history_cache if history_chat_id == _safe_chat_id(chat) else None
+        chat_id_val, title, short_title, unread_count, preview, last_dt = _chat_display(
+            chat, history=cid_history
+        )
         if not chat_id_val:
             continue
         badge = f"🔴{unread_count}" if unread_count > 0 else "⚪"
         ts_label = last_dt.strftime("%d.%m %H:%M") if last_dt else ""
-        preview_label = f'"{preview}"' if preview else ""
+        preview_label = preview or ""
         line_parts = [
             f"{idx}) {badge} {title}",
             ts_label,
             preview_label,
         ]
         display_rows.append(" | ".join([part for part in line_parts if part]))
-        kb_parts = [badge, _truncate_text(title, limit=30)]
+        kb_caption_parts = [badge, _truncate_text(title, limit=30)]
         if ts_label:
-            kb_parts.append(ts_label)
+            kb_caption_parts.append(ts_label)
         if preview_label:
-            kb_parts.append(preview_label)
-        kb_caption = " | ".join(kb_parts)
+            kb_caption_parts.append(_truncate_text(preview_label, limit=50))
+        kb_caption = " | ".join(kb_caption_parts)
         keyboard_items.append((chat_id_val, kb_caption))
 
     lines = ["💬 Чаты с покупателями"]
@@ -974,6 +1233,149 @@ async def _load_posting_products(state: FSMContext, chat_meta: dict | None) -> l
     return names
 
 
+async def _show_chat_draft(
+    *,
+    chat_id: str,
+    draft: str,
+    state: FSMContext,
+    user_id: int,
+    callback: CallbackQuery | None = None,
+    message: Message | None = None,
+    bot: Bot | None = None,
+    chat_id_override: int | None = None,
+) -> None:
+    target = callback.message if callback else message
+    active_bot = bot or (target.bot if target else None)
+    active_chat = chat_id_override or (target.chat.id if target else None)
+    if not active_bot or active_chat is None:
+        return
+
+    text = f"{DRAFT_HEADER}\n\n{draft}".strip()
+    await state.set_state(None)
+    await send_section_message(
+        SECTION_CHAT_PROMPT,
+        text=text,
+        reply_markup=chat_draft_keyboard(chat_id),
+        callback=callback,
+        message=message,
+        user_id=user_id,
+        persistent=True,
+        bot=active_bot,
+        chat_id_override=active_chat,
+    )
+
+
+async def _ensure_chat_history(
+    *,
+    chat_id: str,
+    state: FSMContext,
+    user_id: int,
+    callback: CallbackQuery | None = None,
+    message: Message | None = None,
+) -> list[dict]:
+    data = await state.get_data()
+    cached_chat_id = data.get("current_chat_id")
+    cached_history = data.get("chat_history") if isinstance(data.get("chat_history"), list) else []
+    if cached_chat_id == chat_id and cached_history:
+        return cached_history
+    try:
+        history = await chat_history(chat_id, limit=30)
+        await state.update_data(chat_history=history, current_chat_id=chat_id)
+        return history
+    except Exception as exc:  # pragma: no cover - network
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                chat_id=target.chat.id,
+                text=f"Не удалось загрузить историю чата: {exc}",
+                user_id=user_id,
+            )
+        return []
+
+
+async def _generate_ai_draft(
+    *,
+    chat_id: str,
+    state: FSMContext,
+    user_id: int,
+    user_prompt: str | None = None,
+    callback: CallbackQuery | None = None,
+    message: Message | None = None,
+) -> str | None:
+    data = await state.get_data()
+    history = await _ensure_chat_history(
+        chat_id=chat_id, state=state, user_id=user_id, callback=callback, message=message
+    )
+    cache = data.get("chats_cache") if isinstance(data.get("chats_cache"), dict) else {}
+    meta = cache.get(chat_id) if isinstance(cache, dict) else None
+    product_name = meta.get("product_name") if isinstance(meta, dict) else None
+
+    draft = await suggest_chat_reply(history, product_name, user_prompt=user_prompt)
+    if not draft:
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                chat_id=target.chat.id,
+                text="🤖 Не удалось сгенерировать черновик. Попробуйте позже.",
+                user_id=user_id,
+            )
+        return None
+
+    await _store_chat_draft(state, chat_id, draft)
+    return draft
+
+
+async def _handle_draft_send(
+    *,
+    callback: CallbackQuery | None,
+    state: FSMContext,
+    chat_id: str | None = None,
+    message: Message | None = None,
+) -> None:
+    user_id = callback.from_user.id if callback else (message.from_user.id if message else 0)
+    data = await state.get_data()
+    target_chat_id = chat_id or data.get("chat_id")
+    draft = _get_chat_draft(data, target_chat_id)
+    if not target_chat_id or not draft:
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                chat_id=target.chat.id,
+                text="Черновик ответа не найден",
+                user_id=user_id,
+            )
+        return
+
+    try:
+        await chat_send_message(target_chat_id, draft)
+    except Exception as exc:
+        target = callback.message if callback else message
+        if target:
+            await send_ephemeral_message(
+                target.bot,
+                chat_id=target.chat.id,
+                text=f"Не удалось отправить сообщение: {exc}",
+                user_id=user_id,
+            )
+        return
+
+    await _drop_chat_draft(state, target_chat_id)
+    if callback:
+        await delete_section_message(
+            user_id, SECTION_CHAT_PROMPT, callback.bot, preserve_message_id=None, force=True
+        )
+    await _open_chat_history(
+        user_id=user_id,
+        chat_id=target_chat_id,
+        state=state,
+        callback=callback,
+        message=message,
+    )
+
+
 async def _open_chat_history(
     *,
     user_id: int,
@@ -987,6 +1389,7 @@ async def _open_chat_history(
     data = await state.get_data()
     chat_meta = None
     cache = data.get("chats_cache") if isinstance(data.get("chats_cache"), dict) else {}
+    show_service = bool(data.get("chats_show_service"))
     if isinstance(cache, dict):
         chat_meta = cache.get(chat_id)
 
@@ -1019,7 +1422,9 @@ async def _open_chat_history(
         await chat_read(chat_id, messages)
 
     products = await _load_posting_products(state, chat_meta)
-    normalized_messages, attachments_all = _normalize_chat_messages(messages)
+    normalized_messages, attachments_all = _normalize_chat_messages(
+        messages, show_service=show_service
+    )
     photo_count = sum(1 for att in attachments_all if att.get("kind") == "photo")
     file_count = sum(1 for att in attachments_all if att.get("kind") != "photo")
     attachments_total = len(attachments_all)
@@ -1031,12 +1436,26 @@ async def _open_chat_history(
             history_text
             + "\n\n📎 Вложений много, отправляем их по кнопкам ниже, чтобы не заспамить."
         )
+
+    file_tokens_existing = (
+        data.get("chat_file_tokens") if isinstance(data.get("chat_file_tokens"), dict) else {}
+    )
+    attachment_tokens, tokens_map = _register_attachment_tokens(
+        chat_id, attachments_all, file_tokens_existing
+    )
+    attachment_buttons = []
+    for token, meta in attachment_tokens[:8]:
+        label = _truncate_text(meta.get("name") or "вложение", limit=26)
+        icon = "📷" if (meta.get("kind") or "").startswith("photo") else "📄"
+        attachment_buttons.append((token, f"{icon} {label}", meta.get("kind")))
     markup = chat_actions_keyboard(
         chat_id,
         attachments_total=attachments_total,
         photo_count=photo_count,
         file_count=file_count,
         oversized=attachments_total > ATTACH_AUTOSEND_LIMIT,
+        attachment_tokens=attachment_buttons,
+        has_draft=bool(_get_chat_draft(data, chat_id)),
     )
     target = callback.message if callback else message
     active_bot = bot or (target.bot if target else None)
@@ -1062,6 +1481,7 @@ async def _open_chat_history(
         current_chat_id=chat_id,
         chats_cache=cache,
         chat_attachments=attachments_map,
+        chat_file_tokens=tokens_map,
     )
     sent = None
     if target and chat_id_override is None:
@@ -1211,6 +1631,100 @@ async def cb_chat_media(
     )
 
 
+@router.callback_query(ChatsCallbackData.filter(F.action.in_(("file", "dl"))))
+async def cb_chat_file(
+    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
+) -> None:
+    await callback.answer()
+    chat_id = callback_data.chat_id
+    token = callback_data.token
+    if not chat_id or not token:
+        return
+
+    data = await state.get_data()
+    tokens_map = data.get("chat_file_tokens") if isinstance(data.get("chat_file_tokens"), dict) else {}
+    chat_tokens = tokens_map.get(chat_id) if isinstance(tokens_map, dict) else None
+    meta = chat_tokens.get(token) if isinstance(chat_tokens, dict) else None
+    if not meta:
+        await send_ephemeral_message(
+            callback.bot,
+            chat_id=callback.message.chat.id,
+            text="Файл не найден или ссылка устарела. Обновите чат и попробуйте снова.",
+            user_id=callback.from_user.id,
+        )
+        return
+
+    url = meta.get("url") if isinstance(meta, dict) else None
+    if not url:
+        return
+
+    size = None
+    try:
+        if meta.get("size") not in (None, ""):
+            size = int(meta.get("size"))
+    except Exception:
+        size = None
+
+    if size and size > ATTACH_DOWNLOAD_LIMIT:
+        await send_ephemeral_message(
+            callback.bot,
+            chat_id=callback.message.chat.id,
+            text=f"Файл слишком большой для отправки (> {ATTACH_DOWNLOAD_LIMIT // (1024 * 1024)} МБ).",
+            user_id=callback.from_user.id,
+        )
+        return
+
+    try:
+        content, meta_value = await download_chat_file(url)
+    except Exception as exc:  # pragma: no cover - сеть
+        await send_ephemeral_message(
+            callback.bot,
+            chat_id=callback.message.chat.id,
+            text=f"Не удалось скачать файл: {exc}",
+            user_id=callback.from_user.id,
+        )
+        return
+
+    if len(content) > ATTACH_DOWNLOAD_LIMIT:
+        await send_ephemeral_message(
+            callback.bot,
+            chat_id=callback.message.chat.id,
+            text=f"Файл слишком большой для отправки (> {ATTACH_DOWNLOAD_LIMIT // (1024 * 1024)} МБ).",
+            user_id=callback.from_user.id,
+        )
+        return
+
+    content_type = (meta_value or "").lower()
+    kind_lower = (meta.get("kind") or "").lower() if isinstance(meta, dict) else ""
+    filename = meta.get("name") or Path(urlparse(url).path).name or "file"
+    if not content_type and filename:
+        suffix = Path(filename).suffix.lower()
+        if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic"}:
+            kind_lower = kind_lower or "photo"
+
+    try:
+        if content_type.startswith("image/") or kind_lower == "photo":
+            await callback.bot.send_photo(
+                callback.message.chat.id,
+                BufferedInputFile(content, filename=filename),
+                caption=filename,
+            )
+        else:
+            await callback.bot.send_document(
+                callback.message.chat.id,
+                BufferedInputFile(content, filename=filename),
+                caption=filename,
+            )
+    except Exception as exc:  # pragma: no cover - Telegram/network
+        logger.warning("Failed to send downloaded file %s: %s", filename, exc)
+        await send_ephemeral_message(
+            callback.bot,
+            chat_id=callback.message.chat.id,
+            text="Не удалось отправить файл в Telegram.",
+            user_id=callback.from_user.id,
+        )
+
+
 @router.callback_query(ChatsCallbackData.filter(F.action == "open"))
 async def cb_open_chat(
     callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
@@ -1284,7 +1798,7 @@ async def cb_chat_reply(
     await state.set_state(ChatStates.waiting_manual)
     await send_section_message(
         SECTION_CHAT_PROMPT,
-        text="✍️ Введите ответ для покупателя в чате",
+        text="✍️ Введите черновик ответа для покупателя",
         callback=callback,
         user_id=callback.from_user.id,
         persistent=True,
@@ -1301,42 +1815,38 @@ async def cb_chat_ai(
     if not chat_id:
         return
 
-    data = await state.get_data()
-    messages = data.get("chat_history") if isinstance(data.get("chat_history"), list) else []
-    if not messages:
-        try:
-            messages = await chat_history(chat_id, limit=20)
-        except Exception as exc:  # pragma: no cover - сеть/формат
-            await send_ephemeral_message(
-                callback.bot,
-                chat_id=callback.message.chat.id,
-                text=f"Не удалось загрузить историю чата: {exc}",
-                user_id=user_id,
-            )
-            return
-
-    cache = data.get("chats_cache") if isinstance(data.get("chats_cache"), dict) else {}
-    meta = cache.get(chat_id) if isinstance(cache, dict) else None
-    product_name = meta.get("product_name") if isinstance(meta, dict) else None
-
-    draft = await suggest_chat_reply(messages, product_name)
+    await state.update_data(chat_id=chat_id)
+    draft = await _generate_ai_draft(
+        chat_id=chat_id, state=state, user_id=user_id, callback=callback
+    )
     if not draft:
-        await send_ephemeral_message(
-            callback.bot,
-            chat_id=callback.message.chat.id,
-            text="🤖 Не удалось сгенерировать черновик. Попробуйте позже.",
-            user_id=user_id,
-        )
         return
 
-    await state.update_data(chat_id=chat_id, chat_history=messages, ai_draft=draft)
-    await state.set_state(ChatStates.waiting_ai_confirm)
+    await _show_chat_draft(
+        chat_id=chat_id,
+        draft=draft,
+        state=state,
+        user_id=user_id,
+        callback=callback,
+    )
+
+
+@router.callback_query(ChatsCallbackData.filter(F.action == "reprompt"))
+async def cb_chat_reprompt(
+    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
+) -> None:
+    await callback.answer()
+    chat_id = callback_data.chat_id
+    if not chat_id:
+        return
+
+    await state.update_data(chat_id=chat_id)
+    await state.set_state(ChatStates.waiting_reprompt)
     await send_section_message(
         SECTION_CHAT_PROMPT,
-        text=f"🤖 Черновик ответа:\n\n{draft}",
-        reply_markup=chat_ai_confirm_keyboard(chat_id),
+        text="🔁 Пришлите свой промт для пересборки ответа",
         callback=callback,
-        user_id=user_id,
+        user_id=callback.from_user.id,
         persistent=True,
     )
 
@@ -1346,37 +1856,18 @@ async def cb_chat_ai_send(
     callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
 ) -> None:
     await callback.answer()
-    user_id = callback.from_user.id
-    data = await state.get_data()
-    chat_id = callback_data.chat_id or data.get("chat_id")
-    draft = data.get("ai_draft")
-    if not chat_id or not draft:
-        await send_ephemeral_message(
-            callback.bot,
-            chat_id=callback.message.chat.id,
-            text="Черновик ответа не найден",
-            user_id=user_id,
-        )
-        return
-    try:
-        await chat_send_message(chat_id, draft)
-    except Exception as exc:
-        await send_ephemeral_message(
-            callback.bot,
-            chat_id=callback.message.chat.id,
-            text=f"Не удалось отправить сообщение: {exc}",
-            user_id=user_id,
-        )
-        return
-
-    await delete_section_message(user_id, SECTION_CHAT_PROMPT, callback.bot, force=True)
-    await state.clear()
-    await _open_chat_history(
-        user_id=user_id, chat_id=chat_id, state=state, callback=callback
-    )
+    await _handle_draft_send(callback=callback, state=state, chat_id=callback_data.chat_id)
 
 
-@router.callback_query(ChatsCallbackData.filter(F.action == "ai_edit"))
+@router.callback_query(ChatsCallbackData.filter(F.action == "draft_send"))
+async def cb_chat_draft_send(
+    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
+) -> None:
+    await callback.answer()
+    await _handle_draft_send(callback=callback, state=state, chat_id=callback_data.chat_id)
+
+
+@router.callback_query(ChatsCallbackData.filter(F.action.in_(("ai_edit", "draft_edit"))))
 async def cb_chat_ai_edit(
     callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
 ) -> None:
@@ -1384,11 +1875,11 @@ async def cb_chat_ai_edit(
     chat_id = callback_data.chat_id
     if not chat_id:
         return
-    await state.update_data(chat_id=chat_id, ai_draft=None)
-    await state.set_state(ChatStates.waiting_ai_confirm)
+    await state.update_data(chat_id=chat_id)
+    await state.set_state(ChatStates.waiting_manual)
     await send_section_message(
         SECTION_CHAT_PROMPT,
-        text="✏️ Отправьте отредактированный текст ответа",
+        text="✏️ Пришлите текст черновика",
         callback=callback,
         user_id=callback.from_user.id,
         persistent=True,
@@ -1400,8 +1891,10 @@ async def cb_chat_ai_cancel(
     callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
 ) -> None:
     await callback.answer()
-    await delete_section_message(callback.from_user.id, SECTION_CHAT_PROMPT, callback.bot, force=True)
-    await state.clear()
+    await delete_section_message(
+        callback.from_user.id, SECTION_CHAT_PROMPT, callback.bot, force=True
+    )
+    await state.set_state(None)
 
 
 @router.message(ChatStates.waiting_manual)
@@ -1421,27 +1914,18 @@ async def chat_manual_message(message: Message, state: FSMContext) -> None:
             text="Чат не выбран",
             user_id=message.from_user.id,
         )
-        await state.clear()
+        await state.set_state(None)
         await delete_section_message(message.from_user.id, SECTION_CHAT_PROMPT, message.bot, force=True)
         return
-    try:
-        await chat_send_message(chat_id, text)
-    except Exception as exc:
-        await send_ephemeral_message(
-            message.bot,
-            chat_id=message.chat.id,
-            text=f"Не удалось отправить сообщение: {exc}",
-            user_id=message.from_user.id,
-        )
-        return
 
-    await delete_section_message(message.from_user.id, SECTION_CHAT_PROMPT, message.bot, force=True)
-    await state.clear()
-    await _open_chat_history(
-        user_id=message.from_user.id,
+    await _store_chat_draft(state, chat_id, text)
+    await _show_chat_draft(
         chat_id=chat_id,
+        draft=text,
         state=state,
+        user_id=message.from_user.id,
         message=message,
+        bot=message.bot,
     )
 
 
@@ -1462,25 +1946,57 @@ async def chat_ai_message(message: Message, state: FSMContext) -> None:
             text="Чат не выбран",
             user_id=message.from_user.id,
         )
+        await state.set_state(None)
+        await delete_section_message(message.from_user.id, SECTION_CHAT_PROMPT, message.bot, force=True)
+        return
+
+    await _store_chat_draft(state, chat_id, text)
+    await _show_chat_draft(
+        chat_id=chat_id,
+        draft=text,
+        state=state,
+        user_id=message.from_user.id,
+        message=message,
+        bot=message.bot,
+    )
+
+
+@router.message(ChatStates.waiting_reprompt)
+async def chat_reprompt_message(message: Message, state: FSMContext) -> None:
+    prompt_text = (message.text or "").strip()
+    if prompt_text.lower() == "/cancel":
         await state.clear()
         await delete_section_message(message.from_user.id, SECTION_CHAT_PROMPT, message.bot, force=True)
         return
-    try:
-        await chat_send_message(chat_id, text)
-    except Exception as exc:
+
+    data = await state.get_data()
+    chat_id = data.get("chat_id")
+    if not chat_id:
         await send_ephemeral_message(
             message.bot,
             chat_id=message.chat.id,
-            text=f"Не удалось отправить сообщение: {exc}",
+            text="Чат не выбран",
             user_id=message.from_user.id,
         )
+        await state.set_state(None)
+        await delete_section_message(message.from_user.id, SECTION_CHAT_PROMPT, message.bot, force=True)
         return
 
-    await delete_section_message(message.from_user.id, SECTION_CHAT_PROMPT, message.bot, force=True)
-    await state.clear()
-    await _open_chat_history(
-        user_id=message.from_user.id,
+    draft = await _generate_ai_draft(
         chat_id=chat_id,
         state=state,
+        user_id=message.from_user.id,
+        user_prompt=prompt_text,
         message=message,
+    )
+    if not draft:
+        return
+
+    await _show_chat_draft(
+        chat_id=chat_id,
+        draft=draft,
+        state=state,
+        user_id=message.from_user.id,
+        message=message,
+        bot=message.bot,
     )
