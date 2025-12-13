@@ -231,14 +231,13 @@ async def _send_questions_list(
         if callback:
             await send_ephemeral_message(
                 callback,
-                None,
                 f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
             )
         elif bot and chat_id:
             await send_ephemeral_message(
                 bot,
-                chat_id,
                 f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
+                chat_id=chat_id,
             )
         logger.warning("Unable to load questions list: %s", exc)
         return
@@ -246,14 +245,13 @@ async def _send_questions_list(
         if callback:
             await send_ephemeral_message(
                 callback,
-                None,
                 "⚠️ Не удалось получить список вопросов. Попробуйте позже.",
             )
         elif bot and chat_id:
             await send_ephemeral_message(
                 bot,
-                chat_id,
                 "⚠️ Не удалось получить список вопросов. Попробуйте позже.",
+                chat_id=chat_id,
             )
         logger.exception("Unexpected error while loading questions list")
         return
