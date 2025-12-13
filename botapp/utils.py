@@ -4,7 +4,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, Message
 
-__all__ = ["send_ephemeral_message", "send_ephemeral_from_callback"]
+__all__ = ["send_ephemeral_message", "send_ephemeral_from_callback", "safe_edit_text"]
 
 
 async def send_ephemeral_message(
@@ -55,6 +55,25 @@ async def send_ephemeral_message(
         await target.send_message(target_chat, text)
     except TelegramBadRequest:
         pass
+
+
+async def safe_edit_text(message: Message, text: str, *, reply_markup=None):
+    """Edit a message without crashing on common race conditions.
+
+    * Silently ignores "message is not modified" to avoid noisy warnings.
+    * If the message is gone ("message to edit not found"), returns None so caller
+      can decide to send a fresh message instead.
+    """
+
+    try:
+        return await message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as exc:
+        lower_exc = str(exc).lower()
+        if "message is not modified" in lower_exc:
+            return message
+        if "message to edit not found" in lower_exc:
+            return None
+        raise
 
 
 async def send_ephemeral_from_callback(

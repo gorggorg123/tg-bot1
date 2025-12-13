@@ -272,6 +272,73 @@ def _chat_unread_count(chat: dict) -> int:
     return 0
 
 
+def is_buyer_chat(chat: dict) -> bool:
+    """Отфильтровать служебные/системные чаты и оставить только покупательские."""
+
+    if not isinstance(chat, dict):
+        return False
+
+    raw = chat.get("_raw") if isinstance(chat.get("_raw"), dict) else None
+    merged: dict = {}
+    if raw:
+        merged.update(raw)
+    merged.update(chat)
+
+    def _match_any(value: str, needles: tuple[str, ...]) -> bool:
+        val = value.lower()
+        return any(word in val for word in needles)
+
+    # Позитивные признаки
+    buyer_candidate = _chat_buyer_name(merged)
+    role_fields = [
+        merged.get("role"),
+        merged.get("type"),
+        merged.get("chat_type"),
+        merged.get("source"),
+    ]
+    if isinstance(merged.get("participants"), list):
+        for p in merged["participants"]:
+            if isinstance(p, dict):
+                role_fields.extend([p.get("role"), p.get("type"), p.get("name")])
+
+    positive_found = False
+    for role in role_fields:
+        if role and _match_any(str(role), ("buyer", "customer", "client", "user")):
+            positive_found = True
+            break
+    if buyer_candidate:
+        positive_found = True
+
+    # Негативные признаки
+    negative_fields = [
+        merged.get("title"),
+        merged.get("topic"),
+        merged.get("chat_type"),
+        merged.get("type"),
+        merged.get("source"),
+    ]
+    for participant in merged.get("participants", []) if isinstance(merged.get("participants"), list) else []:
+        if isinstance(participant, dict):
+            negative_fields.extend(
+                [participant.get("name"), participant.get("role"), participant.get("type")]
+            )
+
+    has_negative = False
+    for value in negative_fields:
+        if value and _match_any(
+            str(value), ("support", "ozon", "system", "notification", "service", "crm")
+        ):
+            has_negative = True
+            if not positive_found:
+                return False
+
+    # Если нет негативных признаков, но и нет явного покупателя — считаем чат допустимым,
+    # чтобы не скрыть реального клиента из-за неполной схемы.
+    if has_negative and not positive_found:
+        return False
+    return True if positive_found or not has_negative else False
+
+
 def _chat_last_dt(chat: dict) -> datetime | None:
     if not isinstance(chat, dict):
         return None
@@ -333,6 +400,11 @@ def _chat_display(chat: dict) -> tuple[str | None, str, str, int, str, datetime 
     last_text = _chat_last_text(chat)
     msg_count = _chat_message_count(chat)
 
+    fallback_buyer = None
+    if chat_id:
+        tail = chat_id[-4:]
+        fallback_buyer = f"Покупатель {tail}"
+
     if buyer:
         title = buyer
         if posting:
@@ -341,6 +413,8 @@ def _chat_display(chat: dict) -> tuple[str | None, str, str, int, str, datetime 
         title = f"Заказ {posting}"
         if last_label:
             title = f"{title} • {last_label}"
+    elif fallback_buyer:
+        title = fallback_buyer
     else:
         if last_label and msg_count:
             title = f"Чат от {last_label} • {msg_count} сообщений"
@@ -351,7 +425,7 @@ def _chat_display(chat: dict) -> tuple[str | None, str, str, int, str, datetime 
         else:
             title = "Чат без названия"
 
-    short_title = _truncate_text(title, limit=24)
+    short_title = _truncate_text(title, limit=64)
     preview = _truncate_text(last_text, limit=60) if last_text else ""
     return chat_id, title, short_title, unread_count, preview, last_dt
 
@@ -413,6 +487,7 @@ async def _send_chats_list(
 ) -> None:
     data = await state.get_data()
     unread_flag = bool(unread_only if unread_only is not None else data.get("chats_unread_only"))
+    show_service = bool(data.get("chats_show_service"))
 
     cached_list = data.get("chats_all") if isinstance(data.get("chats_all"), list) else None
     need_reload = refresh or not isinstance(cached_list, list) or not cached_list
@@ -449,9 +524,10 @@ async def _send_chats_list(
         if cid:
             cache[cid] = chat if isinstance(chat, dict) else {}
 
-    filtered_items = [chat for chat in sorted_items if not unread_flag or _chat_unread_count(chat) > 0]
-    total_count = len(sorted_items)
-    unread_total = sum(1 for chat in sorted_items if _chat_unread_count(chat) > 0)
+    buyer_items = [chat for chat in sorted_items if show_service or is_buyer_chat(chat)]
+    filtered_items = [chat for chat in buyer_items if not unread_flag or _chat_unread_count(chat) > 0]
+    total_count = len(buyer_items)
+    unread_total = sum(1 for chat in buyer_items if _chat_unread_count(chat) > 0)
     total_pages = max(1, math.ceil(max(1, len(filtered_items)) / CHAT_PAGE_SIZE))
     safe_page = max(0, min(page, total_pages - 1))
     start = safe_page * CHAT_PAGE_SIZE
@@ -464,21 +540,31 @@ async def _send_chats_list(
         chat_id_val, title, short_title, unread_count, preview, last_dt = _chat_display(chat)
         if not chat_id_val:
             continue
-        line_parts = [f"{idx}) {title}"]
-        if unread_count > 0:
-            line_parts.append(f"🔴 {unread_count}")
-        if preview:
-            line_parts.append(f"— {preview}")
-        display_rows.append(" ".join(line_parts))
-        keyboard_items.append((chat_id_val, short_title))
+        badge = "🔴" if unread_count > 0 else "⚪"
+        ts_label = last_dt.strftime("%d.%m %H:%M") if last_dt else ""
+        preview_label = f'"{preview}"' if preview else ""
+        line_parts = [
+            f"{idx}) {badge} {title}",
+            ts_label,
+            preview_label,
+        ]
+        display_rows.append(" | ".join([part for part in line_parts if part]))
+        kb_caption = " | ".join(
+            [
+                f"{badge}{unread_count if unread_count else ''}",
+                _truncate_text(title, limit=26),
+                ts_label,
+                preview_label,
+            ]
+        ).replace("||", "|")
+        keyboard_items.append((chat_id_val, kb_caption))
 
-    lines = [
-        "🗨️ Активные чаты с покупателями",
-    ]
-    lines.append(f"Всего чатов: {total_count}, непрочитанных: {unread_total}.")
+    lines = ["💬 Чаты с покупателями"]
     lines.append(
-        "Показываю только диалоги с покупателями. Служебные уведомления и чаты с поддержкой Ozon скрыты."
+        f"Всего: {total_count} | Непрочитано: {unread_total}" +
+        (" | Фильтр: все" if show_service else " | Фильтр: только покупатели")
     )
+    lines.append(f"Только непрочитанные: {'ON' if unread_flag else 'OFF'}")
     lines.append("")
 
     if not display_rows:
@@ -493,6 +579,7 @@ async def _send_chats_list(
         page=safe_page,
         total_pages=total_pages,
         unread_only=unread_flag,
+        show_service=show_service,
     )
     target = callback.message if callback else message
     active_bot = bot or (target.bot if target else None)
@@ -505,6 +592,7 @@ async def _send_chats_list(
         chats_page=safe_page,
         chats_unread_only=unread_flag,
         chats_all=sorted_items,
+        chats_show_service=show_service,
     )
     sent = await send_section_message(
         SECTION_CHATS_LIST,
@@ -759,7 +847,6 @@ async def cb_chats_list(
     page = int(callback_data.page or 0)
     data = await state.get_data()
     unread_only = bool(data.get("chats_unread_only"))
-    await state.clear()
     await _send_chats_list(
         user_id=user_id,
         state=state,
@@ -784,6 +871,25 @@ async def cb_chats_filter(
         page=int(page),
         callback=callback,
         unread_only=not current_flag,
+    )
+
+
+@router.callback_query(ChatsCallbackData.filter(F.action == "service"))
+async def cb_chats_service_toggle(
+    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
+) -> None:
+    await callback.answer()
+    data = await state.get_data()
+    current_flag = bool(data.get("chats_show_service"))
+    page = int(callback_data.page or data.get("chats_page") or 0)
+    await state.update_data(chats_show_service=not current_flag)
+    await _send_chats_list(
+        user_id=callback.from_user.id,
+        state=state,
+        page=int(page),
+        callback=callback,
+        unread_only=bool(data.get("chats_unread_only")),
+        refresh=False,
     )
 
 
