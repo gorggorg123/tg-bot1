@@ -978,9 +978,47 @@ def chats_list_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def chat_actions_keyboard(chat_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+def chat_actions_keyboard(
+    chat_id: str,
+    *,
+    attachments_total: int = 0,
+    photo_count: int = 0,
+    file_count: int = 0,
+    oversized: bool = False,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if attachments_total:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=(
+                        f"📷 Фото ({photo_count})"
+                        if oversized and photo_count
+                        else f"📎 Вложения ({attachments_total})"
+                    ),
+                    callback_data=ChatsCallbackData(
+                        action="media_photos" if oversized and photo_count else "media_all",
+                        chat_id=chat_id,
+                    ).pack(),
+                ),
+                InlineKeyboardButton(
+                    text=f"📄 Файлы ({file_count})",
+                    callback_data=ChatsCallbackData(action="media_files", chat_id=chat_id).pack(),
+                ),
+            ]
+        )
+        if oversized:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="⬇️ Скачать всё",
+                        callback_data=ChatsCallbackData(action="media_all", chat_id=chat_id).pack(),
+                    )
+                ]
+            )
+
+    rows.extend(
+        [
             [
                 InlineKeyboardButton(
                     text="✍️ Ответить вручную",
@@ -1013,6 +1051,7 @@ def chat_actions_keyboard(chat_id: str) -> InlineKeyboardMarkup:
             ],
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def chat_ai_confirm_keyboard(chat_id: str) -> InlineKeyboardMarkup:

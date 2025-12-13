@@ -1571,6 +1571,20 @@ async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:
     return messages
 
 
+async def download_with_auth(url: str) -> bytes:
+    """Скачать файл с Ozon API с учётом авторизационных заголовков."""
+
+    client = get_client()
+    response = await client._http_client.get(url)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:  # pragma: no cover - сеть/HTTP
+        logger.warning("Ozon %s -> HTTP %s", url, response.status_code)
+        raise OzonAPIError(f"Не удалось скачать вложение: {exc}") from exc
+
+    return await response.aread()
+
+
 async def chat_read(chat_id: str, messages: Sequence[dict] | None = None) -> None:
     """Mark chat messages as read up to the latest known message."""
 

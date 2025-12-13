@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
+import os
 import textwrap
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict
+from urllib.parse import urlparse
 
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from botapp.chats_ai import suggest_chat_reply
 from botapp.keyboards import (
@@ -44,6 +48,7 @@ from botapp.ozon_client import (
     chat_list,
     chat_read,
     chat_send_message,
+    download_with_auth,
     get_posting_products,
 )
 from botapp.utils import safe_edit_text, send_ephemeral_message
@@ -62,6 +67,9 @@ router = Router()
 CHAT_PAGE_SIZE = 7  # показываем чуть больше чатов на страницу
 CHAT_LIST_LIMIT = 100  # верхняя граница одной выгрузки списка чатов
 MOSCOW_TZ = timezone(timedelta(hours=3))
+ATTACH_AUTOSEND_LIMIT = 10
+ATTACH_CACHE_DIR = Path(os.getenv("ATTACH_CACHE_DIR", "/tmp/ozon_chat_cache"))
+ATTACH_CACHE_TTL = timedelta(hours=12)
 
 
 def _truncate_text(text: str, limit: int = 80) -> str:
@@ -445,24 +453,255 @@ def _chat_sort_key(chat: dict) -> tuple:
     return (last_dt or datetime.min, chat.get("last_message_time") or "")
 
 
-def _describe_attachments(msg: dict) -> list[str]:
-    """Сформировать короткое описание вложений (фото/файлы) для истории."""
-
-    if not isinstance(msg, dict):
-        return []
-    attachments = msg.get("attachments") or msg.get("files")
-    lines: list[str] = []
-    if isinstance(attachments, list):
-        for item in attachments:
-            if not isinstance(item, dict):
+def _cleanup_attachment_cache() -> None:
+    ATTACH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.utcnow()
+    with suppress(Exception):
+        for path in ATTACH_CACHE_DIR.iterdir():
+            try:
+                mtime = datetime.utcfromtimestamp(path.stat().st_mtime)
+            except Exception:
                 continue
-            name = item.get("name") or item.get("file_name") or item.get("filename") or "файл"
-            url = item.get("url") or item.get("link") or item.get("download_url")
-            label = f"📎 {name}"
-            if url:
-                label = f"{label} ({url})"
-            lines.append(label)
-    return lines
+            if now - mtime > ATTACH_CACHE_TTL:
+                with suppress(Exception):
+                    path.unlink()
+
+
+def _attachment_cache_path(url: str) -> Path:
+    parsed = urlparse(url)
+    suffix = Path(parsed.path).suffix
+    digest = hashlib.sha256(url.encode("utf-8", errors="ignore")).hexdigest()
+    filename = digest + (suffix or "")
+    return ATTACH_CACHE_DIR / filename
+
+
+def _normalize_attachment(item: object) -> dict | None:
+    if isinstance(item, str):
+        url = item.strip()
+        if not url or not url.startswith("http"):
+            return None
+        name = Path(urlparse(url).path).name or "вложение"
+        return {
+            "kind": "photo"
+            if any(name.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"))
+            else "file",
+            "name": name,
+            "url": url,
+            "cache_key": url,
+        }
+
+    if not isinstance(item, dict):
+        return None
+
+    url = None
+    for key in ("url", "link", "download_url", "file_url", "fileUrl", "href"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            url = value.strip()
+            break
+    file_id = None
+    for key in ("file_id", "fileId", "file_uuid"):
+        value = item.get(key)
+        if value not in (None, ""):
+            file_id = str(value)
+            break
+
+    if not url and not file_id:
+        return None
+
+    name = None
+    for key in ("name", "file_name", "filename", "title", "original_name"):
+        value = item.get(key)
+        if value not in (None, ""):
+            name = str(value)
+            break
+    if not name and url:
+        parsed = urlparse(url)
+        name = Path(parsed.path).name or "вложение"
+    size = None
+    for key in ("size", "file_size", "length"):
+        value = item.get(key)
+        try:
+            size = int(value)
+            break
+        except Exception:
+            continue
+
+    type_value = None
+    for key in ("type", "mime", "mime_type", "content_type", "file_type"):
+        value = item.get(key)
+        if value not in (None, ""):
+            type_value = str(value)
+            break
+    kind = "file"
+    type_lower = (type_value or "").lower()
+    if any(word in type_lower for word in ("image", "photo", "picture")):
+        kind = "photo"
+    elif url:
+        if any(url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic")):
+            kind = "photo"
+
+    return {"kind": kind, "name": name or "вложение", "url": url, "file_id": file_id, "size": size, "cache_key": url or file_id or name}
+
+
+def _extract_message_attachments(msg: dict) -> list[dict]:
+    attachments: list[dict] = []
+    seen: set[str] = set()
+
+    def _walk(obj: object) -> None:
+        if isinstance(obj, dict):
+            if any(key in obj for key in ("attachments", "files", "file", "file_info", "fileInfo", "data")):
+                for key in ("attachments", "files", "file", "file_info", "fileInfo", "data"):
+                    val = obj.get(key)
+                    if isinstance(val, list):
+                        for item in val:
+                            _walk(item)
+                    elif isinstance(val, dict):
+                        _walk(val)
+            if any(key in obj for key in ("url", "link", "download_url", "file_url", "fileUrl", "href", "file_id", "fileId")):
+                normalized = _normalize_attachment(obj)
+                if normalized:
+                    key_val = normalized.get("cache_key") or normalized.get("url") or normalized.get("name")
+                    if key_val and key_val not in seen:
+                        seen.add(key_val)
+                        attachments.append(normalized)
+            for value in obj.values():
+                if isinstance(value, (dict, list, str)):
+                    _walk(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk(item)
+        elif isinstance(obj, str):
+            normalized = _normalize_attachment(obj)
+            if normalized:
+                key_val = normalized.get("cache_key") or normalized.get("url") or normalized.get("name")
+                if key_val and key_val not in seen:
+                    seen.add(key_val)
+                    attachments.append(normalized)
+
+    _walk(msg or {})
+    raw = msg.get("_raw") if isinstance(msg, dict) else None
+    if raw and raw is not msg:
+        _walk(raw)
+
+    return attachments
+
+
+def _resolve_author(role_lower: str) -> tuple[str, str]:
+    if "seller" in role_lower or "operator" in role_lower or "store" in role_lower:
+        return "seller", "🧑‍🏭 Вы"
+    if "courier" in role_lower:
+        return "courier", "🚚 Курьер"
+    if "support" in role_lower or "crm" in role_lower:
+        return "support", "🛡️ Саппорт"
+    return "buyer", "👤 Покупатель"
+
+
+def _normalize_chat_messages(messages: list[dict]) -> tuple[list[dict], list[dict]]:
+    prepared: list[dict] = []
+    attachments_all: list[dict] = []
+    attachments_seen: set[str] = set()
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        text = _extract_text(msg) or ""
+        attachments = _extract_message_attachments(msg)
+        if not text and not attachments:
+            continue
+
+        role_lower = _detect_message_role(msg)
+        author_kind, author_label = _resolve_author(role_lower)
+
+        ts_value = _ts(msg)
+        ts_dt = _parse_ts(ts_value)
+        ts_label = None
+        if ts_dt:
+            ts_safe = ts_dt
+            if not ts_safe.tzinfo:
+                ts_safe = ts_safe.replace(tzinfo=timezone.utc)
+            ts_label = ts_safe.astimezone(MOSCOW_TZ).strftime("%d.%m %H:%M")
+        elif ts_value:
+            ts_label = ts_value[:16]
+        else:
+            ts_label = ""
+
+        prepared.append(
+            {
+                "author": author_label,
+                "author_kind": author_kind,
+                "text": text,
+                "attachments": attachments,
+                "ts": ts_dt.astimezone(timezone.utc).replace(tzinfo=None) if ts_dt else None,
+                "ts_raw": ts_value or "",
+                "ts_label": ts_label or "",
+            }
+        )
+
+        for att in attachments:
+            key_val = att.get("cache_key") or att.get("url") or att.get("name")
+            if key_val and key_val not in attachments_seen:
+                attachments_seen.add(key_val)
+                attachments_all.append(att)
+
+    prepared.sort(key=lambda item: (item.get("ts") or datetime.min, item.get("ts_raw") or ""))
+    return prepared, attachments_all
+
+
+async def _ensure_cached_attachment(att: dict) -> Path | None:
+    url = att.get("url") if isinstance(att, dict) else None
+    if not url:
+        return None
+
+    _cleanup_attachment_cache()
+    ATTACH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = _attachment_cache_path(url)
+    if cache_path.exists():
+        try:
+            mtime = datetime.utcfromtimestamp(cache_path.stat().st_mtime)
+            if datetime.utcnow() - mtime < ATTACH_CACHE_TTL:
+                return cache_path
+        except Exception:
+            pass
+        with suppress(Exception):
+            cache_path.unlink()
+
+    try:
+        content = await download_with_auth(url)
+    except Exception as exc:  # pragma: no cover - сеть
+        logger.warning("Failed to download attachment %s: %s", url, exc)
+        return None
+
+    try:
+        cache_path.write_bytes(content)
+    except Exception as exc:  # pragma: no cover - FS
+        logger.warning("Failed to write attachment cache %s: %s", cache_path, exc)
+        return None
+
+    return cache_path
+
+
+async def _send_chat_attachments(
+    *, bot: Bot, telegram_chat_id: int, attachments: list[dict], only_kind: str | None = None
+) -> None:
+    if not attachments:
+        return
+
+    for att in attachments:
+        if only_kind and att.get("kind") != only_kind:
+            continue
+        cache_path = await _ensure_cached_attachment(att)
+        if not cache_path:
+            continue
+        filename = att.get("name") or cache_path.name
+        try:
+            file = FSInputFile(cache_path, filename=filename)
+            if att.get("kind") == "photo":
+                await bot.send_photo(telegram_chat_id, file, caption=filename)
+            else:
+                await bot.send_document(telegram_chat_id, file, caption=filename)
+        except Exception as exc:  # pragma: no cover - Telegram/network
+            logger.warning("Failed to send attachment %s: %s", filename, exc)
 
 
 def _collect_product_names(cache: Dict[str, list[str]], posting: str) -> list[str]:
@@ -671,69 +910,34 @@ def _format_chat_history_text(
 
     lines.append("")
 
-    prepared: list[dict] = []
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        text = _extract_text(msg)
-        attachments = _describe_attachments(msg)
-        if not text and not attachments:
-            continue
-
-        role_lower = _detect_message_role(msg)
-        if "crm" in role_lower or "support" in role_lower:
-            continue
-
-        if "seller" in role_lower or "operator" in role_lower or "store" in role_lower:
-            author = "🧑‍🏭 Вы"
-        elif "courier" in role_lower:
-            author = "🚚 Курьер"
-        else:
-            author = "👤 Покупатель"
-
-        ts_value = _ts(msg)
-        ts_dt = _parse_ts(ts_value)
-        ts_label = None
-        if ts_dt:
-            ts_safe = ts_dt
-            if not ts_safe.tzinfo:
-                ts_safe = ts_safe.replace(tzinfo=timezone.utc)
-            ts_label = ts_safe.astimezone(MOSCOW_TZ).strftime("%d.%m %H:%M")
-        elif ts_value:
-            ts_label = ts_value[:16]
-        else:
-            ts_label = ""
-
-        wrapped: list[str] = []
-        if text:
-            for line in str(text).splitlines() or [""]:
-                stripped = line.strip()
-                if not stripped:
-                    wrapped.append("")
-                    continue
-                wrapped.extend(textwrap.wrap(stripped, width=78) or [stripped])
-        wrapped.extend(attachments)
-
-        prepared.append(
-            {
-                "author": author,
-                "text_lines": wrapped,
-                "ts": ts_dt.astimezone(timezone.utc).replace(tzinfo=None) if ts_dt else None,
-                "ts_raw": ts_value or "",
-                "ts_label": ts_label or "",
-            }
-        )
-
-    if not prepared:
+    if not messages:
         lines.append("История чата пуста или нет текстовых сообщений.")
     else:
-        prepared.sort(key=lambda item: (item.get("ts") or datetime.min, item.get("ts_raw") or ""))
-        trimmed = prepared[-max(1, limit) :]
+        trimmed = messages[-max(1, limit) :]
         for item in trimmed:
             ts_label = item.get("ts_label") or ""
             author = item.get("author") or "👤 Покупатель"
             lines.append(f"[{ts_label}] {author}:")
-            lines.extend(item.get("text_lines") or [])
+
+            text = item.get("text") or ""
+            if text:
+                for line in str(text).splitlines() or [""]:
+                    stripped = line.strip()
+                    if not stripped:
+                        lines.append("")
+                        continue
+                    lines.extend(textwrap.wrap(stripped, width=78) or [stripped])
+            attachments = item.get("attachments") or []
+            if attachments:
+                photos = sum(1 for att in attachments if att.get("kind") == "photo")
+                files = sum(1 for att in attachments if att.get("kind") != "photo")
+                parts = []
+                if photos:
+                    parts.append(f"фото={photos}")
+                if files:
+                    parts.append(f"файлы={files}")
+                if parts:
+                    lines.append("📎 Вложения: " + ", ".join(parts))
             lines.append("")
 
     lines.append("─────────────")
@@ -815,15 +1019,50 @@ async def _open_chat_history(
         await chat_read(chat_id, messages)
 
     products = await _load_posting_products(state, chat_meta)
-    history_text = _format_chat_history_text(chat_meta, messages, products=products)
-    markup = chat_actions_keyboard(chat_id)
+    normalized_messages, attachments_all = _normalize_chat_messages(messages)
+    photo_count = sum(1 for att in attachments_all if att.get("kind") == "photo")
+    file_count = sum(1 for att in attachments_all if att.get("kind") != "photo")
+    attachments_total = len(attachments_all)
+    history_text = _format_chat_history_text(
+        chat_meta, normalized_messages, products=products
+    )
+    if attachments_total > ATTACH_AUTOSEND_LIMIT:
+        history_text = (
+            history_text
+            + "\n\n📎 Вложений много, отправляем их по кнопкам ниже, чтобы не заспамить."
+        )
+    markup = chat_actions_keyboard(
+        chat_id,
+        attachments_total=attachments_total,
+        photo_count=photo_count,
+        file_count=file_count,
+        oversized=attachments_total > ATTACH_AUTOSEND_LIMIT,
+    )
     target = callback.message if callback else message
     active_bot = bot or (target.bot if target else None)
     active_chat = chat_id_override or (target.chat.id if target else None)
     if not active_bot or active_chat is None:
         return
 
-    await state.update_data(chat_history=messages, current_chat_id=chat_id, chats_cache=cache)
+    attachments_map = data.get("chat_attachments") if isinstance(data.get("chat_attachments"), dict) else {}
+    if not isinstance(attachments_map, dict):
+        attachments_map = {}
+    attachments_map[chat_id] = {
+        "items": attachments_all,
+        "counts": {
+            "photos": photo_count,
+            "files": file_count,
+            "total": attachments_total,
+        },
+    }
+
+    await state.update_data(
+        chat_history=messages,
+        chat_history_prepared=normalized_messages,
+        current_chat_id=chat_id,
+        chats_cache=cache,
+        chat_attachments=attachments_map,
+    )
     sent = None
     if target and chat_id_override is None:
         sent = await safe_edit_text(
@@ -846,6 +1085,13 @@ async def _open_chat_history(
             user_id=user_id,
         )
     await delete_section_message(user_id, SECTION_CHAT_PROMPT, active_bot, force=True)
+
+    if attachments_total and attachments_total <= ATTACH_AUTOSEND_LIMIT:
+        await _send_chat_attachments(
+            bot=active_bot,
+            telegram_chat_id=active_chat,
+            attachments=attachments_all,
+        )
 
 
 async def _clear_chat_sections(bot: Bot, user_id: int) -> None:
@@ -926,6 +1172,42 @@ async def cb_chats_service_toggle(
         callback=callback,
         unread_only=bool(data.get("chats_unread_only")),
         refresh=False,
+    )
+
+
+@router.callback_query(ChatsCallbackData.filter(F.action.in_(("media_all", "media_photos", "media_files"))))
+async def cb_chat_media(
+    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
+) -> None:
+    await callback.answer()
+    chat_id = callback_data.chat_id
+    if not chat_id:
+        return
+
+    data = await state.get_data()
+    attachments_map = data.get("chat_attachments") if isinstance(data.get("chat_attachments"), dict) else {}
+    record = attachments_map.get(chat_id) if isinstance(attachments_map, dict) else None
+    attachments = record.get("items") if isinstance(record, dict) else []
+    if not attachments:
+        await send_ephemeral_message(
+            callback.bot,
+            callback.message.chat.id,
+            "Вложения не найдены. Обновите чат, чтобы загрузить их заново.",
+            user_id=callback.from_user.id,
+        )
+        return
+
+    kind = None
+    if callback_data.action == "media_photos":
+        kind = "photo"
+    elif callback_data.action == "media_files":
+        kind = "file"
+
+    await _send_chat_attachments(
+        bot=callback.bot,
+        telegram_chat_id=callback.message.chat.id,
+        attachments=attachments,
+        only_kind=kind,
     )
 
 
