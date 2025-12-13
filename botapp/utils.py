@@ -8,23 +8,43 @@ __all__ = ["send_ephemeral_message", "send_ephemeral_from_callback"]
 
 
 async def send_ephemeral_message(
-    bot: Bot | CallbackQuery | Message,
-    chat_id: int | None,
-    text: str,
-    *,
+    target: Bot | CallbackQuery | Message,
+    *args,
+    text: str | None = None,
+    chat_id: int | None = None,
     user_id: int | None = None,
     show_alert: bool = False,
 ) -> None:
-    """Send a short-lived notification without breaking legacy call sites."""
+    """Send a short-lived notification without breaking legacy call sites.
+
+    Accepted call styles (for backwards compatibility):
+    - send_ephemeral_message(callback, "text")
+    - send_ephemeral_message(callback, None, "text")
+    - send_ephemeral_message(bot, chat_id, "text")
+    - send_ephemeral_message(bot, chat_id, text="text")
+    """
+
+    # Backwards compatible positional parsing
+    if text is None:
+        if len(args) == 1:
+            text = args[0]
+        elif len(args) >= 2:
+            chat_id = chat_id if chat_id is not None else args[0]
+            text = args[1]
+    if chat_id is None and len(args) >= 1 and text is None:
+        chat_id = args[0]
+
+    if text is None:
+        raise TypeError("send_ephemeral_message() missing required 'text' argument")
 
     # Compatibility: allow passing CallbackQuery directly
-    if isinstance(bot, CallbackQuery):
-        await send_ephemeral_from_callback(bot, text, show_alert=show_alert)
+    if isinstance(target, CallbackQuery):
+        await send_ephemeral_from_callback(target, text, show_alert=show_alert)
         return
 
     # Compatibility: allow passing Message directly
-    if isinstance(bot, Message):
-        await send_ephemeral_from_callback(bot, text, show_alert=show_alert)
+    if isinstance(target, Message):
+        await send_ephemeral_from_callback(target, text, show_alert=show_alert)
         return
 
     if chat_id is None:
@@ -32,7 +52,7 @@ async def send_ephemeral_message(
 
     target_chat = user_id or chat_id
     try:
-        await bot.send_message(target_chat, text)
+        await target.send_message(target_chat, text)
     except TelegramBadRequest:
         pass
 
