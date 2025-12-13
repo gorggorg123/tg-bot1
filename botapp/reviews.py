@@ -1036,7 +1036,7 @@ def build_reviews_table(
         status_icon, status_text = _status_badge(card)
         stars = f"{card.rating}★" if card.rating else "—"
         product_short = _pick_short_product_label(card)
-    snippet = safe_strip(card.text)
+        snippet = safe_strip(card.text)
         if len(snippet) > 50:
             snippet = snippet[:47] + "…"
         date_part = _fmt_dt_msk(card.created_at) or "дата неизвестна"
