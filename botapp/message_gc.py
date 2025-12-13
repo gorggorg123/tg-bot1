@@ -56,6 +56,20 @@ def remember_section_message(
     _remember_message(user_id, section, chat_id, message_id, persistent=persistent)
 
 
+def get_section_message(user_id: int, section: str) -> SectionMessage | None:
+    """Return stored message binding for section if present."""
+
+    return _section_messages.get(user_id, {}).get(section)
+
+
+def remember_section_message(
+    user_id: int, section: str, chat_id: int, message_id: int, *, persistent: bool = False
+) -> None:
+    """Public wrapper to store section binding (used by safe_edit_text)."""
+
+    _remember_message(user_id, section, chat_id, message_id, persistent=persistent)
+
+
 async def delete_message_safe(bot: Bot, chat_id: int, message_id: int) -> None:
     """Delete a Telegram message, swallowing benign errors."""
 
