@@ -55,7 +55,10 @@ async def build_chat_ai_context(
 
 
 async def suggest_chat_reply(
-    chat_history: list[dict], product_name: str | None
+    chat_history: list[dict],
+    product_name: str | None,
+    *,
+    user_prompt: str | None = None,
 ) -> str | None:
     """Call AI client to generate draft reply based on chat history."""
 
@@ -65,6 +68,7 @@ async def suggest_chat_reply(
             customer_messages=customer_msgs,
             seller_messages=seller_msgs,
             product_name=product_name,
+            extra_context=user_prompt,
         )
     except AIClientError as exc:
         logger.warning("AI client error while suggesting chat reply: %s", exc)
