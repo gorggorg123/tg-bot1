@@ -58,6 +58,7 @@ class ChatsCallbackData(CallbackData, prefix="chats"):
     action: str
     chat_id: Optional[str] = None
     page: Optional[int] = None
+    token: Optional[str] = None
     
 
 class WarehouseCallbackData(CallbackData, prefix="warehouse"):
@@ -985,6 +986,8 @@ def chat_actions_keyboard(
     photo_count: int = 0,
     file_count: int = 0,
     oversized: bool = False,
+    attachment_tokens: list[tuple[str, str, str | None]] | None = None,
+    has_draft: bool = False,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if attachments_total:
@@ -1017,20 +1020,56 @@ def chat_actions_keyboard(
                 ]
             )
 
+    if attachment_tokens:
+        for token, label, _kind in attachment_tokens:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=label,
+                        callback_data=ChatsCallbackData(
+                            action="file",
+                            chat_id=chat_id,
+                            token=token,
+                        ).pack(),
+                    )
+                ]
+            )
+
     rows.extend(
         [
             [
                 InlineKeyboardButton(
-                    text="✍️ Ответить вручную",
+                    text="✏️ Ввести вручную",
                     callback_data=ChatsCallbackData(action="manual", chat_id=chat_id).pack(),
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🤖 Предложить ответ ИИ",
+                    text="✉️ Ответ через ИИ",
                     callback_data=ChatsCallbackData(action="ai", chat_id=chat_id).pack(),
                 )
             ],
+            [
+                InlineKeyboardButton(
+                    text="🔁 Пересобрать по моему промту",
+                    callback_data=ChatsCallbackData(action="reprompt", chat_id=chat_id).pack(),
+                )
+            ],
+        ]
+    )
+
+    if has_draft:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="✅ Отправить",
+                    callback_data=ChatsCallbackData(action="draft_send", chat_id=chat_id).pack(),
+                )
+            ]
+        )
+
+    rows.extend(
+        [
             [
                 InlineKeyboardButton(
                     text="🔄 Обновить чат",
@@ -1055,22 +1094,34 @@ def chat_actions_keyboard(
 
 
 def chat_ai_confirm_keyboard(chat_id: str) -> InlineKeyboardMarkup:
+    return chat_draft_keyboard(chat_id)
+
+
+def chat_draft_keyboard(chat_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="✅ Отправить",
-                    callback_data=ChatsCallbackData(action="ai_send", chat_id=chat_id).pack(),
-                ),
-                InlineKeyboardButton(
-                    text="✏️ Изменить",
-                    callback_data=ChatsCallbackData(action="ai_edit", chat_id=chat_id).pack(),
-                ),
+                    callback_data=ChatsCallbackData(action="draft_send", chat_id=chat_id).pack(),
+                )
             ],
             [
                 InlineKeyboardButton(
-                    text="❌ Отменить",
-                    callback_data=ChatsCallbackData(action="ai_cancel", chat_id=chat_id).pack(),
+                    text="🔁 Пересобрать по моему промту",
+                    callback_data=ChatsCallbackData(action="reprompt", chat_id=chat_id).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✏️ Изменить вручную",
+                    callback_data=ChatsCallbackData(action="draft_edit", chat_id=chat_id).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад к чату",
+                    callback_data=ChatsCallbackData(action="open", chat_id=chat_id).pack(),
                 )
             ],
         ]
@@ -1106,5 +1157,6 @@ __all__ = [
     "chats_list_keyboard",
     "chat_actions_keyboard",
     "chat_ai_confirm_keyboard",
+    "chat_draft_keyboard",
     "account_keyboard",
 ]
