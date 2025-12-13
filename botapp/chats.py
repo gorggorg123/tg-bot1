@@ -752,8 +752,8 @@ async def _send_chats_list(
         if target:
             await send_ephemeral_message(
                 target.bot,
-                target.chat.id,
-                f"⚠️ Не удалось получить список чатов. Ошибка: {exc}",
+                chat_id=target.chat.id,
+                text=f"⚠️ Не удалось получить список чатов. Ошибка: {exc}",
                 user_id=user_id,
             )
         logger.warning("Unable to load chats list: %s", exc)
@@ -763,8 +763,8 @@ async def _send_chats_list(
         if target:
             await send_ephemeral_message(
                 target.bot,
-                target.chat.id,
-                "⚠️ Не удалось получить список чатов. Попробуйте позже.",
+                chat_id=target.chat.id,
+                text="⚠️ Не удалось получить список чатов. Попробуйте позже.",
                 user_id=user_id,
             )
         logger.exception("Unexpected error while loading chats list")
@@ -997,8 +997,8 @@ async def _open_chat_history(
         if target:
             await send_ephemeral_message(
                 target.bot,
-                target.chat.id,
-                f"⚠️ Не удалось получить историю чата. Ошибка: {exc}",
+                chat_id=target.chat.id,
+                text=f"⚠️ Не удалось получить историю чата. Ошибка: {exc}",
                 user_id=user_id,
             )
         logger.warning("Unable to load chat history for %s: %s", chat_id, exc)
@@ -1008,8 +1008,8 @@ async def _open_chat_history(
         if target:
             await send_ephemeral_message(
                 target.bot,
-                target.chat.id,
-                "⚠️ Не удалось загрузить историю чата. Попробуйте позже.",
+                chat_id=target.chat.id,
+                text="⚠️ Не удалось загрузить историю чата. Попробуйте позже.",
                 user_id=user_id,
             )
         logger.exception("Unexpected error while loading chat %s", chat_id)
@@ -1191,8 +1191,8 @@ async def cb_chat_media(
     if not attachments:
         await send_ephemeral_message(
             callback.bot,
-            callback.message.chat.id,
-            "Вложения не найдены. Обновите чат, чтобы загрузить их заново.",
+            chat_id=callback.message.chat.id,
+            text="Вложения не найдены. Обновите чат, чтобы загрузить их заново.",
             user_id=callback.from_user.id,
         )
         return
@@ -1221,8 +1221,8 @@ async def cb_open_chat(
     if not chat_id:
         await send_ephemeral_message(
             callback.bot,
-            callback.message.chat.id,
-            "Не удалось определить чат.",
+            chat_id=callback.message.chat.id,
+            text="Не удалось определить чат.",
             user_id=user_id,
         )
         return
@@ -1309,8 +1309,8 @@ async def cb_chat_ai(
         except Exception as exc:  # pragma: no cover - сеть/формат
             await send_ephemeral_message(
                 callback.bot,
-                callback.message.chat.id,
-                f"Не удалось загрузить историю чата: {exc}",
+                chat_id=callback.message.chat.id,
+                text=f"Не удалось загрузить историю чата: {exc}",
                 user_id=user_id,
             )
             return
@@ -1323,8 +1323,8 @@ async def cb_chat_ai(
     if not draft:
         await send_ephemeral_message(
             callback.bot,
-            callback.message.chat.id,
-            "🤖 Не удалось сгенерировать черновик. Попробуйте позже.",
+            chat_id=callback.message.chat.id,
+            text="🤖 Не удалось сгенерировать черновик. Попробуйте позже.",
             user_id=user_id,
         )
         return
@@ -1353,8 +1353,8 @@ async def cb_chat_ai_send(
     if not chat_id or not draft:
         await send_ephemeral_message(
             callback.bot,
-            callback.message.chat.id,
-            "Черновик ответа не найден",
+            chat_id=callback.message.chat.id,
+            text="Черновик ответа не найден",
             user_id=user_id,
         )
         return
@@ -1363,8 +1363,8 @@ async def cb_chat_ai_send(
     except Exception as exc:
         await send_ephemeral_message(
             callback.bot,
-            callback.message.chat.id,
-            f"Не удалось отправить сообщение: {exc}",
+            chat_id=callback.message.chat.id,
+            text=f"Не удалось отправить сообщение: {exc}",
             user_id=user_id,
         )
         return
@@ -1416,7 +1416,10 @@ async def chat_manual_message(message: Message, state: FSMContext) -> None:
     chat_id = data.get("chat_id")
     if not chat_id:
         await send_ephemeral_message(
-            message.bot, message.chat.id, "Чат не выбран", user_id=message.from_user.id
+            message.bot,
+            chat_id=message.chat.id,
+            text="Чат не выбран",
+            user_id=message.from_user.id,
         )
         await state.clear()
         await delete_section_message(message.from_user.id, SECTION_CHAT_PROMPT, message.bot, force=True)
@@ -1426,8 +1429,8 @@ async def chat_manual_message(message: Message, state: FSMContext) -> None:
     except Exception as exc:
         await send_ephemeral_message(
             message.bot,
-            message.chat.id,
-            f"Не удалось отправить сообщение: {exc}",
+            chat_id=message.chat.id,
+            text=f"Не удалось отправить сообщение: {exc}",
             user_id=message.from_user.id,
         )
         return
@@ -1454,7 +1457,10 @@ async def chat_ai_message(message: Message, state: FSMContext) -> None:
     chat_id = data.get("chat_id")
     if not chat_id:
         await send_ephemeral_message(
-            message.bot, message.chat.id, "Чат не выбран", user_id=message.from_user.id
+            message.bot,
+            chat_id=message.chat.id,
+            text="Чат не выбран",
+            user_id=message.from_user.id,
         )
         await state.clear()
         await delete_section_message(message.from_user.id, SECTION_CHAT_PROMPT, message.bot, force=True)
@@ -1464,8 +1470,8 @@ async def chat_ai_message(message: Message, state: FSMContext) -> None:
     except Exception as exc:
         await send_ephemeral_message(
             message.bot,
-            message.chat.id,
-            f"Не удалось отправить сообщение: {exc}",
+            chat_id=message.chat.id,
+            text=f"Не удалось отправить сообщение: {exc}",
             user_id=message.from_user.id,
         )
         return

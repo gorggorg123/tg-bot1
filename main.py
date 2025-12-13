@@ -231,13 +231,13 @@ async def _send_questions_list(
         if callback:
             await send_ephemeral_message(
                 callback,
-                f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
+                text=f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
             )
         elif bot and chat_id:
             await send_ephemeral_message(
                 bot,
-                f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
                 chat_id=chat_id,
+                text=f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
             )
         logger.warning("Unable to load questions list: %s", exc)
         return
@@ -245,13 +245,13 @@ async def _send_questions_list(
         if callback:
             await send_ephemeral_message(
                 callback,
-                "⚠️ Не удалось получить список вопросов. Попробуйте позже.",
+                text="⚠️ Не удалось получить список вопросов. Попробуйте позже.",
             )
         elif bot and chat_id:
             await send_ephemeral_message(
                 bot,
-                "⚠️ Не удалось получить список вопросов. Попробуйте позже.",
                 chat_id=chat_id,
+                text="⚠️ Не удалось получить список вопросов. Попробуйте позже.",
             )
         logger.exception("Unexpected error while loading questions list")
         return
@@ -630,8 +630,8 @@ async def _send_question_card(
         if target:
             await send_ephemeral_message(
                 target.bot,
-                target.chat.id,
-                "Не удалось найти этот вопрос. Обновите список и попробуйте ещё раз.",
+                chat_id=target.chat.id,
+                text="Не удалось найти этот вопрос. Обновите список и попробуйте ещё раз.",
                 user_id=user_id,
             )
         return
@@ -648,7 +648,7 @@ async def _send_question_card(
                 user_id=user_id, category=category, index=idx
             )
 
-    await ensure_question_answer_text(resolved_question)
+    await ensure_question_answer_text(resolved_question, user_id=user_id)
 
     period_title = get_questions_pretty_period(user_id)
 
@@ -1051,8 +1051,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         except OzonAPIError as exc:
             await send_ephemeral_message(
                 callback.message.bot,
-                callback.message.chat.id,
-                f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
+                chat_id=callback.message.chat.id,
+                text=f"⚠️ Не удалось получить список вопросов. Ошибка: {exc}",
                 user_id=user_id,
             )
             return
@@ -1060,8 +1060,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
             logger.exception("Unexpected error while refreshing questions")
             await send_ephemeral_message(
                 callback.message.bot,
-                callback.message.chat.id,
-                "⚠️ Не удалось получить список вопросов. Попробуйте позже.",
+                chat_id=callback.message.chat.id,
+                text="⚠️ Не удалось получить список вопросов. Попробуйте позже.",
                 user_id=user_id,
             )
             return
@@ -1116,8 +1116,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         if question is None:
             await send_ephemeral_message(
                 callback.message.bot,
-                callback.message.chat.id,
-                "Не удалось найти вопрос для обновления ответа.",
+                chat_id=callback.message.chat.id,
+                text="Не удалось найти вопрос для обновления ответа.",
                 user_id=user_id,
             )
             return
@@ -1139,8 +1139,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         if not (answer_text or "").strip():
             await send_ephemeral_message(
                 callback.message.bot,
-                callback.message.chat.id,
-                "Ответ для этого вопроса в Ozon не найден.",
+                chat_id=callback.message.chat.id,
+                text="Ответ для этого вопроса в Ozon не найден.",
                 user_id=user_id,
             )
             return
@@ -1157,9 +1157,9 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
             answer_sent_to_ozon=True,
         )
         await send_ephemeral_message(
-            callback.message.bot,
-            callback.message.chat.id,
-            "Текущий ответ подставлен в черновик, можно отредактировать и отправить.",
+                callback.message.bot,
+                chat_id=callback.message.chat.id,
+                text="Текущий ответ подставлен в черновик, можно отредактировать и отправить.",
             user_id=user_id,
         )
         await _send_question_card(
@@ -1178,8 +1178,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         if question is None:
             await send_ephemeral_message(
                 callback.message.bot,
-                callback.message.chat.id,
-                "Вопрос не найден. Обновите список и попробуйте снова.",
+                chat_id=callback.message.chat.id,
+                text="Вопрос не найден. Обновите список и попробуйте снова.",
                 user_id=user_id,
             )
             return
@@ -1201,8 +1201,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         if not answer_id:
             await send_ephemeral_message(
                 callback.message.bot,
-                callback.message.chat.id,
-                "Не нашли ответ, который можно удалить.",
+                chat_id=callback.message.chat.id,
+                text="Не нашли ответ, который можно удалить.",
                 user_id=user_id,
             )
             return
@@ -1213,8 +1213,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
             logger.warning("Failed to delete question answer %s: %s", question.id, exc)
             await send_ephemeral_message(
                 callback.message.bot,
-                callback.message.chat.id,
-                str(exc),
+                chat_id=callback.message.chat.id,
+                text=str(exc),
                 user_id=user_id,
             )
             return
@@ -1222,8 +1222,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
             logger.warning("Failed to delete question answer %s: %s", question.id, exc)
             await send_ephemeral_message(
                 callback.message.bot,
-                callback.message.chat.id,
-                "Не удалось удалить ответ, попробуйте позже.",
+                chat_id=callback.message.chat.id,
+                text="Не удалось удалить ответ, попробуйте позже.",
                 user_id=user_id,
             )
             return
@@ -1244,9 +1244,9 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         )
         await refresh_questions(user_id, category)
         await send_ephemeral_message(
-            callback.message.bot,
-            callback.message.chat.id,
-            "Ответ удалён в Ozon.",
+                callback.message.bot,
+                chat_id=callback.message.chat.id,
+                text="Ответ удалён в Ozon.",
             user_id=user_id,
         )
         await _send_question_card(
@@ -1267,8 +1267,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         if question is None:
             await send_ephemeral_message(
                 callback.message.bot,
-                callback.message.chat.id,
-                "Не удалось найти вопрос для генерации ответа.",
+                chat_id=callback.message.chat.id,
+                text="Не удалось найти вопрос для генерации ответа.",
                 user_id=user_id,
             )
             return
@@ -1281,8 +1281,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         if not ai_answer:
             await send_ephemeral_message(
                 callback.message.bot,
-                callback.message.chat.id,
-                "Не удалось сгенерировать ответ, попробуйте ещё раз позже.",
+                chat_id=callback.message.chat.id,
+                text="Не удалось сгенерировать ответ, попробуйте ещё раз позже.",
                 user_id=user_id,
             )
             return
@@ -1315,8 +1315,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         if question is None:
             await send_ephemeral_message(
                 callback.message.bot,
-                callback.message.chat.id,
-                "Не удалось найти вопрос для подготовки ответа.",
+                chat_id=callback.message.chat.id,
+                text="Не удалось найти вопрос для подготовки ответа.",
                 user_id=user_id,
             )
             return
@@ -1343,8 +1343,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         if question is None:
             await send_ephemeral_message(
                 callback.message.bot,
-                callback.message.chat.id,
-                "Не удалось найти вопрос для пересборки ответа.",
+                chat_id=callback.message.chat.id,
+                text="Не удалось найти вопрос для пересборки ответа.",
                 user_id=user_id,
             )
             return
@@ -1371,8 +1371,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         if question is None:
             await send_ephemeral_message(
                 callback.message.bot,
-                callback.message.chat.id,
-                "Вопрос не найден. Обновите список и попробуйте снова.",
+                chat_id=callback.message.chat.id,
+                text="Вопрос не найден. Обновите список и попробуйте снова.",
                 user_id=user_id,
             )
             return
@@ -1382,8 +1382,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         if len(answer_clean) < 2:
             await send_ephemeral_message(
                 callback.message.bot,
-                callback.message.chat.id,
-                "Ответ пустой или слишком короткий, сначала отредактируйте текст.",
+                chat_id=callback.message.chat.id,
+                text="Ответ пустой или слишком короткий, сначала отредактируйте текст.",
                 user_id=user_id,
             )
             return
@@ -1393,8 +1393,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
             logger.warning("Failed to send question answer %s: %s", question.id, exc)
             await send_ephemeral_message(
                 callback.message.bot,
-                callback.message.chat.id,
-                str(exc),
+                chat_id=callback.message.chat.id,
+                text=str(exc),
                 user_id=user_id,
             )
             return
@@ -1402,8 +1402,8 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
             logger.warning("Failed to send question answer %s: %s", question.id, exc)
             await send_ephemeral_message(
                 callback.message.bot,
-                callback.message.chat.id,
-                "Не удалось отправить ответ в Ozon. Проверьте права API‑ключа OZON_API_KEY.",
+                chat_id=callback.message.chat.id,
+                text="Не удалось отправить ответ в Ozon. Проверьте права API‑ключа OZON_API_KEY.",
                 user_id=user_id,
             )
             return
@@ -1425,9 +1425,9 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
         question.answer_text = answer_clean
         await refresh_questions(user_id, category)
         await send_ephemeral_message(
-            callback.message.bot,
-            callback.message.chat.id,
-            "Ответ отправлен в Ozon ✅",
+                callback.message.bot,
+                chat_id=callback.message.chat.id,
+                text="Ответ отправлен в Ozon ✅",
             user_id=user_id,
         )
         await _send_question_card(
@@ -1457,9 +1457,9 @@ async def handle_reprompt(message: Message, state: FSMContext) -> None:
     text_payload = (message.text or message.caption or "").strip()
     if not text_payload:
         await send_ephemeral_message(
-            message.bot,
-            message.chat.id,
-            "Ответ пустой, пришлите текст.",
+                message.bot,
+                chat_id=message.chat.id,
+                text="Ответ пустой, пришлите текст.",
             user_id=user_id,
         )
         return
@@ -1467,9 +1467,9 @@ async def handle_reprompt(message: Message, state: FSMContext) -> None:
     review, resolved_index = await get_review_by_id(user_id, category, review_id)
     if not review:
         await send_ephemeral_message(
-            message.bot,
-            message.chat.id,
-            "Не удалось найти отзыв для пересборки.",
+                message.bot,
+                chat_id=message.chat.id,
+                text="Не удалось найти отзыв для пересборки.",
             user_id=user_id,
         )
         await delete_section_message(user_id, SECTION_REVIEW_PROMPT, message.bot, force=True)
@@ -1499,9 +1499,9 @@ async def handle_manual_answer(message: Message, state: FSMContext) -> None:
     text = (message.text or message.caption or "").strip()
     if not text:
         await send_ephemeral_message(
-            message.bot,
-            message.chat.id,
-            "Ответ пустой, пришлите текст.",
+                message.bot,
+                chat_id=message.chat.id,
+                text="Ответ пустой, пришлите текст.",
             user_id=user_id,
         )
         return
@@ -1532,9 +1532,9 @@ async def handle_question_reprompt(message: Message, state: FSMContext) -> None:
     text_payload = (message.text or message.caption or "").strip()
     if not text_payload:
         await send_ephemeral_message(
-            message.bot,
-            message.chat.id,
-            "Ответ пустой, пришлите текст.",
+                message.bot,
+                chat_id=message.chat.id,
+                text="Ответ пустой, пришлите текст.",
             user_id=user_id,
         )
         return
@@ -1546,9 +1546,9 @@ async def handle_question_reprompt(message: Message, state: FSMContext) -> None:
         )
     if not question:
         await send_ephemeral_message(
-            message.bot,
-            message.chat.id,
-            "Не удалось найти вопрос для пересборки.",
+                message.bot,
+                chat_id=message.chat.id,
+                text="Не удалось найти вопрос для пересборки.",
             user_id=user_id,
         )
         await delete_section_message(user_id, SECTION_QUESTION_PROMPT, message.bot, force=True)
@@ -1600,9 +1600,9 @@ async def handle_question_manual(message: Message, state: FSMContext) -> None:
     text = (message.text or message.caption or "").strip()
     if not text:
         await send_ephemeral_message(
-            message.bot,
-            message.chat.id,
-            "Ответ пустой, пришлите текст.",
+                message.bot,
+                chat_id=message.chat.id,
+                text="Ответ пустой, пришлите текст.",
             user_id=user_id,
         )
         return
@@ -1614,9 +1614,9 @@ async def handle_question_manual(message: Message, state: FSMContext) -> None:
         )
     if not question:
         await send_ephemeral_message(
-            message.bot,
-            message.chat.id,
-            "Не удалось найти вопрос.",
+                message.bot,
+                chat_id=message.chat.id,
+                text="Не удалось найти вопрос.",
             user_id=user_id,
         )
         await delete_section_message(user_id, SECTION_QUESTION_PROMPT, message.bot, force=True)
@@ -1754,7 +1754,7 @@ async def on_shutdown() -> None:
     await bot.session.close()
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root() -> dict:
     return {"status": "ok", "detail": "Ozon bot is running"}
 

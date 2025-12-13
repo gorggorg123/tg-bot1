@@ -22,6 +22,7 @@ from botapp.ozon_client import (
     get_question_answers,
     get_questions_list,
 )
+from botapp.text_utils import safe_strip, safe_str
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,9 @@ class QuestionsSession:
 
     # Токены -> (category, index) для компактных callback_data
     tokens: Dict[str, Tuple[str, int]] = field(default_factory=dict)
+
+    # Кеш текстов ответов по question.id, живёт вместе с сессией
+    answer_cache: Dict[str, Dict[str, Optional[str]]] = field(default_factory=dict)
 
 
 # user_id -> QuestionsSession
@@ -155,7 +159,7 @@ def _filter_by_category(items: List[Question], category: str) -> List[Question]:
             for q in items
             if getattr(q, "has_answer", False)
             or (getattr(q, "status", "") or "").upper() == "PROCESSED"
-            or (getattr(q, "answer_text", None) or "").strip()
+            or safe_strip(getattr(q, "answer_text", None))
         ]
 
     # "all" — без фильтра
@@ -176,12 +180,12 @@ async def _prefetch_question_product_names(questions: List[Question]) -> None:
 
     missing_ids: list[str] = []
     for q in questions:
-        existing_name = (getattr(q, "product_name", None) or "").strip()
+        existing_name = safe_strip(getattr(q, "product_name", None))
         has_cyrillic = bool(_CYRILLIC_RE.search(existing_name))
         if existing_name and has_cyrillic:
             continue
         pid = getattr(q, "product_id", None) or getattr(q, "sku", None)
-        pid_str = str(pid).strip() if pid not in (None, "") else ""
+        pid_str = safe_strip(pid) if pid not in (None, "") else ""
         if pid_str:
             missing_ids.append(pid_str)
 
@@ -209,7 +213,7 @@ async def _prefetch_question_product_names(questions: List[Question]) -> None:
     if title_map:
         for q in questions:
             pid_val = getattr(q, "product_id", None) or getattr(q, "sku", None)
-            pid_str = str(pid_val).strip()
+            pid_str = safe_strip(pid_val)
             if not pid_str:
                 continue
             if getattr(q, "product_name", None) and _CYRILLIC_RE.search(
@@ -217,7 +221,7 @@ async def _prefetch_question_product_names(questions: List[Question]) -> None:
             ):
                 covered_ids.add(pid_str)
                 continue
-            mapped_name = (title_map.get(pid_str) or "").strip()
+            mapped_name = safe_strip(title_map.get(pid_str))
             if not mapped_name:
                 continue
             q.product_name = mapped_name
@@ -238,9 +242,9 @@ async def _prefetch_question_product_names(questions: List[Question]) -> None:
 
         for q in questions:
             pid_val = getattr(q, "product_id", None) or getattr(q, "sku", None)
-            if str(pid_val).strip() != pid:
+            if safe_strip(pid_val) != pid:
                 continue
-            existing_name = (getattr(q, "product_name", None) or "").strip()
+            existing_name = safe_strip(getattr(q, "product_name", None))
             if not existing_name or not _CYRILLIC_RE.search(existing_name):
                 q.product_name = name
 
@@ -302,13 +306,24 @@ def _get_cached_questions(user_id: int, category: str) -> List[Question]:
     return session.all
 
 
-async def ensure_question_answer_text(question: Question) -> None:
+async def ensure_question_answer_text(question: Question, user_id: Optional[int] = None) -> None:
     """Догружает текст ответа для вопроса, если он отмечен как отвеченный."""
 
     if not getattr(question, "has_answer", False):
         return
 
-    if (getattr(question, "answer_text", None) or "").strip():
+    if safe_strip(getattr(question, "answer_text", None)):
+        return
+
+    session = _sessions.get(user_id) if user_id is not None else None
+    cached = None
+    if session:
+        cached = session.answer_cache.get(question.id)
+    if cached:
+        question.answer_text = cached.get("text") or question.answer_text
+        question.answer_id = cached.get("answer_id") or question.answer_id
+        question.has_answer = bool(question.answer_text)
+        question.answers_count = question.answers_count or cached.get("answers_count")
         return
 
     try:
@@ -325,6 +340,13 @@ async def ensure_question_answer_text(question: Question) -> None:
     question.answer_id = first.id or question.answer_id
     question.has_answer = bool(question.answer_text)
     question.answers_count = question.answers_count or len(answers)
+
+    if session:
+        session.answer_cache[question.id] = {
+            "text": question.answer_text,
+            "answer_id": question.answer_id,
+            "answers_count": question.answers_count,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -416,8 +438,9 @@ def format_question_card_text(
     status_icon, status_text = _status_badge_question(question)
 
     sku_part = ""
-    if getattr(question, "sku", None):
-        sku_part = f" (SKU: {question.sku})"
+    sku_value = safe_strip(getattr(question, "sku", None))
+    if sku_value:
+        sku_part = f" (SKU: {sku_value})"
 
     header_date = _fmt_dt_msk(created) or "—"
 
@@ -437,10 +460,7 @@ def format_question_card_text(
         "Ответ продавца:",
     ]
 
-    answer_text = (
-        (answer_override or "").strip()
-        or (getattr(question, "answer_text", None) or "").strip()
-    )
+    answer_text = safe_strip(answer_override) or safe_strip(getattr(question, "answer_text", None))
 
     if not answer_text:
         answer_text = "Ответа продавца пока нет."
@@ -462,7 +482,7 @@ def _slice_questions(items: List[Question], page: int, page_size: int) -> tuple[
 def _status_badge_question(q: Question) -> tuple[str, str]:
     if (
         getattr(q, "has_answer", False)
-        or (getattr(q, "answer_text", None) or "").strip()
+        or safe_strip(getattr(q, "answer_text", None))
         or (getattr(q, "status", "") or "").upper() == "PROCESSED"
     ):
         return "✅", "Ответ есть"
@@ -471,9 +491,9 @@ def _status_badge_question(q: Question) -> tuple[str, str]:
 
 def _pick_short_product_label_question(q: Question) -> str:
     raw_product_name = getattr(q, "product_name", None)
-    product_name = str(raw_product_name or "").strip()
+    product_name = safe_strip(raw_product_name)
     raw_sku = getattr(q, "sku", None)
-    sku = str(raw_sku or "").strip()
+    sku = safe_strip(raw_sku)
     if product_name:
         return product_name[:50] + ("…" if len(product_name) > 50 else "")
     if sku:
@@ -492,14 +512,22 @@ def build_questions_table(
     """Собрать текст таблицы и кнопки для списка вопросов."""
 
     slice_items, safe_page, total_pages = _slice_questions(cards, page, page_size)
-    rows: List[str] = [f"❓ Вопросы ({category})", pretty_period, "", f"Страница {safe_page + 1}/{total_pages}"]
+    rows: List[str] = [
+        f"❓ Вопросы ({category})",
+        pretty_period,
+        "",
+        f"Страница {safe_page + 1}/{total_pages}",
+        "",
+    ]
     items: List[tuple[str, str, int]] = []
 
-    for idx, q in enumerate(slice_items):
-        global_index = safe_page * page_size + idx
+    for idx, q in enumerate(slice_items, start=1):
+        global_index = safe_page * page_size + (idx - 1)
         status_icon, status_text = _status_badge_question(q)
         product_short = _pick_short_product_label_question(q)
-        snippet = (getattr(q, "question_text", None) or getattr(q, "text", None) or "").strip()
+        snippet = safe_strip(
+            getattr(q, "question_text", None) or getattr(q, "text", None) or ""
+        )
         if len(snippet) > 50:
             snippet = snippet[:47] + "…"
         created_at = _parse_date(getattr(q, "created_at", None))
@@ -507,17 +535,19 @@ def build_questions_table(
         age = _human_age(created_at)
         age_part = f" ({age})" if age else ""
         status_label = status_text.upper() if status_text else ""
-        label = (
-            f"{status_icon} | {date_part}{age_part} | "
+        line = (
+            f"{idx}) {status_icon} {date_part}{age_part} | "
             f"Товар: {product_short} | {status_label or 'СТАТУС НЕИЗВЕСТЕН'}"
         )
         if snippet:
-            label = f"{label} | {snippet}"
+            line = f"{line} | Вопрос: {snippet}"
+        rows.append(line)
 
         question_id = getattr(q, "id", None)
         if not question_id:
             continue
-        items.append((label, str(question_id), global_index))
+        button_label = f"{idx}{status_icon}" if status_icon else str(idx)
+        items.append((button_label, safe_str(question_id), global_index))
 
     text = "\n".join(rows)
     return text, items, safe_page, total_pages
