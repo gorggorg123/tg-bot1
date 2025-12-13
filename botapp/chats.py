@@ -493,7 +493,11 @@ async def _send_chats_list(
     need_reload = refresh or not isinstance(cached_list, list) or not cached_list
 
     try:
-        items_raw = await chat_list(limit=CHAT_LIST_LIMIT, offset=0) if need_reload else cached_list or []
+        items_raw = (
+            await chat_list(limit=CHAT_LIST_LIMIT, offset=0, include_service=True)
+            if need_reload
+            else cached_list or []
+        )
     except OzonAPIError as exc:
         target = callback.message if callback else message
         if target:

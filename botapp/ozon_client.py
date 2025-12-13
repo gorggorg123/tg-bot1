@@ -1400,7 +1400,9 @@ def _merge_nested_block(item: dict, key: str) -> dict:
     return item
 
 
-async def chat_list(*, limit: int = 100, offset: int = 0) -> list[dict]:
+async def chat_list(
+    *, limit: int = 100, offset: int = 0, include_service: bool = False
+) -> list[dict]:
     """Получить список чатов продавца.
 
     Увеличиваем лимит до 100 и при необходимости подгружаем несколько страниц,
@@ -1503,9 +1505,10 @@ async def chat_list(*, limit: int = 100, offset: int = 0) -> list[dict]:
             or merged.get("type")
         )
         chat_type_str = str(chat_type or "").lower()
-        if any(bad in chat_type_str for bad in ("support", "system", "notification", "crm")):
-            logger.debug("Skip service chat (%s): %s", chat_type_str or "empty", merged)
-            continue
+        if not include_service:
+            if any(bad in chat_type_str for bad in ("support", "system", "notification", "crm")):
+                logger.debug("Skip service chat (%s): %s", chat_type_str or "empty", merged)
+                continue
         try:
             items.append(ChatSummary.model_validate(merged).to_dict())
         except ValidationError as exc:
