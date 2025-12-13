@@ -376,71 +376,47 @@ def _chat_unread_count(chat: dict) -> int:
     return 0
 
 
+def _classify_chat(chat: dict) -> tuple[bool, bool]:
+    """Определить, является ли чат покупательским.
+
+    Возвращает кортеж (is_buyer, recognized), где recognized=True означает, что
+    решение было принято по явным правилам, а False — это консервативный фолбэк.
+    """
+
+    if not isinstance(chat, dict):
+        return False, False
+
+    raw = chat.get("_raw") if isinstance(chat.get("_raw"), dict) else {}
+
+    # 1) Явные служебные типы
+    chat_type = raw.get("chat_type") or raw.get("type")
+    if isinstance(chat_type, str) and chat_type.lower() in {"support", "ozon_support", "service"}:
+        return False, True
+
+    # 2) Явные признаки покупателя
+    buyer_block = chat.get("buyer") if isinstance(chat.get("buyer"), dict) else None
+    if not buyer_block and isinstance(raw.get("buyer"), dict):
+        buyer_block = raw["buyer"]
+    if buyer_block and buyer_block.get("name"):
+        return True, True
+
+    for key in ("posting_number", "order_id", "buyer_id", "customer_id"):
+        value = chat.get(key)
+        if value:
+            return True, True
+        raw_value = raw.get(key)
+        if raw_value:
+            return True, True
+
+    # 3) Ничего не нашли — консервативно False
+    return False, False
+
+
 def is_buyer_chat(chat: dict) -> bool:
     """Отфильтровать служебные/системные чаты и оставить только покупательские."""
 
-    if not isinstance(chat, dict):
-        return False
-
-    raw = chat.get("_raw") if isinstance(chat.get("_raw"), dict) else None
-    merged: dict = {}
-    if raw:
-        merged.update(raw)
-    merged.update(chat)
-
-    def _match_any(value: str, needles: tuple[str, ...]) -> bool:
-        val = value.lower()
-        return any(word in val for word in needles)
-
-    # Позитивные признаки
-    buyer_candidate = _chat_buyer_name(merged)
-    role_fields = [
-        merged.get("role"),
-        merged.get("type"),
-        merged.get("chat_type"),
-        merged.get("source"),
-    ]
-    if isinstance(merged.get("participants"), list):
-        for p in merged["participants"]:
-            if isinstance(p, dict):
-                role_fields.extend([p.get("role"), p.get("type"), p.get("name")])
-
-    positive_found = False
-    for role in role_fields:
-        if role and _match_any(str(role), ("buyer", "customer", "client", "user")):
-            positive_found = True
-            break
-    if buyer_candidate:
-        positive_found = True
-
-    # Негативные признаки
-    negative_fields = [
-        merged.get("title"),
-        merged.get("topic"),
-        merged.get("chat_type"),
-        merged.get("type"),
-        merged.get("source"),
-    ]
-    for participant in merged.get("participants", []) if isinstance(merged.get("participants"), list) else []:
-        if isinstance(participant, dict):
-            negative_fields.extend(
-                [participant.get("name"), participant.get("role"), participant.get("type")]
-            )
-
-    has_negative = False
-    for value in negative_fields:
-        if value and _match_any(
-            str(value), ("support", "ozon", "system", "notification", "service", "crm")
-        ):
-            has_negative = True
-            if not positive_found:
-                return False
-
-    # Если нет негативных признаков, но и нет явного покупателя — считаем чат допустимым,
-    # чтобы не скрыть реального клиента из-за неполной схемы.
-    if has_negative and not positive_found:
-        return False
-    return True if positive_found or not has_negative else False
+    is_buyer, _ = _classify_chat(chat)
+    return is_buyer
 
 
 def _chat_last_dt(chat: dict) -> datetime | None:
@@ -989,52 +965,46 @@ async def _send_chats_list(
     sorted_items = sorted(items_raw, key=_chat_sort_key, reverse=True)
     total_loaded = len(sorted_items)
 
-    def _filter_service(chat: dict) -> bool:
-        if show_service:
-            return True
+    classifications: dict[int, tuple[bool, bool]] = {}
+    buyer_count = 0
+    service_count = 0
+    unknown_count = 0
+    for chat in sorted_items:
+        chat_dict = chat if isinstance(chat, dict) else {}
+        is_buyer, recognized = _classify_chat(chat_dict)
+        classifications[id(chat)] = (is_buyer, recognized)
+        if is_buyer:
+            buyer_count += 1
+        elif recognized:
+            service_count += 1
+        else:
+            unknown_count += 1
 
-        merged: dict = {}
-        raw = chat.get("_raw") if isinstance(chat, dict) else None
-        if isinstance(raw, dict):
-            merged.update(raw)
-        if isinstance(chat, dict):
-            merged.update(chat)
-
-        buyer_id = merged.get("buyer_id") or merged.get("buyerId")
-        buyer_name = merged.get("buyer_name") or merged.get("buyerName")
-        has_buyer = bool(buyer_id) or (isinstance(buyer_name, str) and buyer_name.strip())
-
-        service_words = ("support", "system", "notification", "ozon")
-        type_candidates = [
-            merged.get("chat_category"),
-            merged.get("category"),
-            merged.get("type"),
-            merged.get("chat_type"),
-        ]
-        has_service_marker = any(
-            isinstance(value, str) and any(word in value.lower() for word in service_words)
-            for value in type_candidates
-        )
-
-        return has_buyer and not has_service_marker
-
-    service_filtered = [chat for chat in sorted_items if _filter_service(chat if isinstance(chat, dict) else {})]
+    buyer_chats = [chat for chat in sorted_items if classifications.get(id(chat), (False, False))[0]]
+    visible_items = sorted_items if show_service else buyer_chats
     logger.debug(
         "Chats list filter applied (show_service=%s): total=%s, after_filter=%s",
         show_service,
         total_loaded,
-        len(service_filtered),
+        len(visible_items),
+    )
+    logger.debug(
+        "Chats classification stats: total=%s, buyer=%s, non_buyer=%s, unknown=%s",
+        total_loaded,
+        buyer_count,
+        service_count,
+        unknown_count,
     )
 
     cache: dict[str, dict] = {}
-    for chat in service_filtered:
+    for chat in visible_items:
         cid = _safe_chat_id(chat)
         if cid:
             cache[cid] = chat if isinstance(chat, dict) else {}
 
-    filtered_items = [chat for chat in service_filtered if not unread_flag or _chat_unread_count(chat) > 0]
-    total_count = len(service_filtered)
-    unread_total = sum(1 for chat in service_filtered if _chat_unread_count(chat) > 0)
+    filtered_items = [chat for chat in visible_items if not unread_flag or _chat_unread_count(chat) > 0]
+    total_count = len(visible_items)
+    unread_total = sum(1 for chat in visible_items if _chat_unread_count(chat) > 0)
     total_pages = max(1, math.ceil(max(1, len(filtered_items)) / CHAT_PAGE_SIZE))
     safe_page = 0 if page >= total_pages else max(0, min(page, total_pages - 1))
     start = safe_page * CHAT_PAGE_SIZE
@@ -1052,16 +1022,18 @@ async def _send_chats_list(
         )
         if not chat_id_val:
             continue
+        is_service_chat = not classifications.get(id(chat), (False, False))[0]
         badge = f"🔴{unread_count}" if unread_count > 0 else "⚪"
         ts_label = last_dt.strftime("%d.%m %H:%M") if last_dt else ""
         preview_label = preview or ""
+        display_title = f"🛠 {title}" if show_service and is_service_chat else title
         line_parts = [
-            f"{idx}) {badge} {title}",
+            f"{idx}) {badge} {display_title}",
             ts_label,
             preview_label,
         ]
         display_rows.append(" | ".join([part for part in line_parts if part]))
-        kb_caption_parts = [badge, _truncate_text(title, limit=30)]
+        kb_caption_parts = [badge, _truncate_text(display_title, limit=30)]
         if ts_label:
             kb_caption_parts.append(ts_label)
         if preview_label:

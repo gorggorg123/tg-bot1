@@ -1331,6 +1331,7 @@ class ChatSummary(BaseModel):
     id: str | None = None
     posting_number: str | None = None
     order_id: str | None = None
+    raw: dict = Field(default_factory=dict, alias="_raw")
     buyer_name: str | None = None
     client_name: str | None = None
     customer_name: str | None = None
@@ -1342,10 +1343,10 @@ class ChatSummary(BaseModel):
     is_unread: bool | None = None
     has_unread: bool | None = None
 
-    model_config = ConfigDict(extra="ignore", protected_namespaces=(), populate_by_name=True)
+    model_config = ConfigDict(extra="allow", protected_namespaces=(), populate_by_name=True)
 
     def to_dict(self) -> dict:
-        data = self.model_dump(exclude_none=True, by_alias=False)
+        data = self.model_dump(exclude_none=True, by_alias=True)
         if not data.get("chat_id") and self.id:
             data["chat_id"] = str(self.id)
         if self.last_message is not None:
@@ -1563,6 +1564,7 @@ async def chat_list(
                 logger.debug("Skip service chat (%s): %s", chat_type_str or "empty", merged)
                 continue
         try:
+            merged["_raw"] = merged.copy()
             items.append(ChatSummary.model_validate(merged).to_dict())
         except ValidationError as exc:
             logger.warning("Failed to normalize chat summary: %s", exc)
