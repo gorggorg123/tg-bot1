@@ -1,1974 +1,338 @@
+# botapp/chats.py
 from __future__ import annotations
 
 import hashlib
+import html
 import logging
-import math
-import os
-import re
-import textwrap
-from contextlib import suppress
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Dict
-from urllib.parse import urlparse
+from typing import Any, Iterable
 
-from aiogram import Bot, F, Router
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
-
-from botapp.chats_ai import suggest_chat_reply
-from botapp.keyboards import (
-    ChatsCallbackData,
-    MenuCallbackData,
-    chat_actions_keyboard,
-    chat_draft_keyboard,
-    chats_list_keyboard,
-    main_menu_keyboard,
-)
-from botapp.message_gc import (
-    SECTION_ACCOUNT,
-    SECTION_CHAT_HISTORY,
-    SECTION_CHAT_PROMPT,
-    SECTION_CHATS_LIST,
-    SECTION_FBO,
-    SECTION_FINANCE_TODAY,
-    SECTION_MENU,
-    SECTION_QUESTION_CARD,
-    SECTION_QUESTION_PROMPT,
-    SECTION_QUESTIONS_LIST,
-    SECTION_REVIEW_CARD,
-    SECTION_REVIEW_PROMPT,
-    SECTION_REVIEWS_LIST,
-    delete_section_message,
-    send_section_message,
-)
-from botapp.ozon_client import (
-    OzonAPIError,
-    chat_history,
-    chat_list,
-    chat_read,
-    chat_send_message,
-    download_chat_file,
-    download_with_auth,
-    get_posting_products,
-)
-from botapp.utils import safe_edit_text, send_ephemeral_message
-
-try:
-    from botapp.states import ChatStates
-except Exception:  # pragma: no cover - fallback for import issues during deploy
-    class ChatStates(StatesGroup):
-        waiting_manual = State()
-        waiting_ai_confirm = State()
-        waiting_reprompt = State()
+from botapp.ozon_client import ChatHistoryResponse, ChatListItem, chat_history as ozon_chat_history, chat_list as ozon_chat_list
 
 logger = logging.getLogger(__name__)
 
-router = Router()
+PAGE_SIZE = 10
+CACHE_TTL_SECONDS = 30
+THREAD_TTL_SECONDS = 15
 
-CHAT_PAGE_SIZE = 7  # показываем чуть больше чатов на страницу
-CHAT_LIST_LIMIT = 100  # верхняя граница одной выгрузки списка чатов
-MOSCOW_TZ = timezone(timedelta(hours=3))
-ATTACH_AUTOSEND_LIMIT = 10
-ATTACH_CACHE_DIR = Path(os.getenv("ATTACH_CACHE_DIR", "/tmp/ozon_chat_cache"))
-ATTACH_CACHE_TTL = timedelta(hours=12)
-ATTACH_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # 20 MB
-SYSTEM_NUMBER_RE = re.compile(r"^(?:[#№]\s*)?\d{6,}(?:[-\s]\d+)*$", re.IGNORECASE)
-INLINE_FILE_RE = re.compile(r"https?://[^\s)]+/v2/chat/file/[^\s)]+", re.IGNORECASE)
-INLINE_MD_IMAGE_RE = re.compile(r"!\[\]\((https?://[^)]+/v2/chat/file/[^)]+)\)", re.IGNORECASE)
-DRAFT_HEADER = "📄 Черновик ответа"
+DEFAULT_THREAD_LIMIT = 30
+MAX_THREAD_LIMIT = 180
 
 
-def _truncate_text(text: str, limit: int = 80) -> str:
-    cleaned = (text or "").strip()
-    if len(cleaned) <= limit:
-        return cleaned
-    return cleaned[: limit - 1] + "…"
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def _is_timestamp(value: str) -> bool:
-    if not isinstance(value, str):
+def _cache_fresh(dt: datetime | None, ttl: int) -> bool:
+    if not dt:
         return False
-    try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return True
-    except Exception:
-        return False
+    return (_now_utc() - dt) <= timedelta(seconds=int(ttl))
 
 
-def _parse_ts(ts_value: str | None) -> datetime | None:
-    if not ts_value:
+def _trim(s: str, n: int) -> str:
+    s = (s or "").strip()
+    if len(s) <= n:
+        return s
+    return s[: max(0, n - 1)].rstrip() + "…"
+
+
+def _escape(s: str) -> str:
+    return html.escape((s or "").strip())
+
+
+def _short_token(user_id: int, chat_id: str) -> str:
+    return hashlib.blake2s(f"{user_id}:c:{chat_id}".encode("utf-8"), digest_size=8).hexdigest()
+
+
+@dataclass(slots=True)
+class ChatsCache:
+    fetched_at: datetime | None = None
+    chats: list[ChatListItem] = field(default_factory=list)
+    token_to_chat_id: dict[str, str] = field(default_factory=dict)
+    chat_id_to_token: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ThreadCache:
+    fetched_at: datetime | None = None
+    limit: int = DEFAULT_THREAD_LIMIT
+    raw_messages: list[dict] = field(default_factory=list)
+    last_message_id: int | None = None
+
+
+@dataclass(slots=True)
+class ThreadView:
+    chat_id: str
+    raw_messages: list[dict]
+    fetched_at: datetime | None
+    limit: int
+    last_message_id: int | None = None
+
+
+@dataclass(slots=True)
+class NormalizedMessage:
+    role: str  # buyer | seller | ozon
+    text: str
+    created_at: str | None = None
+    raw: dict | None = None
+
+
+_USER_CACHE: dict[int, ChatsCache] = {}
+_USER_THREADS: dict[tuple[int, str], ThreadCache] = {}
+
+
+def _cc(user_id: int) -> ChatsCache:
+    c = _USER_CACHE.get(user_id)
+    if c is None:
+        c = ChatsCache()
+        _USER_CACHE[user_id] = c
+    return c
+
+
+def _tc(user_id: int, chat_id: str) -> ThreadCache:
+    key = (int(user_id), str(chat_id))
+    t = _USER_THREADS.get(key)
+    if t is None:
+        t = ThreadCache()
+        _USER_THREADS[key] = t
+    return t
+
+
+def resolve_chat_id(user_id: int, token: str | None) -> str | None:
+    if not token:
         return None
-    try:
-        parsed = datetime.fromisoformat(str(ts_value).replace("Z", "+00:00"))
-        return parsed
-    except Exception:
-        return None
+    return _cc(user_id).token_to_chat_id.get(str(token).strip())
 
 
-def _ts(msg: dict) -> str:
-    """Достать временную метку сообщения как строку."""
-
-    if not isinstance(msg, dict):
-        return ""
-    for key in ("created_at", "send_time"):
-        value = msg.get(key)
-        if isinstance(value, str):
-            return value
-        if isinstance(value, (int, float)):
-            try:
-                return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
-            except Exception:
-                continue
-
-    raw = msg.get("_raw")
-    if isinstance(raw, dict):
-        for key in ("created_at", "send_time"):
-            value = raw.get(key)
-            if isinstance(value, str):
-                return value
-    return ""
-
-
-def _strip_inline_file_links(text: str) -> tuple[str, list[str]]:
-    if not isinstance(text, str):
-        return "", []
-
-    found: list[str] = []
-
-    def _add(url: str) -> None:
-        if url not in found:
-            found.append(url)
-
-    def _replace_md(match: re.Match[str]) -> str:
-        _add(match.group(1))
-        return ""
-
-    without_md = INLINE_MD_IMAGE_RE.sub(_replace_md, text)
-
-    def _replace_plain(match: re.Match[str]) -> str:
-        _add(match.group(0))
-        return ""
-
-    cleaned = INLINE_FILE_RE.sub(_replace_plain, without_md)
-    return cleaned, found
-
-
-def _inline_summary(photo_count: int, file_count: int) -> str:
-    parts: list[str] = []
-    if photo_count:
-        parts.append(f"📎 Фото: {photo_count}")
-    if file_count:
-        parts.append(f"📎 Файл: {file_count}")
-    return " ".join(parts)
-
-
-def _build_inline_attachments(urls: list[str]) -> tuple[list[dict], int, int]:
-    attachments: list[dict] = []
-    seen: set[str] = set()
-    photo_count = 0
-    file_count = 0
-
-    for url in urls:
-        normalized = _normalize_attachment(url)
-        if not normalized:
-            continue
-        ext = Path(urlparse(url).path).suffix.lower()
-        normalized["kind"] = "photo" if ext in (".jpg", ".jpeg", ".png") else "file"
-        key_val = normalized.get("cache_key") or normalized.get("url") or normalized.get("name")
-        if key_val and key_val in seen:
-            continue
-        if key_val:
-            seen.add(key_val)
-        attachments.append(normalized)
-        if normalized.get("kind") == "photo":
-            photo_count += 1
-        else:
-            file_count += 1
-
-    return attachments, photo_count, file_count
-
-
-def _extract_text(msg: dict) -> str | None:
-    inline_key = "_inline_file_urls"
-
-    def _store_inline(urls: list[str]) -> None:
-        if not isinstance(msg, dict) or not urls:
-            return
-        existing = msg.get(inline_key) if isinstance(msg.get(inline_key), list) else []
-        for url in urls:
-            if url not in existing:
-                existing.append(url)
-        msg[inline_key] = existing
-
-    def _clean_value(raw: str) -> str | None:
-        cleaned, urls = _strip_inline_file_links(raw)
-        _store_inline(urls)
-        candidate = cleaned.strip()
-        if candidate:
-            return candidate
-        if urls:
-            _, photo_count, file_count = _build_inline_attachments(urls)
-            summary = _inline_summary(photo_count, file_count)
-            if summary:
-                return summary
-        return None
-    def _pick_from_dict(d: dict) -> str | None:
-        PREFERRED_KEYS = (
-            "text",
-            "message",
-            "content",
-            "body",
-            "title",
-            "question",
-            "description",
-            "comment",
-        )
-        if not isinstance(d, dict):
-            return None
-        for key in PREFERRED_KEYS:
-            value = d.get(key)
-            if isinstance(value, str) and value.strip() and not _is_timestamp(value.strip()):
-                cleaned = _clean_value(value.strip())
-                if cleaned:
-                    return cleaned
-            if isinstance(value, dict):
-                for k2 in PREFERRED_KEYS:
-                    inner = value.get(k2)
-                    if isinstance(inner, str):
-                        inner_str = inner.strip()
-                        if inner_str and not _is_timestamp(inner_str):
-                            cleaned = _clean_value(inner_str)
-                            if cleaned:
-                                return cleaned
-        data_val = d.get("data")
-        if isinstance(data_val, list):
-            for item in data_val:
-                if isinstance(item, str):
-                    s = item.strip()
-                    if s and not _is_timestamp(s):
-                        cleaned = _clean_value(s)
-                        if cleaned:
-                            return cleaned
-                if isinstance(item, dict):
-                    nested = _pick_from_dict(item)
-                    if nested:
-                        return nested
-        return None
-
-    if not isinstance(msg, dict):
-        return None
-
-    direct = _pick_from_dict(msg)
-    if direct:
-        return direct
-
-    root = msg.get("_raw")
-    if not isinstance(root, (dict, list)):
-        return None
-
-    queue: list[object] = [root]
-    seen: set[int] = set()
-
-    while queue:
-        cur = queue.pop(0)
-        obj_id = id(cur)
-        if obj_id in seen:
-            continue
-        seen.add(obj_id)
-
-        if isinstance(cur, dict):
-            candidate = _pick_from_dict(cur)
-            if candidate:
-                return candidate
-            for v in cur.values():
-                if isinstance(v, (dict, list)):
-                    queue.append(v)
-        elif isinstance(cur, list):
-            for v in cur:
-                if isinstance(v, (dict, list)):
-                    queue.append(v)
-
-    return None
-
-
-def _detect_message_role(msg: dict) -> str:
-    """Вернуть роль автора сообщения (customer/seller/support/...)."""
-
-    user_block = msg.get("user") if isinstance(msg.get("user"), dict) else None
-    author_block = msg.get("author") if isinstance(msg.get("author"), dict) else None
-
-    role = None
-    if user_block:
-        role = user_block.get("type") or user_block.get("role") or user_block.get("name")
-
-    if not role and author_block:
-        role = (
-            author_block.get("role")
-            or author_block.get("type")
-            or author_block.get("name")
-            or author_block.get("author_type")
-        )
-
-    if not role:
-        role = (
-            msg.get("author_type")
-            or msg.get("from")
-            or msg.get("sender")
-            or msg.get("direction")
-        )
-
-    return str(role or "").lower()
-
-
-def _safe_chat_id(chat: dict) -> str | None:
-    if not isinstance(chat, dict):
-        return None
-    raw_id = chat.get("chat_id") or chat.get("id") or chat.get("chatId")
-    return str(raw_id) if raw_id not in (None, "") else None
-
-
-def _chat_posting(chat: dict) -> str | None:
-    if not isinstance(chat, dict):
-        return None
-    for key in ("posting_number", "postingNumber", "order_id", "orderId"):
-        val = chat.get(key)
-        if val not in (None, ""):
-            return str(val)
-    return None
-
-
-def _chat_buyer_name(chat: dict) -> str | None:
-    if not isinstance(chat, dict):
-        return None
-    candidates = [
-        chat.get("buyer_name"),
-        chat.get("client_name"),
-        chat.get("customer_name"),
-    ]
-    user_block = chat.get("user") if isinstance(chat.get("user"), dict) else None
-    if user_block:
-        candidates.extend(
-            [
-                user_block.get("name"),
-                user_block.get("phone"),
-                user_block.get("display_name"),
-            ]
-        )
-    for candidate in candidates:
-        if candidate not in (None, ""):
-            return str(candidate)
-    return None
-
-
-def _chat_unread_count(chat: dict) -> int:
-    if not isinstance(chat, dict):
-        return 0
-    for key in ("unread_count", "unreadCount"):
-        value = chat.get(key)
-        try:
-            return int(value)
-        except Exception:
-            continue
-    if chat.get("is_unread") or chat.get("has_unread"):
-        return 1
-    return 0
-
-
-def _classify_chat(chat: dict) -> tuple[bool, bool]:
-    """Определить, является ли чат покупательским.
-
-    Возвращает кортеж (is_buyer, recognized), где recognized=True означает, что
-    решение было принято по явным правилам, а False — это консервативный фолбэк.
+def _detect_sender_type(m: dict) -> str:
     """
+    Пытаемся понять автора сообщения:
+      - buyer/customer/client/user
+      - seller/vendor/shop
+      - ozon/system/service/support
+    """
+    candidates: list[str] = []
 
-    if not isinstance(chat, dict):
-        return False, False
+    for k in ("author_type", "sender_type", "type", "from_type", "user_type", "role"):
+        v = m.get(k)
+        if isinstance(v, str) and v:
+            candidates.append(v.lower())
 
-    raw = chat.get("_raw") if isinstance(chat.get("_raw"), dict) else {}
+    # nested structures
+    for k in ("from", "sender", "author"):
+        v = m.get(k)
+        if isinstance(v, dict):
+            for kk in ("type", "role", "user_type", "kind"):
+                vv = v.get(kk)
+                if isinstance(vv, str) and vv:
+                    candidates.append(vv.lower())
 
-    # 1) Явные служебные типы
-    chat_type = raw.get("chat_type") or raw.get("type")
-    if isinstance(chat_type, str) and chat_type.lower() in {"support", "ozon_support", "service"}:
-        return False, True
+    blob = " ".join(candidates)
 
-    # 2) Явные признаки покупателя
-    buyer_block = chat.get("buyer") if isinstance(chat.get("buyer"), dict) else None
-    if not buyer_block and isinstance(raw.get("buyer"), dict):
-        buyer_block = raw["buyer"]
-    if buyer_block and buyer_block.get("name"):
-        return True, True
+    if any(x in blob for x in ("customer", "buyer", "client", "consumer", "user")):
+        return "buyer"
+    if any(x in blob for x in ("seller", "vendor", "shop", "merchant")):
+        return "seller"
+    if any(x in blob for x in ("ozon", "system", "service", "support", "robot", "auto")):
+        return "ozon"
 
-    for key in ("posting_number", "order_id", "buyer_id", "customer_id"):
-        value = chat.get(key)
-        if value:
-            return True, True
-        raw_value = raw.get(key)
-        if raw_value:
-            return True, True
+    # fallback: sometimes there is "is_my" / "is_seller"
+    if m.get("is_seller") is True or m.get("is_my") is True:
+        return "seller"
+    if m.get("is_customer") is True:
+        return "buyer"
 
-    # 3) Ничего не нашли — консервативно False
-    return False, False
-
-
-def is_buyer_chat(chat: dict) -> bool:
-    """Отфильтровать служебные/системные чаты и оставить только покупательские."""
-
-    is_buyer, _ = _classify_chat(chat)
-    return is_buyer
-
-
-def _chat_last_dt(chat: dict) -> datetime | None:
-    if not isinstance(chat, dict):
-        return None
-    ts_value = (
-        chat.get("last_message_time")
-        or chat.get("updated_at")
-        or chat.get("updatedAt")
-    )
-    if isinstance(ts_value, str):
-        parsed = _parse_ts(ts_value)
-        if parsed:
-            return parsed
-
-    last_block = chat.get("last_message") or chat.get("lastMessage")
-    if isinstance(last_block, dict):
-        ts_from_message = _parse_ts(_ts(last_block))
-        if ts_from_message:
-            return ts_from_message
-    return None
+    return "ozon"
 
 
-def _chat_last_text(chat: dict) -> str | None:
-    if not isinstance(chat, dict):
-        return None
-    last_block = chat.get("last_message") or chat.get("lastMessage")
-    if isinstance(last_block, dict):
-        text = _extract_text(last_block) or last_block.get("text") or last_block.get("message")
-        if text:
-            return str(text)
-    text_field = chat.get("last_message_text") or chat.get("lastMessageText")
-    if text_field:
-        return str(text_field)
-    return None
+def _extract_text(m: dict) -> str:
+    # common fields
+    for k in ("text", "message", "content", "body"):
+        v = m.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
 
-
-def _looks_like_system_number(text: str | None) -> bool:
-    if not isinstance(text, str):
-        return False
-    return bool(SYSTEM_NUMBER_RE.match(text.strip()))
-
-
-def _chat_snippet(chat: dict, *, history: list[dict] | None = None) -> str:
-    last_text = _chat_last_text(chat)
-    if last_text and not _looks_like_system_number(last_text):
-        return _truncate_text(last_text, limit=50)
-
-    history_source = history if isinstance(history, list) else None
-    if history_source:
-        for msg in reversed(history_source):
-            if not isinstance(msg, dict):
-                continue
-            text = _extract_text(msg) or msg.get("text") or msg.get("message")
-            if not text:
-                continue
-            if _looks_like_system_number(str(text)):
-                continue
-            cleaned = str(text).strip()
-            if cleaned:
-                return _truncate_text(cleaned, limit=50)
-
-    if last_text and _looks_like_system_number(last_text):
-        return "(служебное)"
+    # some APIs store in payload
+    payload = m.get("payload")
+    if isinstance(payload, dict):
+        v = payload.get("text") or payload.get("message")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
 
     return ""
 
 
-def _chat_message_count(chat: dict) -> int | None:
-    if not isinstance(chat, dict):
-        return None
-    for key in ("messages_count", "message_count", "messagesCount", "messageCount"):
-        value = chat.get(key)
-        try:
-            count = int(value)
-            if count >= 0:
-                return count
-        except Exception:
-            continue
+def _extract_created_at(m: dict) -> str | None:
+    for k in ("created_at", "create_time", "timestamp", "date", "time"):
+        v = m.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
     return None
 
 
-def _chat_display(
-    chat: dict, *, history: list[dict] | None = None
-) -> tuple[str | None, str, str, int, str, datetime | None]:
-    """Построить информативное название и превью чата."""
+def normalize_thread_messages(raw_messages: list[dict], *, customer_only: bool = True, include_seller: bool = True) -> list[NormalizedMessage]:
+    out: list[NormalizedMessage] = []
+    for m in raw_messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = _detect_sender_type(m)
+        txt = _extract_text(m)
+        if not txt:
+            continue
 
-    chat_id = _safe_chat_id(chat)
-    posting = _chat_posting(chat)
-    buyer = _chat_buyer_name(chat)
-    unread_count = _chat_unread_count(chat)
-    last_dt = _chat_last_dt(chat)
-    last_dt_msk = None
-    if last_dt:
-        try:
-            base_dt = last_dt
-            if not base_dt.tzinfo:
-                base_dt = base_dt.replace(tzinfo=timezone.utc)
-            last_dt_msk = base_dt.astimezone(MOSCOW_TZ)
-        except Exception:
-            last_dt_msk = last_dt
-    last_label = last_dt_msk.strftime("%d.%m %H:%M") if last_dt_msk else ""
-    preview = _chat_snippet(chat, history=history)
-    msg_count = _chat_message_count(chat)
-
-    fallback_buyer = None
-    if chat_id:
-        tail = chat_id[-4:]
-        fallback_buyer = f"Покупатель {tail}"
-
-    if buyer:
-        title = buyer
-        if posting:
-            title = f"{buyer} • заказ {posting}"
-    elif posting:
-        title = f"Заказ {posting}"
-        if last_label:
-            title = f"{title} • {last_label}"
-    elif fallback_buyer:
-        title = fallback_buyer
-    else:
-        if last_label and msg_count:
-            title = f"Чат от {last_label} • {msg_count} сообщений"
-        elif last_label:
-            title = f"Чат от {last_label}"
-        elif msg_count:
-            title = f"Чат • {msg_count} сообщений"
-        else:
-            title = "Чат без названия"
-
-    short_title = _truncate_text(title, limit=64)
-    return chat_id, title, short_title, unread_count, preview, last_dt
-
-
-def _chat_sort_key(chat: dict) -> tuple:
-    last_dt = _chat_last_dt(chat)
-    return (last_dt or datetime.min, chat.get("last_message_time") or "")
-
-
-def _cleanup_attachment_cache() -> None:
-    ATTACH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    now = datetime.utcnow()
-    with suppress(Exception):
-        for path in ATTACH_CACHE_DIR.iterdir():
-            try:
-                mtime = datetime.utcfromtimestamp(path.stat().st_mtime)
-            except Exception:
+        if customer_only:
+            if role == "ozon":
                 continue
-            if now - mtime > ATTACH_CACHE_TTL:
-                with suppress(Exception):
-                    path.unlink()
+            if role == "seller" and not include_seller:
+                continue
+
+        out.append(NormalizedMessage(role=role, text=txt, created_at=_extract_created_at(m), raw=m))
+
+    return out
 
 
-def _attachment_cache_path(url: str) -> Path:
-    parsed = urlparse(url)
-    suffix = Path(parsed.path).suffix
-    digest = hashlib.sha256(url.encode("utf-8", errors="ignore")).hexdigest()
-    filename = digest + (suffix or "")
-    return ATTACH_CACHE_DIR / filename
-
-
-def _normalize_attachment(item: object) -> dict | None:
-    if isinstance(item, str):
-        url = item.strip()
-        if not url or not url.startswith("http"):
-            return None
-        name = Path(urlparse(url).path).name or "вложение"
-        return {
-            "kind": "photo"
-            if any(name.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"))
-            else "file",
-            "name": name,
-            "url": url,
-            "cache_key": url,
-        }
-
-    if not isinstance(item, dict):
-        return None
-
-    url = None
-    for key in ("url", "link", "download_url", "file_url", "fileUrl", "href"):
-        value = item.get(key)
-        if isinstance(value, str) and value.strip():
-            url = value.strip()
-            break
-    file_id = None
-    for key in ("file_id", "fileId", "file_uuid"):
-        value = item.get(key)
-        if value not in (None, ""):
-            file_id = str(value)
-            break
-
-    if not url and not file_id:
-        return None
-
-    name = None
-    for key in ("name", "file_name", "filename", "title", "original_name"):
-        value = item.get(key)
-        if value not in (None, ""):
-            name = str(value)
-            break
-    if not name and url:
-        parsed = urlparse(url)
-        name = Path(parsed.path).name or "вложение"
-    size = None
-    for key in ("size", "file_size", "length"):
-        value = item.get(key)
-        try:
-            size = int(value)
-            break
-        except Exception:
-            continue
-
-    type_value = None
-    for key in ("type", "mime", "mime_type", "content_type", "file_type"):
-        value = item.get(key)
-        if value not in (None, ""):
-            type_value = str(value)
-            break
-    kind = "file"
-    type_lower = (type_value or "").lower()
-    if any(word in type_lower for word in ("image", "photo", "picture")):
-        kind = "photo"
-    elif url:
-        if any(url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic")):
-            kind = "photo"
-
-    return {"kind": kind, "name": name or "вложение", "url": url, "file_id": file_id, "size": size, "cache_key": url or file_id or name}
-
-
-def _extract_message_attachments(msg: dict) -> list[dict]:
-    attachments: list[dict] = []
-    seen: set[str] = set()
-
-    def _walk(obj: object) -> None:
-        if isinstance(obj, dict):
-            if any(key in obj for key in ("attachments", "files", "file", "file_info", "fileInfo", "data")):
-                for key in ("attachments", "files", "file", "file_info", "fileInfo", "data"):
-                    val = obj.get(key)
-                    if isinstance(val, list):
-                        for item in val:
-                            _walk(item)
-                    elif isinstance(val, dict):
-                        _walk(val)
-            if any(key in obj for key in ("url", "link", "download_url", "file_url", "fileUrl", "href", "file_id", "fileId")):
-                normalized = _normalize_attachment(obj)
-                if normalized:
-                    key_val = normalized.get("cache_key") or normalized.get("url") or normalized.get("name")
-                    if key_val and key_val not in seen:
-                        seen.add(key_val)
-                        attachments.append(normalized)
-            for value in obj.values():
-                if isinstance(value, (dict, list, str)):
-                    _walk(value)
-        elif isinstance(obj, list):
-            for item in obj:
-                _walk(item)
-        elif isinstance(obj, str):
-            normalized = _normalize_attachment(obj)
-            if normalized:
-                key_val = normalized.get("cache_key") or normalized.get("url") or normalized.get("name")
-                if key_val and key_val not in seen:
-                    seen.add(key_val)
-                    attachments.append(normalized)
-
-    _walk(msg or {})
-    raw = msg.get("_raw") if isinstance(msg, dict) else None
-    if raw and raw is not msg:
-        _walk(raw)
-
-    return attachments
-
-
-def _resolve_author(role_lower: str) -> tuple[str, str]:
-    if "seller" in role_lower or "operator" in role_lower or "store" in role_lower:
-        return "seller", "🧑‍🏭 Вы"
-    if "courier" in role_lower:
-        return "courier", "🚚 Курьер"
-    if "support" in role_lower or "crm" in role_lower:
-        return "support", "🛡️ Саппорт"
-    return "buyer", "👤 Покупатель"
-
-
-def _normalize_chat_messages(
-    messages: list[dict], *, show_service: bool = False
-) -> tuple[list[dict], list[dict]]:
-    prepared: list[dict] = []
-    attachments_all: list[dict] = []
-    attachments_seen: set[str] = set()
-
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        text = _extract_text(msg) or ""
-        inline_urls = msg.get("_inline_file_urls") if isinstance(msg, dict) else []
-        inline_urls = inline_urls if isinstance(inline_urls, list) else []
-
-        inline_attachments, inline_photos, inline_files = _build_inline_attachments(
-            inline_urls
-        )
-
-        attachments = _extract_message_attachments(msg)
-        if inline_attachments:
-            attachments.extend(inline_attachments)
-
-        if not text and not attachments:
-            continue
-
-        if inline_attachments:
-            summary = _inline_summary(inline_photos, inline_files)
-            base_text = text.strip()
-            if base_text:
-                text = base_text if not summary else f"{base_text}\n{summary}"
-            else:
-                text = summary or text
-            if show_service and inline_urls:
-                urls_block = "\n".join(inline_urls)
-                text = (text + "\n" + urls_block).strip()
-
-        role_lower = _detect_message_role(msg)
-        author_kind, author_label = _resolve_author(role_lower)
-
-        ts_value = _ts(msg)
-        ts_dt = _parse_ts(ts_value)
-        ts_label = None
-        if ts_dt:
-            ts_safe = ts_dt
-            if not ts_safe.tzinfo:
-                ts_safe = ts_safe.replace(tzinfo=timezone.utc)
-            ts_label = ts_safe.astimezone(MOSCOW_TZ).strftime("%d.%m %H:%M")
-        elif ts_value:
-            ts_label = ts_value[:16]
-        else:
-            ts_label = ""
-
-        prepared.append(
-            {
-                "author": author_label,
-                "author_kind": author_kind,
-                "text": text,
-                "attachments": attachments,
-                "ts": ts_dt.astimezone(timezone.utc).replace(tzinfo=None) if ts_dt else None,
-                "ts_raw": ts_value or "",
-                "ts_label": ts_label or "",
-            }
-        )
-
-        for att in attachments:
-            key_val = att.get("cache_key") or att.get("url") or att.get("name")
-            if key_val and key_val not in attachments_seen:
-                attachments_seen.add(key_val)
-                attachments_all.append(att)
-
-    prepared.sort(key=lambda item: (item.get("ts") or datetime.min, item.get("ts_raw") or ""))
-    return prepared, attachments_all
-
-
-async def _ensure_cached_attachment(att: dict) -> Path | None:
-    url = att.get("url") if isinstance(att, dict) else None
-    if not url:
-        return None
-
-    _cleanup_attachment_cache()
-    ATTACH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_path = _attachment_cache_path(url)
-    if cache_path.exists():
-        try:
-            mtime = datetime.utcfromtimestamp(cache_path.stat().st_mtime)
-            if datetime.utcnow() - mtime < ATTACH_CACHE_TTL:
-                return cache_path
-        except Exception:
-            pass
-        with suppress(Exception):
-            cache_path.unlink()
-
-    try:
-        content = await download_with_auth(url)
-    except Exception as exc:  # pragma: no cover - сеть
-        logger.warning("Failed to download attachment %s: %s", url, exc)
-        return None
-
-    try:
-        cache_path.write_bytes(content)
-    except Exception as exc:  # pragma: no cover - FS
-        logger.warning("Failed to write attachment cache %s: %s", cache_path, exc)
-        return None
-
-    return cache_path
-
-
-async def _send_chat_attachments(
-    *, bot: Bot, telegram_chat_id: int, attachments: list[dict], only_kind: str | None = None
-) -> None:
-    if not attachments:
+async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
+    cache = _cc(user_id)
+    if not force and cache.chats and _cache_fresh(cache.fetched_at, CACHE_TTL_SECONDS):
         return
 
-    for att in attachments:
-        if only_kind and att.get("kind") != only_kind:
-            continue
-        cache_path = await _ensure_cached_attachment(att)
-        if not cache_path:
-            continue
-        filename = att.get("name") or cache_path.name
-        try:
-            file = FSInputFile(cache_path, filename=filename)
-            if att.get("kind") == "photo":
-                await bot.send_photo(telegram_chat_id, file, caption=filename)
-            else:
-                await bot.send_document(telegram_chat_id, file, caption=filename)
-        except Exception as exc:  # pragma: no cover - Telegram/network
-            logger.warning("Failed to send attachment %s: %s", filename, exc)
+    resp = await ozon_chat_list(limit=200, offset=0, refresh=True)
+    chats = resp.chats or []
+
+    # simple ordering: unread first, then by last_message_id desc
+    chats.sort(key=lambda c: (-(int(c.unread_count or 0)), -(int(c.last_message_id or 0))))
+
+    cache.chats = chats
+    cache.fetched_at = _now_utc()
+
+    cache.token_to_chat_id.clear()
+    cache.chat_id_to_token.clear()
+    for c in chats:
+        cid = str(c.chat_id)
+        tok = _short_token(user_id, cid)
+        cache.chat_id_to_token[cid] = tok
+        cache.token_to_chat_id[tok] = cid
 
 
-def _register_attachment_tokens(
-    chat_id: str, attachments: list[dict], existing: dict | None
-) -> tuple[list[tuple[str, dict]], dict]:
-    tokens_map: dict[str, dict] = existing if isinstance(existing, dict) else {}
-    chat_tokens: dict[str, dict] = {}
+async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = False) -> tuple[str, list[dict], int, int]:
+    await refresh_chats_list(user_id, force=force_refresh)
+    cache = _cc(user_id)
+    total = len(cache.chats)
 
-    for att in attachments:
-        url = att.get("url") if isinstance(att, dict) else None
-        if not url:
-            continue
-        name = att.get("name") if isinstance(att, dict) else None
-        size = att.get("size") if isinstance(att, dict) else None
-        kind = att.get("kind") if isinstance(att, dict) else None
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    safe_page = max(0, min(int(page), total_pages - 1))
 
-        token_source = f"{chat_id}:{url}"
-        token = hashlib.sha256(token_source.encode("utf-8", errors="ignore")).hexdigest()[:8]
-        suffix = 0
-        while token in chat_tokens and chat_tokens[token].get("url") != url:
-            suffix += 1
-            token = hashlib.sha256(
-                f"{token_source}:{suffix}".encode("utf-8", errors="ignore")
-            ).hexdigest()[:8]
+    start = safe_page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    chunk = cache.chats[start:end]
 
-        chat_tokens[token] = {
-            "url": url,
-            "name": name or "вложение",
-            "size": size,
-            "kind": kind or "file",
-        }
+    items: list[dict] = []
+    for c in chunk:
+        cid = str(c.chat_id)
+        tok = cache.chat_id_to_token.get(cid) or _short_token(user_id, cid)
+        title = (c.title or "").strip() or f"Чат {cid}"
+        title = _trim(title.replace("\n", " "), 42)
+        items.append({"token": tok, "title": title, "unread_count": int(c.unread_count or 0)})
 
-    tokens_map[chat_id] = chat_tokens
-    tokens_list = list(chat_tokens.items())
-    return tokens_list, tokens_map
-
-
-def _get_chat_drafts(data: dict | None) -> dict[str, str]:
-    drafts = data.get("chat_drafts") if isinstance(data, dict) else None
-    return drafts if isinstance(drafts, dict) else {}
-
-
-def _get_chat_draft(data: dict | None, chat_id: str | None) -> str | None:
-    if not chat_id:
-        return None
-    drafts = _get_chat_drafts(data)
-    draft = drafts.get(chat_id)
-    if isinstance(draft, str) and draft.strip():
-        return draft
-    return None
-
-
-async def _store_chat_draft(state: FSMContext, chat_id: str, text: str) -> str:
-    data = await state.get_data()
-    drafts = _get_chat_drafts(data)
-    drafts[chat_id] = text
-    await state.update_data(chat_drafts=drafts)
-    return text
-
-
-async def _drop_chat_draft(state: FSMContext, chat_id: str) -> None:
-    data = await state.get_data()
-    drafts = _get_chat_drafts(data)
-    if chat_id in drafts:
-        drafts.pop(chat_id, None)
-        await state.update_data(chat_drafts=drafts)
-
-
-def _collect_product_names(cache: Dict[str, list[str]], posting: str) -> list[str]:
-    if posting in cache:
-        return cache[posting]
-    return []
-
-
-def _render_products_line(product_names: list[str]) -> str | None:
-    if not product_names:
-        return None
-    unique = []
-    for name in product_names:
-        if name and name not in unique:
-            unique.append(name)
-    if not unique:
-        return None
-    return "Товары: " + ", ".join(unique[:5])
-
-
-async def _send_chats_list(
-    *,
-    user_id: int,
-    state: FSMContext,
-    page: int = 0,
-    message: Message | None = None,
-    callback: CallbackQuery | None = None,
-    bot: Bot | None = None,
-    chat_id: int | None = None,
-    unread_only: bool | None = None,
-    refresh: bool = False,
-) -> None:
-    data = await state.get_data()
-    unread_flag = bool(unread_only if unread_only is not None else data.get("chats_unread_only"))
-    show_service = bool(data.get("chats_show_service"))
-
-    cached_list = data.get("chats_all") if isinstance(data.get("chats_all"), list) else None
-    need_reload = refresh or not isinstance(cached_list, list) or not cached_list
-
-    try:
-        items_raw = (
-            await chat_list(limit=CHAT_LIST_LIMIT, offset=0, include_service=True)
-            if need_reload
-            else cached_list or []
-        )
-    except OzonAPIError as exc:
-        target = callback.message if callback else message
-        if target:
-            await send_ephemeral_message(
-                target.bot,
-                chat_id=target.chat.id,
-                text=f"⚠️ Не удалось получить список чатов. Ошибка: {exc}",
-                user_id=user_id,
-            )
-        logger.warning("Unable to load chats list: %s", exc)
-        return
-    except Exception:
-        target = callback.message if callback else message
-        if target:
-            await send_ephemeral_message(
-                target.bot,
-                chat_id=target.chat.id,
-                text="⚠️ Не удалось получить список чатов. Попробуйте позже.",
-                user_id=user_id,
-            )
-        logger.exception("Unexpected error while loading chats list")
-        return
-
-    sorted_items = sorted(items_raw, key=_chat_sort_key, reverse=True)
-    total_loaded = len(sorted_items)
-
-    classifications: dict[int, tuple[bool, bool]] = {}
-    buyer_count = 0
-    service_count = 0
-    unknown_count = 0
-    for chat in sorted_items:
-        chat_dict = chat if isinstance(chat, dict) else {}
-        is_buyer, recognized = _classify_chat(chat_dict)
-        classifications[id(chat)] = (is_buyer, recognized)
-        if is_buyer:
-            buyer_count += 1
-        elif recognized:
-            service_count += 1
-        else:
-            unknown_count += 1
-
-    buyer_chats = [chat for chat in sorted_items if classifications.get(id(chat), (False, False))[0]]
-    visible_items = sorted_items if show_service else buyer_chats
-    logger.debug(
-        "Chats list filter applied (show_service=%s): total=%s, after_filter=%s",
-        show_service,
-        total_loaded,
-        len(visible_items),
+    stamp = cache.fetched_at.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC") if cache.fetched_at else "—"
+    text = (
+        f"<b>Чаты</b>\n"
+        f"Обновлено: <code>{stamp}</code>\n"
+        f"Всего: <b>{total}</b> | Страница: <b>{safe_page + 1}/{total_pages}</b>\n\n"
+        f"Выберите чат:"
     )
-    logger.debug(
-        "Chats classification stats: total=%s, buyer=%s, non_buyer=%s, unknown=%s",
-        total_loaded,
-        buyer_count,
-        service_count,
-        unknown_count,
-    )
+    return text, items, safe_page, total_pages
 
-    cache: dict[str, dict] = {}
-    for chat in visible_items:
-        cid = _safe_chat_id(chat)
-        if cid:
-            cache[cid] = chat if isinstance(chat, dict) else {}
 
-    filtered_items = [chat for chat in visible_items if not unread_flag or _chat_unread_count(chat) > 0]
-    total_count = len(visible_items)
-    unread_total = sum(1 for chat in visible_items if _chat_unread_count(chat) > 0)
-    total_pages = max(1, math.ceil(max(1, len(filtered_items)) / CHAT_PAGE_SIZE))
-    safe_page = 0 if page >= total_pages else max(0, min(page, total_pages - 1))
-    start = safe_page * CHAT_PAGE_SIZE
-    end = start + CHAT_PAGE_SIZE
-    page_slice = filtered_items[start:end]
+async def refresh_chat_thread(*, user_id: int, chat_id: str, force: bool = False, limit: int = DEFAULT_THREAD_LIMIT) -> ThreadView:
+    cid = str(chat_id).strip()
+    t = _tc(user_id, cid)
 
-    display_rows: list[str] = []
-    keyboard_items: list[tuple[str, str]] = []
-    history_cache = data.get("chat_history") if isinstance(data.get("chat_history"), list) else None
-    history_chat_id = data.get("current_chat_id")
-    for idx, chat in enumerate(page_slice, start=start + 1):
-        cid_history = history_cache if history_chat_id == _safe_chat_id(chat) else None
-        chat_id_val, title, short_title, unread_count, preview, last_dt = _chat_display(
-            chat, history=cid_history
-        )
-        if not chat_id_val:
-            continue
-        is_service_chat = not classifications.get(id(chat), (False, False))[0]
-        badge = f"🔴{unread_count}" if unread_count > 0 else "⚪"
-        ts_label = last_dt.strftime("%d.%m %H:%M") if last_dt else ""
-        preview_label = preview or ""
-        display_title = f"🛠 {title}" if show_service and is_service_chat else title
-        line_parts = [
-            f"{idx}) {badge} {display_title}",
-            ts_label,
-            preview_label,
-        ]
-        display_rows.append(" | ".join([part for part in line_parts if part]))
-        kb_caption_parts = [badge, _truncate_text(display_title, limit=30)]
-        if ts_label:
-            kb_caption_parts.append(ts_label)
-        if preview_label:
-            kb_caption_parts.append(_truncate_text(preview_label, limit=50))
-        kb_caption = " | ".join(kb_caption_parts)
-        keyboard_items.append((chat_id_val, kb_caption))
+    if force:
+        t.fetched_at = None
 
-    lines = ["💬 Чаты с покупателями"]
-    lines.append(f"Всего: {total_count} | Непрочитано: {unread_total}")
-    lines.append(
-        "Фильтр: "
-        + ("все" if show_service else "только покупатели")
-        + f" | Только непрочитанные: {'ON' if unread_flag else 'OFF'}"
-    )
-    lines.append(f"Стр. {safe_page + 1}/{total_pages}")
-    lines.append("")
-
-    if not display_rows:
-        lines.append("Нет активных диалогов" if not unread_flag else "Нет непрочитанных диалогов")
+    # we maintain and clamp limit
+    if limit:
+        t.limit = max(10, min(int(limit), MAX_THREAD_LIMIT))
     else:
-        lines.extend(display_rows)
-    markup = chats_list_keyboard(
-        items=keyboard_items,
-        page=safe_page,
-        total_pages=total_pages,
-        unread_only=unread_flag,
-        show_service=show_service,
-    )
-    target = callback.message if callback else message
-    active_bot = bot or (target.bot if target else None)
-    active_chat = chat_id or (target.chat.id if target else None)
-    if not active_bot or active_chat is None:
-        return
+        t.limit = max(10, min(int(t.limit or DEFAULT_THREAD_LIMIT), MAX_THREAD_LIMIT))
 
-    await state.update_data(
-        chats_cache=cache,
-        chats_page=safe_page,
-        chats_unread_only=unread_flag,
-        chats_all=sorted_items,
-        chats_show_service=show_service,
-    )
-    rendered_text = "\n".join(lines)
-    sent = None
-    if target and not chat_id:
-        sent = await safe_edit_text(
-            target,
-            rendered_text,
-            reply_markup=markup,
-            section=SECTION_CHATS_LIST,
-            user_id=user_id,
-            bot=active_bot,
-        )
-    if not sent:
-        sent = await send_section_message(
-            SECTION_CHATS_LIST,
-            text=rendered_text,
-            reply_markup=markup,
-            message=message,
-            callback=callback,
-            bot=bot,
-            chat_id=chat_id,
-            user_id=user_id,
-        )
-    await delete_section_message(
-        user_id,
-        SECTION_CHAT_HISTORY,
-        active_bot,
-        preserve_message_id=sent.message_id if sent else None,
-    )
-    await delete_section_message(user_id, SECTION_CHAT_PROMPT, active_bot, force=True)
+    if not force and t.raw_messages and _cache_fresh(t.fetched_at, THREAD_TTL_SECONDS):
+        return ThreadView(chat_id=cid, raw_messages=t.raw_messages, fetched_at=t.fetched_at, limit=t.limit, last_message_id=t.last_message_id)
+
+    resp: ChatHistoryResponse = await ozon_chat_history(cid, limit=t.limit)
+    t.raw_messages = resp.messages or []
+    t.last_message_id = resp.last_message_id
+    t.fetched_at = _now_utc()
+
+    return ThreadView(chat_id=cid, raw_messages=t.raw_messages, fetched_at=t.fetched_at, limit=t.limit, last_message_id=t.last_message_id)
 
 
-def _format_chat_history_text(
-    chat_meta: dict | None,
-    messages: list[dict],
-    *,
-    products: list[str] | None = None,
-    limit: int = 30,
-) -> str:
-    buyer = _chat_buyer_name(chat_meta or {}) if isinstance(chat_meta, dict) else None
-    posting = _chat_posting(chat_meta or {}) if isinstance(chat_meta, dict) else None
-    product = None
-    if isinstance(chat_meta, dict):
-        product = chat_meta.get("product_name") or chat_meta.get("product_title")
-
-    lines = ["💬 Чат с покупателем"]
-    if buyer:
-        lines.append(f"Покупатель: {buyer}")
-    if posting:
-        lines.append(f"Заказ: {posting}")
-    if product:
-        lines.append(f"Товар: {product}")
-    products_line = _render_products_line(products or [])
-    if products_line:
-        lines.append(products_line)
-
-    unread_count = _chat_unread_count(chat_meta or {}) if isinstance(chat_meta, dict) else 0
-    has_unread = bool(chat_meta.get("is_unread") or chat_meta.get("has_unread")) if isinstance(chat_meta, dict) else False
-    if unread_count > 0:
-        lines.append(f"🔴 Непрочитанных сообщений: {unread_count}")
-    elif has_unread:
-        lines.append("🔴 Непрочитанные сообщения есть")
-    else:
-        lines.append("Все сообщения прочитаны.")
-
-    lines.append("")
-
-    if not messages:
-        lines.append("История чата пуста или нет текстовых сообщений.")
-    else:
-        trimmed = messages[-max(1, limit) :]
-        for item in trimmed:
-            ts_label = item.get("ts_label") or ""
-            author = item.get("author") or "👤 Покупатель"
-            lines.append(f"[{ts_label}] {author}:")
-
-            text = item.get("text") or ""
-            if text:
-                for line in str(text).splitlines() or [""]:
-                    stripped = line.strip()
-                    if not stripped:
-                        lines.append("")
-                        continue
-                    lines.extend(textwrap.wrap(stripped, width=78) or [stripped])
-            attachments = item.get("attachments") or []
-            if attachments:
-                photos = sum(1 for att in attachments if att.get("kind") == "photo")
-                files = sum(1 for att in attachments if att.get("kind") != "photo")
-                parts = []
-                if photos:
-                    parts.append(f"фото={photos}")
-                if files:
-                    parts.append(f"файлы={files}")
-                if parts:
-                    lines.append("📎 Вложения: " + ", ".join(parts))
-            lines.append("")
-
-    lines.append("─────────────")
-    lines.append("Используйте кнопки ниже, чтобы ответить покупателю или обновить чат.")
-
-    body = "\n".join(lines).strip()
-    max_len = 3500
-    if len(body) > max_len:
-        body = "…\n" + body[-max_len:]
-    return body
+async def load_older_messages(*, user_id: int, chat_id: str, pages: int = 1, limit: int = 30) -> ThreadView:
+    """
+    У Ozon history часто нет явной пагинации в seller API (может меняться).
+    Поэтому "старые" реализуем как увеличение limit на N*limit.
+    """
+    cid = str(chat_id).strip()
+    t = _tc(user_id, cid)
+    add = max(1, int(pages)) * max(10, int(limit))
+    new_limit = min(MAX_THREAD_LIMIT, max(DEFAULT_THREAD_LIMIT, (t.limit or DEFAULT_THREAD_LIMIT) + add))
+    return await refresh_chat_thread(user_id=user_id, chat_id=cid, force=True, limit=new_limit)
 
 
-async def _load_posting_products(state: FSMContext, chat_meta: dict | None) -> list[str]:
-    posting = _chat_posting(chat_meta or {}) if isinstance(chat_meta, dict) else None
-    if not posting:
-        return []
-
-    data = await state.get_data()
-    cache = data.get("posting_products") if isinstance(data.get("posting_products"), dict) else {}
-    cached = _collect_product_names(cache, posting)
-    if cached:
-        return cached
-
+def _fmt_time(created_at: str | None) -> str:
+    if not created_at:
+        return ""
+    s = created_at.strip().replace("Z", "+00:00")
     try:
-        names = await get_posting_products(posting)
-    except Exception as exc:  # pragma: no cover - сеть/схема
-        logger.warning("Failed to fetch posting %s products: %s", posting, exc)
-        names = []
-
-    if not isinstance(cache, dict):
-        cache = {}
-    cache[posting] = names
-    await state.update_data(posting_products=cache)
-    return names
-
-
-async def _show_chat_draft(
-    *,
-    chat_id: str,
-    draft: str,
-    state: FSMContext,
-    user_id: int,
-    callback: CallbackQuery | None = None,
-    message: Message | None = None,
-    bot: Bot | None = None,
-    chat_id_override: int | None = None,
-) -> None:
-    target = callback.message if callback else message
-    active_bot = bot or (target.bot if target else None)
-    active_chat = chat_id_override or (target.chat.id if target else None)
-    if not active_bot or active_chat is None:
-        return
-
-    text = f"{DRAFT_HEADER}\n\n{draft}".strip()
-    await state.set_state(None)
-    await send_section_message(
-        SECTION_CHAT_PROMPT,
-        text=text,
-        reply_markup=chat_draft_keyboard(chat_id),
-        callback=callback,
-        message=message,
-        user_id=user_id,
-        persistent=True,
-        bot=active_bot,
-        chat_id_override=active_chat,
-    )
-
-
-async def _ensure_chat_history(
-    *,
-    chat_id: str,
-    state: FSMContext,
-    user_id: int,
-    callback: CallbackQuery | None = None,
-    message: Message | None = None,
-) -> list[dict]:
-    data = await state.get_data()
-    cached_chat_id = data.get("current_chat_id")
-    cached_history = data.get("chat_history") if isinstance(data.get("chat_history"), list) else []
-    if cached_chat_id == chat_id and cached_history:
-        return cached_history
-    try:
-        history = await chat_history(chat_id, limit=30)
-        await state.update_data(chat_history=history, current_chat_id=chat_id)
-        return history
-    except Exception as exc:  # pragma: no cover - network
-        target = callback.message if callback else message
-        if target:
-            await send_ephemeral_message(
-                target.bot,
-                chat_id=target.chat.id,
-                text=f"Не удалось загрузить историю чата: {exc}",
-                user_id=user_id,
-            )
-        return []
-
-
-async def _generate_ai_draft(
-    *,
-    chat_id: str,
-    state: FSMContext,
-    user_id: int,
-    user_prompt: str | None = None,
-    callback: CallbackQuery | None = None,
-    message: Message | None = None,
-) -> str | None:
-    data = await state.get_data()
-    history = await _ensure_chat_history(
-        chat_id=chat_id, state=state, user_id=user_id, callback=callback, message=message
-    )
-    cache = data.get("chats_cache") if isinstance(data.get("chats_cache"), dict) else {}
-    meta = cache.get(chat_id) if isinstance(cache, dict) else None
-    product_name = meta.get("product_name") if isinstance(meta, dict) else None
-
-    draft = await suggest_chat_reply(history, product_name, user_prompt=user_prompt)
-    if not draft:
-        target = callback.message if callback else message
-        if target:
-            await send_ephemeral_message(
-                target.bot,
-                chat_id=target.chat.id,
-                text="🤖 Не удалось сгенерировать черновик. Попробуйте позже.",
-                user_id=user_id,
-            )
-        return None
-
-    await _store_chat_draft(state, chat_id, draft)
-    return draft
-
-
-async def _handle_draft_send(
-    *,
-    callback: CallbackQuery | None,
-    state: FSMContext,
-    chat_id: str | None = None,
-    message: Message | None = None,
-) -> None:
-    user_id = callback.from_user.id if callback else (message.from_user.id if message else 0)
-    data = await state.get_data()
-    target_chat_id = chat_id or data.get("chat_id")
-    draft = _get_chat_draft(data, target_chat_id)
-    if not target_chat_id or not draft:
-        target = callback.message if callback else message
-        if target:
-            await send_ephemeral_message(
-                target.bot,
-                chat_id=target.chat.id,
-                text="Черновик ответа не найден",
-                user_id=user_id,
-            )
-        return
-
-    try:
-        await chat_send_message(target_chat_id, draft)
-    except Exception as exc:
-        target = callback.message if callback else message
-        if target:
-            await send_ephemeral_message(
-                target.bot,
-                chat_id=target.chat.id,
-                text=f"Не удалось отправить сообщение: {exc}",
-                user_id=user_id,
-            )
-        return
-
-    await _drop_chat_draft(state, target_chat_id)
-    if callback:
-        await delete_section_message(
-            user_id, SECTION_CHAT_PROMPT, callback.bot, preserve_message_id=None, force=True
-        )
-    await _open_chat_history(
-        user_id=user_id,
-        chat_id=target_chat_id,
-        state=state,
-        callback=callback,
-        message=message,
-    )
-
-
-async def _open_chat_history(
-    *,
-    user_id: int,
-    chat_id: str,
-    state: FSMContext,
-    message: Message | None = None,
-    callback: CallbackQuery | None = None,
-    bot: Bot | None = None,
-    chat_id_override: int | None = None,
-) -> None:
-    data = await state.get_data()
-    chat_meta = None
-    cache = data.get("chats_cache") if isinstance(data.get("chats_cache"), dict) else {}
-    show_service = bool(data.get("chats_show_service"))
-    if isinstance(cache, dict):
-        chat_meta = cache.get(chat_id)
-
-    try:
-        messages = await chat_history(chat_id, limit=30)
-    except OzonAPIError as exc:
-        target = callback.message if callback else message
-        if target:
-            await send_ephemeral_message(
-                target.bot,
-                chat_id=target.chat.id,
-                text=f"⚠️ Не удалось получить историю чата. Ошибка: {exc}",
-                user_id=user_id,
-            )
-        logger.warning("Unable to load chat history for %s: %s", chat_id, exc)
-        return
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime("%H:%M")
     except Exception:
-        target = callback.message if callback else message
-        if target:
-            await send_ephemeral_message(
-                target.bot,
-                chat_id=target.chat.id,
-                text="⚠️ Не удалось загрузить историю чата. Попробуйте позже.",
-                user_id=user_id,
-            )
-        logger.exception("Unexpected error while loading chat %s", chat_id)
-        return
-
-    with suppress(Exception):
-        await chat_read(chat_id, messages)
-
-    products = await _load_posting_products(state, chat_meta)
-    normalized_messages, attachments_all = _normalize_chat_messages(
-        messages, show_service=show_service
-    )
-    photo_count = sum(1 for att in attachments_all if att.get("kind") == "photo")
-    file_count = sum(1 for att in attachments_all if att.get("kind") != "photo")
-    attachments_total = len(attachments_all)
-    history_text = _format_chat_history_text(
-        chat_meta, normalized_messages, products=products
-    )
-    if attachments_total > ATTACH_AUTOSEND_LIMIT:
-        history_text = (
-            history_text
-            + "\n\n📎 Вложений много, отправляем их по кнопкам ниже, чтобы не заспамить."
-        )
-
-    file_tokens_existing = (
-        data.get("chat_file_tokens") if isinstance(data.get("chat_file_tokens"), dict) else {}
-    )
-    attachment_tokens, tokens_map = _register_attachment_tokens(
-        chat_id, attachments_all, file_tokens_existing
-    )
-    attachment_buttons = []
-    for token, meta in attachment_tokens[:8]:
-        label = _truncate_text(meta.get("name") or "вложение", limit=26)
-        icon = "📷" if (meta.get("kind") or "").startswith("photo") else "📄"
-        attachment_buttons.append((token, f"{icon} {label}", meta.get("kind")))
-    markup = chat_actions_keyboard(
-        chat_id,
-        attachments_total=attachments_total,
-        photo_count=photo_count,
-        file_count=file_count,
-        oversized=attachments_total > ATTACH_AUTOSEND_LIMIT,
-        attachment_tokens=attachment_buttons,
-        has_draft=bool(_get_chat_draft(data, chat_id)),
-    )
-    target = callback.message if callback else message
-    active_bot = bot or (target.bot if target else None)
-    active_chat = chat_id_override or (target.chat.id if target else None)
-    if not active_bot or active_chat is None:
-        return
-
-    attachments_map = data.get("chat_attachments") if isinstance(data.get("chat_attachments"), dict) else {}
-    if not isinstance(attachments_map, dict):
-        attachments_map = {}
-    attachments_map[chat_id] = {
-        "items": attachments_all,
-        "counts": {
-            "photos": photo_count,
-            "files": file_count,
-            "total": attachments_total,
-        },
-    }
-
-    await state.update_data(
-        chat_history=messages,
-        chat_history_prepared=normalized_messages,
-        current_chat_id=chat_id,
-        chats_cache=cache,
-        chat_attachments=attachments_map,
-        chat_file_tokens=tokens_map,
-    )
-    sent = None
-    if target and chat_id_override is None:
-        sent = await safe_edit_text(
-            target,
-            history_text,
-            reply_markup=markup,
-            section=SECTION_CHAT_HISTORY,
-            user_id=user_id,
-            bot=active_bot,
-        )
-    if not sent:
-        sent = await send_section_message(
-            SECTION_CHAT_HISTORY,
-            text=history_text,
-            reply_markup=markup,
-            message=message,
-            callback=callback,
-            bot=bot,
-            chat_id=chat_id_override,
-            user_id=user_id,
-        )
-    await delete_section_message(user_id, SECTION_CHAT_PROMPT, active_bot, force=True)
-
-    if attachments_total and attachments_total <= ATTACH_AUTOSEND_LIMIT:
-        await _send_chat_attachments(
-            bot=active_bot,
-            telegram_chat_id=active_chat,
-            attachments=attachments_all,
-        )
-
-
-async def _clear_chat_sections(bot: Bot, user_id: int) -> None:
-    await delete_section_message(bot=bot, user_id=user_id, section=SECTION_FBO, force=True)
-    await delete_section_message(bot=bot, user_id=user_id, section=SECTION_FINANCE_TODAY, force=True)
-    await delete_section_message(bot=bot, user_id=user_id, section=SECTION_ACCOUNT, force=True)
-    await delete_section_message(bot=bot, user_id=user_id, section=SECTION_REVIEWS_LIST, force=True)
-    await delete_section_message(bot=bot, user_id=user_id, section=SECTION_REVIEW_CARD, force=True)
-    await delete_section_message(bot=bot, user_id=user_id, section=SECTION_QUESTIONS_LIST, force=True)
-    await delete_section_message(bot=bot, user_id=user_id, section=SECTION_QUESTION_CARD, force=True)
-    await delete_section_message(bot=bot, user_id=user_id, section=SECTION_REVIEW_PROMPT, force=True)
-    await delete_section_message(bot=bot, user_id=user_id, section=SECTION_QUESTION_PROMPT, force=True)
-    await delete_section_message(bot=bot, user_id=user_id, section=SECTION_CHATS_LIST, force=True)
-    await delete_section_message(bot=bot, user_id=user_id, section=SECTION_CHAT_HISTORY, force=True)
-    await delete_section_message(bot=bot, user_id=user_id, section=SECTION_CHAT_PROMPT, force=True)
-
-
-@router.callback_query(MenuCallbackData.filter(F.section == "chats"))
-async def cb_chats_menu(
-    callback: CallbackQuery, callback_data: MenuCallbackData, state: FSMContext
-) -> None:
-    await callback.answer()
-    user_id = callback.from_user.id
-    await state.clear()
-    await _clear_chat_sections(callback.message.bot, user_id)
-    await _send_chats_list(user_id=user_id, state=state, page=0, callback=callback)
-
-
-@router.callback_query(ChatsCallbackData.filter(F.action == "list"))
-async def cb_chats_list(
-    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
-) -> None:
-    await callback.answer()
-    user_id = callback.from_user.id
-    page = int(callback_data.page or 0)
-    data = await state.get_data()
-    unread_only = bool(data.get("chats_unread_only"))
-    await _send_chats_list(
-        user_id=user_id,
-        state=state,
-        page=page,
-        callback=callback,
-        unread_only=unread_only,
-        refresh=True,
-    )
-
-
-@router.callback_query(ChatsCallbackData.filter(F.action == "filter"))
-async def cb_chats_filter(
-    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
-) -> None:
-    await callback.answer()
-    data = await state.get_data()
-    current_flag = bool(data.get("chats_unread_only"))
-    page = 0
-    await _send_chats_list(
-        user_id=callback.from_user.id,
-        state=state,
-        page=int(page),
-        callback=callback,
-        unread_only=not current_flag,
-    )
-
-
-@router.callback_query(ChatsCallbackData.filter(F.action == "service"))
-async def cb_chats_service_toggle(
-    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
-) -> None:
-    await callback.answer()
-    data = await state.get_data()
-    current_flag = bool(data.get("chats_show_service"))
-    page = 0
-    await state.update_data(chats_show_service=not current_flag)
-    await _send_chats_list(
-        user_id=callback.from_user.id,
-        state=state,
-        page=int(page),
-        callback=callback,
-        unread_only=bool(data.get("chats_unread_only")),
-        refresh=False,
-    )
-
-
-@router.callback_query(ChatsCallbackData.filter(F.action.in_(("media_all", "media_photos", "media_files"))))
-async def cb_chat_media(
-    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
-) -> None:
-    await callback.answer()
-    chat_id = callback_data.chat_id
-    if not chat_id:
-        return
-
-    data = await state.get_data()
-    attachments_map = data.get("chat_attachments") if isinstance(data.get("chat_attachments"), dict) else {}
-    record = attachments_map.get(chat_id) if isinstance(attachments_map, dict) else None
-    attachments = record.get("items") if isinstance(record, dict) else []
-    if not attachments:
-        await send_ephemeral_message(
-            callback.bot,
-            chat_id=callback.message.chat.id,
-            text="Вложения не найдены. Обновите чат, чтобы загрузить их заново.",
-            user_id=callback.from_user.id,
-        )
-        return
-
-    kind = None
-    if callback_data.action == "media_photos":
-        kind = "photo"
-    elif callback_data.action == "media_files":
-        kind = "file"
-
-    await _send_chat_attachments(
-        bot=callback.bot,
-        telegram_chat_id=callback.message.chat.id,
-        attachments=attachments,
-        only_kind=kind,
-    )
-
-
-@router.callback_query(ChatsCallbackData.filter(F.action.in_(("file", "dl"))))
-async def cb_chat_file(
-    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
-) -> None:
-    await callback.answer()
-    chat_id = callback_data.chat_id
-    token = callback_data.token
-    if not chat_id or not token:
-        return
-
-    data = await state.get_data()
-    tokens_map = data.get("chat_file_tokens") if isinstance(data.get("chat_file_tokens"), dict) else {}
-    chat_tokens = tokens_map.get(chat_id) if isinstance(tokens_map, dict) else None
-    meta = chat_tokens.get(token) if isinstance(chat_tokens, dict) else None
-    if not meta:
-        await send_ephemeral_message(
-            callback.bot,
-            chat_id=callback.message.chat.id,
-            text="Файл не найден или ссылка устарела. Обновите чат и попробуйте снова.",
-            user_id=callback.from_user.id,
-        )
-        return
-
-    url = meta.get("url") if isinstance(meta, dict) else None
-    if not url:
-        return
-
-    size = None
-    try:
-        if meta.get("size") not in (None, ""):
-            size = int(meta.get("size"))
-    except Exception:
-        size = None
-
-    if size and size > ATTACH_DOWNLOAD_LIMIT:
-        await send_ephemeral_message(
-            callback.bot,
-            chat_id=callback.message.chat.id,
-            text=f"Файл слишком большой для отправки (> {ATTACH_DOWNLOAD_LIMIT // (1024 * 1024)} МБ).",
-            user_id=callback.from_user.id,
-        )
-        return
-
-    try:
-        content, meta_value = await download_chat_file(url)
-    except Exception as exc:  # pragma: no cover - сеть
-        await send_ephemeral_message(
-            callback.bot,
-            chat_id=callback.message.chat.id,
-            text=f"Не удалось скачать файл: {exc}",
-            user_id=callback.from_user.id,
-        )
-        return
-
-    if len(content) > ATTACH_DOWNLOAD_LIMIT:
-        await send_ephemeral_message(
-            callback.bot,
-            chat_id=callback.message.chat.id,
-            text=f"Файл слишком большой для отправки (> {ATTACH_DOWNLOAD_LIMIT // (1024 * 1024)} МБ).",
-            user_id=callback.from_user.id,
-        )
-        return
-
-    content_type = (meta_value or "").lower()
-    kind_lower = (meta.get("kind") or "").lower() if isinstance(meta, dict) else ""
-    filename = meta.get("name") or Path(urlparse(url).path).name or "file"
-    if not content_type and filename:
-        suffix = Path(filename).suffix.lower()
-        if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic"}:
-            kind_lower = kind_lower or "photo"
-
-    try:
-        if content_type.startswith("image/") or kind_lower == "photo":
-            await callback.bot.send_photo(
-                callback.message.chat.id,
-                BufferedInputFile(content, filename=filename),
-                caption=filename,
-            )
-        else:
-            await callback.bot.send_document(
-                callback.message.chat.id,
-                BufferedInputFile(content, filename=filename),
-                caption=filename,
-            )
-    except Exception as exc:  # pragma: no cover - Telegram/network
-        logger.warning("Failed to send downloaded file %s: %s", filename, exc)
-        await send_ephemeral_message(
-            callback.bot,
-            chat_id=callback.message.chat.id,
-            text="Не удалось отправить файл в Telegram.",
-            user_id=callback.from_user.id,
-        )
-
-
-@router.callback_query(ChatsCallbackData.filter(F.action == "open"))
-async def cb_open_chat(
-    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
-) -> None:
-    await callback.answer()
-    user_id = callback.from_user.id
-    chat_id = callback_data.chat_id
-    if not chat_id:
-        await send_ephemeral_message(
-            callback.bot,
-            chat_id=callback.message.chat.id,
-            text="Не удалось определить чат.",
-            user_id=user_id,
-        )
-        return
-
-    await _open_chat_history(
-        user_id=user_id,
-        chat_id=chat_id,
-        state=state,
-        callback=callback,
-    )
-
-
-@router.callback_query(ChatsCallbackData.filter(F.action == "refresh"))
-async def cb_chat_refresh(
-    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
-) -> None:
-    chat_id = callback_data.chat_id
-    if not chat_id:
-        await callback.answer("Не удалось определить чат", show_alert=True)
-        return
-
-    await callback.answer()
-
-    await _open_chat_history(
-        user_id=callback.from_user.id,
-        chat_id=chat_id,
-        state=state,
-        callback=callback,
-        bot=callback.bot,
-    )
-
-
-@router.callback_query(ChatsCallbackData.filter(F.action == "back"))
-async def cb_chat_back(
-    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
-) -> None:
-    await callback.answer()
-    data = await state.get_data()
-    page = int(data.get("chats_page") or 0)
-    unread_only = bool(data.get("chats_unread_only"))
-    await _send_chats_list(
-        user_id=callback.from_user.id,
-        state=state,
-        page=page,
-        callback=callback,
-        unread_only=unread_only,
-    )
-
-
-@router.callback_query(ChatsCallbackData.filter(F.action == "reply"))
-async def cb_chat_reply(
-    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
-) -> None:
-    await callback.answer()
-    chat_id = callback_data.chat_id
-    if not chat_id:
-        return
-    await state.update_data(chat_id=chat_id)
-    await state.set_state(ChatStates.waiting_manual)
-    await send_section_message(
-        SECTION_CHAT_PROMPT,
-        text="✍️ Введите черновик ответа для покупателя",
-        callback=callback,
-        user_id=callback.from_user.id,
-        persistent=True,
-    )
-
-
-@router.callback_query(ChatsCallbackData.filter(F.action == "ai"))
-async def cb_chat_ai(
-    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
-) -> None:
-    await callback.answer()
-    user_id = callback.from_user.id
-    chat_id = callback_data.chat_id
-    if not chat_id:
-        return
-
-    await state.update_data(chat_id=chat_id)
-    draft = await _generate_ai_draft(
-        chat_id=chat_id, state=state, user_id=user_id, callback=callback
-    )
-    if not draft:
-        return
-
-    await _show_chat_draft(
-        chat_id=chat_id,
-        draft=draft,
-        state=state,
-        user_id=user_id,
-        callback=callback,
-    )
-
-
-@router.callback_query(ChatsCallbackData.filter(F.action == "reprompt"))
-async def cb_chat_reprompt(
-    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
-) -> None:
-    await callback.answer()
-    chat_id = callback_data.chat_id
-    if not chat_id:
-        return
-
-    await state.update_data(chat_id=chat_id)
-    await state.set_state(ChatStates.waiting_reprompt)
-    await send_section_message(
-        SECTION_CHAT_PROMPT,
-        text="🔁 Пришлите свой промт для пересборки ответа",
-        callback=callback,
-        user_id=callback.from_user.id,
-        persistent=True,
-    )
-
-
-@router.callback_query(ChatsCallbackData.filter(F.action == "ai_send"))
-async def cb_chat_ai_send(
-    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
-) -> None:
-    await callback.answer()
-    await _handle_draft_send(callback=callback, state=state, chat_id=callback_data.chat_id)
-
-
-@router.callback_query(ChatsCallbackData.filter(F.action == "draft_send"))
-async def cb_chat_draft_send(
-    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
-) -> None:
-    await callback.answer()
-    await _handle_draft_send(callback=callback, state=state, chat_id=callback_data.chat_id)
-
-
-@router.callback_query(ChatsCallbackData.filter(F.action.in_(("ai_edit", "draft_edit"))))
-async def cb_chat_ai_edit(
-    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
-) -> None:
-    await callback.answer()
-    chat_id = callback_data.chat_id
-    if not chat_id:
-        return
-    await state.update_data(chat_id=chat_id)
-    await state.set_state(ChatStates.waiting_manual)
-    await send_section_message(
-        SECTION_CHAT_PROMPT,
-        text="✏️ Пришлите текст черновика",
-        callback=callback,
-        user_id=callback.from_user.id,
-        persistent=True,
-    )
-
-
-@router.callback_query(ChatsCallbackData.filter(F.action == "ai_cancel"))
-async def cb_chat_ai_cancel(
-    callback: CallbackQuery, callback_data: ChatsCallbackData, state: FSMContext
-) -> None:
-    await callback.answer()
-    await delete_section_message(
-        callback.from_user.id, SECTION_CHAT_PROMPT, callback.bot, force=True
-    )
-    await state.set_state(None)
-
-
-@router.message(ChatStates.waiting_manual)
-async def chat_manual_message(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
-    if text.lower() == "/cancel":
-        await state.clear()
-        await delete_section_message(message.from_user.id, SECTION_CHAT_PROMPT, message.bot, force=True)
-        return
-
-    data = await state.get_data()
-    chat_id = data.get("chat_id")
-    if not chat_id:
-        await send_ephemeral_message(
-            message.bot,
-            chat_id=message.chat.id,
-            text="Чат не выбран",
-            user_id=message.from_user.id,
-        )
-        await state.set_state(None)
-        await delete_section_message(message.from_user.id, SECTION_CHAT_PROMPT, message.bot, force=True)
-        return
-
-    await _store_chat_draft(state, chat_id, text)
-    await _show_chat_draft(
-        chat_id=chat_id,
-        draft=text,
-        state=state,
-        user_id=message.from_user.id,
-        message=message,
-        bot=message.bot,
-    )
-
-
-@router.message(ChatStates.waiting_ai_confirm)
-async def chat_ai_message(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
-    if text.lower() == "/cancel":
-        await state.clear()
-        await delete_section_message(message.from_user.id, SECTION_CHAT_PROMPT, message.bot, force=True)
-        return
-
-    data = await state.get_data()
-    chat_id = data.get("chat_id")
-    if not chat_id:
-        await send_ephemeral_message(
-            message.bot,
-            chat_id=message.chat.id,
-            text="Чат не выбран",
-            user_id=message.from_user.id,
-        )
-        await state.set_state(None)
-        await delete_section_message(message.from_user.id, SECTION_CHAT_PROMPT, message.bot, force=True)
-        return
-
-    await _store_chat_draft(state, chat_id, text)
-    await _show_chat_draft(
-        chat_id=chat_id,
-        draft=text,
-        state=state,
-        user_id=message.from_user.id,
-        message=message,
-        bot=message.bot,
-    )
-
-
-@router.message(ChatStates.waiting_reprompt)
-async def chat_reprompt_message(message: Message, state: FSMContext) -> None:
-    prompt_text = (message.text or "").strip()
-    if prompt_text.lower() == "/cancel":
-        await state.clear()
-        await delete_section_message(message.from_user.id, SECTION_CHAT_PROMPT, message.bot, force=True)
-        return
-
-    data = await state.get_data()
-    chat_id = data.get("chat_id")
-    if not chat_id:
-        await send_ephemeral_message(
-            message.bot,
-            chat_id=message.chat.id,
-            text="Чат не выбран",
-            user_id=message.from_user.id,
-        )
-        await state.set_state(None)
-        await delete_section_message(message.from_user.id, SECTION_CHAT_PROMPT, message.bot, force=True)
-        return
-
-    draft = await _generate_ai_draft(
-        chat_id=chat_id,
-        state=state,
-        user_id=message.from_user.id,
-        user_prompt=prompt_text,
-        message=message,
-    )
-    if not draft:
-        return
-
-    await _show_chat_draft(
-        chat_id=chat_id,
-        draft=draft,
-        state=state,
-        user_id=message.from_user.id,
-        message=message,
-        bot=message.bot,
-    )
+        return ""
+
+
+def _bubble_text(msg: NormalizedMessage) -> str:
+    tm = _fmt_time(msg.created_at)
+    txt = _escape(msg.text)
+
+    # минималистично, чтобы было похоже на “пузырь”
+    if msg.role == "buyer":
+        return f"{txt}\n<i>{tm}</i>" if tm else txt
+    if msg.role == "seller":
+        return f"<b>Вы:</b> {txt}\n<i>{tm}</i>" if tm else f"<b>Вы:</b> {txt}"
+    return f"<i>{txt}</i>"
+
+
+async def get_chat_bubbles_for_ui(
+    *,
+    user_id: int,
+    chat_id: str,
+    force_refresh: bool = False,
+    customer_only: bool = True,
+    include_seller: bool = False,
+    max_messages: int = 18,
+) -> list[str]:
+    th = await refresh_chat_thread(user_id=user_id, chat_id=chat_id, force=force_refresh, limit=DEFAULT_THREAD_LIMIT)
+    norm = normalize_thread_messages(th.raw_messages, customer_only=customer_only, include_seller=include_seller)
+
+    # показываем последние max_messages
+    tail = norm[-max(1, int(max_messages)) :]
+    bubbles = [_bubble_text(m) for m in tail if (m.text or "").strip()]
+
+    # если после фильтра стало пусто — вероятно, только системные сообщения
+    return bubbles
+
+
+__all__ = [
+    "resolve_chat_id",
+    "get_chats_table",
+    "refresh_chat_thread",
+    "load_older_messages",
+    "normalize_thread_messages",
+    "get_chat_bubbles_for_ui",
+    "NormalizedMessage",
+    "ThreadView",
+]
