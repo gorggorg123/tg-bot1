@@ -1,284 +1,674 @@
 # botapp/questions.py
+"""Helpers for loading and formatting customer questions from Ozon.
+
+Логика максимально похожа на модуль с отзывами:
+- кешируем вопросы по user_id,
+- поддерживаем категории (all / unanswered / answered),
+- даём удобные функции для main.py и keyboards.py.
+"""
+
 from __future__ import annotations
 
-import hashlib
-import html
 import logging
+import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Tuple, Optional
 
-from botapp.ozon_client import Question, QuestionAnswer, get_question_answers, get_questions_list
+from botapp.ozon_client import (
+    Question,
+    get_client,
+    get_question_answers,
+    get_questions_list,
+)
+from botapp.text_utils import safe_strip, safe_str
 
 logger = logging.getLogger(__name__)
 
-PAGE_SIZE = 8
-CACHE_TTL_SECONDS = 35
-DEFAULT_STATUS = "unanswered"
+# МСК: Ozon все даты отдаёт в UTC, но интерфейс — под МСК
+MSK_SHIFT = timedelta(hours=3)
+MSK_TZ = timezone(MSK_SHIFT)
+
+# Сколько вопросов на странице списка
+QUESTIONS_PAGE_SIZE = 10
+
+# Время жизни кеша списка вопросов
+SESSION_TTL = timedelta(minutes=2)
+
+
+# ---------------------------------------------------------------------------
+# Модель сессии вопросов на одного Telegram-пользователя
+# ---------------------------------------------------------------------------
 
 
 @dataclass
-class QuestionsCache:
-    fetched_at: datetime | None = None
-    all_questions: list[Question] = field(default_factory=list)
-    views: dict[str, list[str]] = field(default_factory=dict)
+class QuestionsSession:
+    """Кеш состояния по вопросам для одного пользователя Telegram."""
 
-    token_to_qid: dict[str, str] = field(default_factory=dict)
-    qid_to_token: dict[str, str] = field(default_factory=dict)
+    # Полный список вопросов, как пришёл от API
+    all: List[Question] = field(default_factory=list)
+    # Быстрые предфильтры
+    unanswered: List[Question] = field(default_factory=list)
+    answered: List[Question] = field(default_factory=list)
+
+    pretty_period: str = ""
+
+    # Текущие страницы по категориям (для возможной навигации)
+    page: Dict[str, int] = field(
+        default_factory=lambda: {"all": 0, "unanswered": 0, "answered": 0}
+    )
+
+    # Время загрузки кеша
+    loaded_at: datetime = field(default_factory=datetime.utcnow)
+
+    # Токены -> (category, index) для компактных callback_data
+    tokens: Dict[str, Tuple[str, int]] = field(default_factory=dict)
+
+    # Кеш текстов ответов по question.id, живёт вместе с сессией
+    answer_cache: Dict[str, Dict[str, Optional[str]]] = field(default_factory=dict)
 
 
-_USER_QCACHE: dict[int, QuestionsCache] = {}
+# user_id -> QuestionsSession
+_sessions: Dict[int, QuestionsSession] = {}
 
 
-def _qc(user_id: int) -> QuestionsCache:
-    c = _USER_QCACHE.get(user_id)
-    if c is None:
-        c = QuestionsCache()
-        _USER_QCACHE[user_id] = c
-    return c
+# ---------------------------------------------------------------------------
+# Вспомогательные функции для дат и человекочитаемых меток
+# ---------------------------------------------------------------------------
 
 
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+def _parse_date(value: Optional[str]) -> Optional[datetime]:
+    """Аккуратно парсим ISO-дату из API Ozon, возвращаем UTC-datetime."""
+    if not value:
+        return None
+    try:
+        # Ozon часто отдаёт "2025-11-27T09:07:33.288Z"
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo:
+        return dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=timezone.utc)
 
 
-def _cache_fresh(dt: datetime | None, ttl: int = CACHE_TTL_SECONDS) -> bool:
+def _to_msk(dt: Optional[datetime]) -> Optional[datetime]:
+    """Переводим datetime в МСК."""
     if not dt:
-        return False
-    return (_now_utc() - dt) <= timedelta(seconds=int(ttl))
+        return None
+    base = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return base.astimezone(MSK_TZ)
 
 
-def _escape(s: str) -> str:
-    return html.escape((s or "").strip())
-
-
-def _trim(s: str, n: int) -> str:
-    s = (s or "").strip()
-    if len(s) <= n:
-        return s
-    return s[: max(0, n - 1)].rstrip() + "…"
-
-
-def _short_token(user_id: int, question_id: str) -> str:
-    cache = _qc(user_id)
-    qid = str(question_id).strip()
-    if not qid:
+def _fmt_dt_msk(dt: Optional[datetime]) -> str:
+    """Форматируем дату в строку МСК вида 27.11.2025 12:34."""
+    if not dt:
         return ""
-    if qid in cache.qid_to_token:
-        return cache.qid_to_token[qid]
-    t = hashlib.blake2s(f"{user_id}:q:{qid}".encode("utf-8"), digest_size=8).hexdigest()
-    cache.qid_to_token[qid] = t
-    cache.token_to_qid[t] = qid
-    return t
+    msk = _to_msk(dt)
+    return msk.strftime("%d.%m.%Y %H:%M") if msk else ""
 
 
-def resolve_question_token(user_id: int, token: str | None) -> Question | None:
-    if not token:
-        return None
-    qid = _qc(user_id).token_to_qid.get(token)
-    if not qid:
-        return None
-    return find_question(user_id, qid)
+def _human_age(dt: Optional[datetime]) -> str:
+    """Человекочитаемый возраст даты: "сегодня", "вчера", "N дн. назад"."""
+    if not dt:
+        return ""
+    msk = _to_msk(dt)
+    if not msk:
+        return ""
+    today = datetime.now(MSK_TZ).date()
+    delta_days = (today - msk.date()).days
+    if delta_days < 0:
+        return "из будущего"
+    if delta_days == 0:
+        return "сегодня"
+    if delta_days == 1:
+        return "вчера"
+    return f"{delta_days} дн. назад"
 
 
-def resolve_question_id(user_id: int, question_id: str | None) -> Question | None:
-    if not question_id:
-        return None
-    return find_question(user_id, str(question_id).strip())
+# ---------------------------------------------------------------------------
+# Фильтрация и кеширование списков вопросов
+# ---------------------------------------------------------------------------
 
 
-def _build_views(items: list[Question]) -> dict[str, list[str]]:
-    all_ids: list[str] = []
-    answered: list[str] = []
-    unanswered: list[str] = []
-
-    for q in items:
-        if not q or not q.id:
-            continue
-        all_ids.append(q.id)
-        if bool(q.has_answer) or bool((q.answer_text or "").strip()):
-            answered.append(q.id)
-        else:
-            unanswered.append(q.id)
-
-    return {"all": all_ids, "answered": answered, "unanswered": unanswered}
+_CYRILLIC_RE = re.compile("[А-Яа-яЁё]")
 
 
-async def refresh_questions(user_id: int, *, force: bool = False) -> None:
-    cache = _qc(user_id)
-    if not force and cache.all_questions and _cache_fresh(cache.fetched_at):
+def _filter_by_category(items: List[Question], category: str) -> List[Question]:
+    """Фильтруем вопросы по UI-категории.
+
+    category:
+      - "all"         — без фильтра
+      - "unanswered"  — без ответа / не обработанные
+      - "answered"    — есть ответ / обработанные
+    """
+    cat = (category or "all").lower()
+
+    if cat == "unanswered":
+        # Ориентируемся на отсутствие текста ответа и статус != PROCESSED
+        return [
+            q
+            for q in items
+            if not getattr(q, "has_answer", False)
+            and (getattr(q, "status", "") or "").upper() != "PROCESSED"
+        ]
+
+    if cat == "answered":
+        return [
+            q
+            for q in items
+            if getattr(q, "has_answer", False)
+            or (getattr(q, "status", "") or "").upper() == "PROCESSED"
+            or safe_strip(getattr(q, "answer_text", None))
+        ]
+
+    # "all" — без фильтра
+    return items
+
+
+async def _prefetch_question_product_names(questions: List[Question]) -> None:
+    """Дополняем названия товаров для вопросов.
+
+    Основной способ — batch через /v3/product/info/list (sku/product_id), чтобы не плодить
+    десятки запросов и не зависеть от аналитики.
+    """
+
+    try:
+        client = get_client()
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Cannot init Ozon client for product names: %s", exc)
         return
 
-    items = await get_questions_list(status="all", limit=200, offset=0)
-    items = [q for q in items if q and q.id]
+    if not questions:
+        return
 
-    def _k(q: Question) -> float:
-        s = (q.updated_at or q.created_at or "").replace("Z", "+00:00")
+    # Вопросы с уже нормальным названием пропускаем
+    need: list[Question] = []
+    for q in questions:
+        existing = safe_strip(getattr(q, "product_name", None))
+        if existing and _CYRILLIC_RE.search(existing):
+            continue
+        need.append(q)
+
+    if not need:
+        return
+
+    skus: list[int] = []
+    pids: list[str] = []
+    for q in need:
+        sku_val = getattr(q, "sku", None)
+        if isinstance(sku_val, int):
+            skus.append(sku_val)
+        pid = safe_strip(getattr(q, "product_id", None))
+        if pid:
+            pids.append(pid)
+
+    def _uniq(seq):
+        seen=set()
+        out=[]
+        for x in seq:
+            if x in (None, ""):
+                continue
+            if x in seen:
+                continue
+            seen.add(x)
+            out.append(x)
+        return out
+
+    skus = _uniq(skus)
+    pids = _uniq(pids)
+
+    title_by_sku: dict[int, str] = {}
+    title_by_pid: dict[str, str] = {}
+
+    async def _fetch(kind: str, vals: list):
         try:
-            dt = datetime.fromisoformat(s)
-            if not dt.tzinfo:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.timestamp()
+            if kind == "sku":
+                items = await client.get_product_info_list(skus=vals)
+            else:
+                items = await client.get_product_info_list(product_ids=vals)
+        except Exception as exc:
+            logger.debug("Product info list (%s) failed: %s", kind, exc)
+            return
+        for it in items or []:
+            name = safe_strip(getattr(it, "name", None))
+            if not name:
+                continue
+            if getattr(it, "sku", None) is not None:
+                try:
+                    title_by_sku[int(it.sku)] = name
+                except Exception:
+                    pass
+            if getattr(it, "product_id", None):
+                title_by_pid[str(it.product_id)] = name
+
+    def _chunks(seq, n=80):
+        for i in range(0, len(seq), n):
+            yield seq[i:i+n]
+
+    for ch in _chunks(skus, 80):
+        await _fetch("sku", ch)
+    for ch in _chunks(pids, 80):
+        await _fetch("pid", ch)
+
+    for q in need:
+        existing = safe_strip(getattr(q, "product_name", None))
+        if existing and _CYRILLIC_RE.search(existing):
+            continue
+        sku_val = getattr(q, "sku", None)
+        if isinstance(sku_val, int) and sku_val in title_by_sku:
+            q.product_name = title_by_sku[sku_val]
+            continue
+        pid = safe_strip(getattr(q, "product_id", None))
+        if pid and pid in title_by_pid:
+            q.product_name = title_by_pid[pid]
+            continue
+
+    # Финальный точечный fallback (редко)
+    for q in need:
+        existing = safe_strip(getattr(q, "product_name", None))
+        if existing and _CYRILLIC_RE.search(existing):
+            continue
+        pid = safe_strip(getattr(q, "product_id", None))
+        if not pid:
+            continue
+        try:
+            name = await client.get_product_name(pid)
         except Exception:
-            return 0.0
-
-    items.sort(key=_k, reverse=True)
-
-    cache.all_questions = items
-    cache.views = _build_views(items)
-    cache.fetched_at = _now_utc()
-
-    cache.token_to_qid.clear()
-    cache.qid_to_token.clear()
-    for q in items:
-        _short_token(user_id, q.id)
+            name = None
+        if name:
+            q.product_name = name
 
 
-async def _ensure_cache(user_id: int) -> None:
-    c = _qc(user_id)
-    if not c.all_questions:
-        await refresh_questions(user_id, force=True)
+async def refresh_questions(user_id: int, category: str) -> List[Question]:
+    """Запрашиваем список вопросов с Ozon и обновляем кеш для пользователя.
+
+    Возвращаем список уже отфильтрованный по категории.
+    """
+    # Загружаем все вопросы один раз и фильтруем локально
+    questions = await get_questions_list(
+        status=None,
+        limit=200,
+        offset=0,
+    )
+
+    await _prefetch_question_product_names(questions)
+
+    session = _sessions.setdefault(user_id, QuestionsSession())
+    session.all = questions
+    session.unanswered = _filter_by_category(questions, "unanswered")
+    session.answered = _filter_by_category(questions, "answered")
+    session.loaded_at = datetime.utcnow()
+    session.tokens.clear()
+
+    dates_msk = []
+    for q in questions:
+        created = _parse_date(getattr(q, "created_at", None))
+        msk = _to_msk(created)
+        if msk:
+            dates_msk.append(msk)
+
+    if dates_msk:
+        start = min(dates_msk)
+        end = max(dates_msk)
+        session.pretty_period = f"{start:%d.%m.%Y} 00:00 — {end:%d.%m.%Y %H:%M} (МСК)"
+    else:
+        session.pretty_period = "период не определён"
+
+    return _filter_by_category(questions, category)
 
 
-def get_questions_pretty_period(user_id: int) -> str:
-    c = _qc(user_id)
-    if not c.fetched_at:
-        return "Вопросы"
-    stamp = c.fetched_at.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
-    return f"Вопросы (обновлено: {stamp})"
+def _get_session(user_id: int) -> QuestionsSession:
+    """Берём (или создаём) сессию по user_id."""
+    return _sessions.setdefault(user_id, QuestionsSession())
 
 
-def find_question(user_id: int, question_id: str) -> Question | None:
-    qid = str(question_id).strip()
-    if not qid:
+def _get_cached_questions(user_id: int, category: str) -> List[Question]:
+    """Возвращаем кешированный список вопросов, если TTL не истёк."""
+    session = _get_session(user_id)
+    if datetime.utcnow() - session.loaded_at > SESSION_TTL:
+        return []
+
+    cat = (category or "all").lower()
+    if cat == "unanswered":
+        return session.unanswered
+    if cat == "answered":
+        return session.answered
+    return session.all
+
+
+async def ensure_question_answer_text(question: Question, user_id: Optional[int] = None) -> None:
+    """Догружает текст ответа для вопроса, если он отмечен как отвеченный."""
+
+    if not getattr(question, "has_answer", False):
+        return
+
+    if safe_strip(getattr(question, "answer_text", None)):
+        return
+
+    session = _sessions.get(user_id) if user_id is not None else None
+    cached = None
+    if session:
+        cached = session.answer_cache.get(question.id)
+    if cached:
+        question.answer_text = cached.get("text") or question.answer_text
+        question.answer_id = cached.get("answer_id") or question.answer_id
+        question.has_answer = bool(question.answer_text)
+        question.answers_count = question.answers_count or cached.get("answers_count")
+        question.answer_created_at = cached.get("answer_created_at") or getattr(question, "answer_created_at", None)
+        return
+
+    try:
+        answers = await get_question_answers(question.id, limit=1)
+    except Exception as exc:  # pragma: no cover - сеть/формат
+        logger.warning("Failed to fetch answer text for %s: %s", question.id, exc)
+        return
+
+    if not answers:
+        return
+
+    first = answers[0]
+    question.answer_text = first.text or question.answer_text
+    question.answer_id = first.id or question.answer_id
+    question.has_answer = bool(question.answer_text)
+    question.answers_count = question.answers_count or len(answers)
+
+    if session:
+        session.answer_cache[question.id] = {
+            "text": question.answer_text,
+            "answer_id": question.answer_id,
+            "answer_created_at": getattr(question, "answer_created_at", None),
+            "answers_count": question.answers_count,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Пагинация и таблица списка вопросов
+# ---------------------------------------------------------------------------
+
+
+async def get_questions_table(
+    *,
+    user_id: int,
+    category: str,
+    page: int = 0,
+) -> tuple[str, List[tuple[str, str, int]], int, int]:
+    """Вернуть (text, items, current_page, total_pages) для списка вопросов."""
+
+    questions = _get_cached_questions(user_id, category)
+    if not questions:
+        questions = await refresh_questions(user_id, category)
+
+    session = _get_session(user_id)
+    pretty_period = session.pretty_period or "период не определён"
+
+    text, items, safe_page, total_pages = build_questions_table(
+        cards=questions,
+        pretty_period=pretty_period,
+        category=(category or "all").lower(),
+        page=page,
+        page_size=QUESTIONS_PAGE_SIZE,
+    )
+
+    return text, items, safe_page, total_pages
+
+
+# ---------------------------------------------------------------------------
+# Поиск вопроса по индексу / ID
+# ---------------------------------------------------------------------------
+
+
+def get_question_by_index(user_id: int, category: str, index: int) -> Optional[Question]:
+    """Вернуть вопрос по абсолютному индексу в кешированном списке категории."""
+    questions = _get_cached_questions(user_id, category)
+    if not questions:
         return None
-    for q in _qc(user_id).all_questions:
-        if q.id == qid:
-            return q
+    if 0 <= index < len(questions):
+        return questions[index]
     return None
 
 
-async def ensure_question_answer_text(q: Question, *, user_id: int) -> None:
-    if not q or not q.id:
-        return
-    if (q.answer_text or "").strip():
-        return
-    if not bool(q.has_answer):
-        return
-
-    sku = None
-    try:
-        sku = int(q.sku) if (q.sku or "").isdigit() else None
-    except Exception:
-        sku = None
-
-    try:
-        answers = await get_question_answers(q.id, sku=sku, limit=1)
-    except Exception:
-        return
-    if not answers:
-        return
-    a = answers[0]
-    if (a.text or "").strip():
-        q.answer_text = a.text
-        q.answer_id = a.id
-        q.has_answer = True
+def get_question_index(user_id: int, category: str, question_id: str) -> Optional[int]:
+    """Найти абсолютный индекс вопроса по его Ozon ID в кешированном списке."""
+    questions = _get_cached_questions(user_id, category)
+    for idx, q in enumerate(questions):
+        if str(getattr(q, "id", "")) == str(question_id):
+            return idx
+    return None
 
 
-def get_question_by_index(user_id: int, category: str, index: int) -> tuple[Question | None, int, int]:
-    c = _qc(user_id)
-    ids = c.views.get(category) or c.views.get(DEFAULT_STATUS) or c.views.get("all") or []
-    total = len(ids)
-    if total == 0:
-        return None, 0, 0
-    idx = max(0, min(int(index), total - 1))
-    qid = ids[idx]
-    return find_question(user_id, qid), idx, total
+def find_question(user_id: int, question_id: str) -> Optional[Question]:
+    """Поиск вопроса по его Ozon ID во всех кешированных списках сессии."""
+    session = _get_session(user_id)
+    for pool in (session.all, session.unanswered, session.answered):
+        for q in pool:
+            if str(getattr(q, "id", "")) == str(question_id):
+                return q
+    return None
 
 
-def _label_for_list_item(q: Question) -> str:
-    prefix = "🟡" if not (q.has_answer or (q.answer_text or "").strip()) else "✅"
-    prod = _trim((q.product_name or "").replace("\n", " "), 22)
-    text = _trim((q.question_text or "").replace("\n", " "), 46)
-    if prod:
-        return f"{prefix} {prod}: {text}"
-    return f"{prefix} {text}"
+def resolve_question_id(user_id: int, question_id: str) -> Optional[Question]:
+    """Backward-совместимый helper: сейчас просто find_question."""
+    return find_question(user_id, question_id)
 
 
-async def get_questions_table(*, user_id: int, category: str, page: int) -> tuple[str, list[dict], int, int]:
-    await _ensure_cache(user_id)
-    c = _qc(user_id)
-
-    ids = c.views.get(category) or c.views.get(DEFAULT_STATUS) or c.views.get("all") or []
-    total = len(ids)
-
-    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-    safe_page = max(0, min(int(page), total_pages - 1))
-
-    start = safe_page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    page_ids = ids[start:end]
-
-    items: list[dict] = []
-    for i, qid in enumerate(page_ids, start=start):
-        q = find_question(user_id, qid)
-        if not q:
-            continue
-        token = _short_token(user_id, q.id)
-        items.append({"token": token, "label": _label_for_list_item(q), "index": i})
-
-    title = get_questions_pretty_period(user_id)
-    header = f"<b>{title}</b>\n"
-    header += f"Категория: <b>{_escape(category)}</b>\n"
-    header += f"Всего: <b>{total}</b> | Страница: <b>{safe_page + 1}/{total_pages}</b>\n\n"
-    header += "Выберите вопрос из списка ниже:"
-
-    return header, items, safe_page, total_pages
+# ---------------------------------------------------------------------------
+# Форматирование карточки вопроса
+# ---------------------------------------------------------------------------
 
 
-def format_question_card_text(q: Question, *, answer_override: str | None, period_title: str) -> str:
-    created = (q.created_at or "").strip()
-    sku = (q.sku or "").strip()
-    prod = _escape(q.product_name or "—")
-    qtext = _escape(q.question_text or "—")
+def format_question_card_text(
+    question: Question,
+    answer_override: Optional[str] = None,
+    answers_count: Optional[int] = None,
+    *,
+    period_title: str,
+) -> str:
+    """Карточка вопроса: показывает товар, вопрос, опубликованный ответ и/или черновик."""
 
-    has_answer = bool(q.has_answer) or bool((q.answer_text or "").strip())
-    status = "✅ С ответом" if has_answer else "🟡 Без ответа"
+    created = _parse_date(getattr(question, "created_at", None))
+    created_part = _fmt_dt_msk(created) or "дата неизвестна"
+    age = _human_age(created)
+    age_part = f" ({age})" if age else ""
 
-    ozon_answer = (q.answer_text or "").strip()
-    draft = (answer_override or "").strip()
+    product = safe_strip(getattr(question, "product_name", None)) or safe_strip(
+        getattr(question, "product_id", None) or getattr(question, "sku", None)
+    ) or "—"
 
-    parts: list[str] = []
-    parts.append(f"<b>{period_title}</b>")
-    parts.append(f"{status}")
-    parts.append(f"🆔 <code>{_escape(q.id)}</code>")
-    if created:
-        parts.append(f"🕒 {_escape(created)}")
-    if sku:
-        parts.append(f"SKU: <code>{_escape(sku)}</code>")
-    parts.append(f"🧾 Товар: {prod}")
+    qid = safe_strip(getattr(question, "id", None))
+    status = safe_strip(getattr(question, "status", None))
+    status_label = status.upper() if status else "СТАТУС НЕИЗВЕСТЕН"
 
-    parts.append("\n<b>Вопрос покупателя:</b>\n" + _trim(qtext, 3400))
+    question_text = safe_strip(getattr(question, "question_text", None)) or "—"
 
-    parts.append("\n<b>Ответ в Ozon:</b>\n" + (_trim(_escape(ozon_answer), 1800) if ozon_answer else "—"))
+    published_answer = safe_strip(getattr(question, "answer_text", None))
+    answer_dt_raw = safe_strip(getattr(question, "answer_created_at", None))
+    answer_dt = _fmt_dt_msk(_parse_date(answer_dt_raw)) if answer_dt_raw else None
 
+    lines: list[str] = []
+    lines.append(f"❓ Вопрос  •  {status_label}")
+    lines.append(f"📅 {created_part}{age_part}")
+    lines.append(f"🛒 Товар: {product}")
+    if qid:
+        lines.append(f"ID: {qid}")
+
+    lines.append("")
+    lines.append("Текст вопроса:")
+    lines.append(question_text)
+
+    if published_answer:
+        dt_part = f" • {answer_dt}" if answer_dt else ""
+        count_part = ""
+        if answers_count and answers_count > 1:
+            count_part = f" (сообщений: {answers_count})"
+        lines.append("")
+        lines.append(f"✅ Ответ продавца на Ozon{dt_part}{count_part}:")
+        lines.append(published_answer)
+
+    draft = safe_strip(answer_override)
     if draft:
-        parts.append("\n<b>Текущий черновик:</b>\n" + _trim(_escape(draft), 1800))
+        lines.append("")
+        lines.append("📄 Черновик ответа (не отправлен):")
+        lines.append(draft)
 
-    parts.append(
-        "\n<i>Подсказка:</i> «ИИ-ответ» генерирует черновик. "
-        "«Пересобрать» учитывает ваши пожелания. «Отправить» публикует ответ в Ozon."
-    )
-    return _trim("\n".join(parts), 3900)
+    if period_title:
+        lines.append("")
+        lines.append(f"Период: {period_title}")
+
+    return "\n".join(lines)
+
+
+def _slice_questions(items: List[Question], page: int, page_size: int) -> tuple[List[Question], int, int]:
+    total = len(items)
+    total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+    safe_page = max(0, min(page, total_pages - 1))
+    start = safe_page * page_size
+    end = start + page_size
+    return items[start:end], safe_page, total_pages
+
+
+def _status_badge_question(q: Question) -> tuple[str, str]:
+    if (
+        getattr(q, "has_answer", False)
+        or safe_strip(getattr(q, "answer_text", None))
+        or (getattr(q, "status", "") or "").upper() == "PROCESSED"
+    ):
+        return "✅", "Ответ есть"
+    return "✏️", "Без ответа"
+
+
+def _pick_short_product_label_question(q: Question) -> str:
+    raw_product_name = getattr(q, "product_name", None)
+    product_name = safe_strip(raw_product_name)
+    raw_sku = getattr(q, "sku", None)
+    sku = safe_strip(raw_sku)
+    if product_name:
+        return product_name[:50] + ("…" if len(product_name) > 50 else "")
+    if sku:
+        return f"Артикул: {sku}"
+    return "—"
+
+
+def build_questions_table(
+    *,
+    cards: List[Question],
+    pretty_period: str,
+    category: str,
+    page: int = 0,
+    page_size: int = QUESTIONS_PAGE_SIZE,
+) -> tuple[str, List[tuple[str, str, int]], int, int]:
+    """Собрать «старый» плотный список вопросов + кнопки выбора."""
+
+    TELEGRAM_TEXT_LIMIT = 4096
+    SNIP_Q = 140
+    SNIP_A = 80
+
+    slice_items, safe_page, total_pages = _slice_questions(cards, page, page_size)
+    category_label = {
+        "unanswered": "Без ответа",
+        "answered": "С ответом",
+        "all": "Все",
+    }.get(category, category)
+
+    header = [
+        f"🗂 Вопросы: {category_label}",
+        f"Период: {pretty_period}",
+        f"Страница: {safe_page + 1}/{max(total_pages,1)}",
+        "",
+    ]
+
+    rows: list[str] = []
+    items: list[tuple[str, str, int]] = []
+
+    for i, q in enumerate(slice_items, start=1 + safe_page * page_size):
+        created_at = _parse_date(getattr(q, "created_at", None))
+        date_part = _fmt_dt_msk(created_at) or "—"
+        status_text = safe_strip(getattr(q, "status", None)) or ""
+        status_label = status_text.upper() if status_text else "—"
+
+        product = safe_strip(getattr(q, "product_name", None)) or safe_strip(
+            getattr(q, "product_id", None) or getattr(q, "sku", None)
+        ) or "—"
+
+        q_text = safe_str(getattr(q, "question_text", None), max_len=SNIP_Q)
+        a_text = safe_str(getattr(q, "answer_text", None), max_len=SNIP_A)
+
+        has_answer = bool(getattr(q, "has_answer", False)) or bool(safe_strip(a_text))
+        badge = "✅" if has_answer else "🆕"
+
+        block = [
+            f"{i}) {badge} • {date_part} • {status_label}",
+            f"   🛒 {product}",
+            f"   ❓ {q_text}",
+        ]
+        if has_answer and a_text.strip("— "):
+            block.append(f"   ↪️ {a_text}")
+        rows.append("\n".join(block))
+
+        qid = safe_strip(getattr(q, "id", None))
+        if qid:
+            items.append((f"{badge} {i}", qid, i - 1))
+
+    text = "\n\n".join(header + rows).strip()
+    if len(text) > TELEGRAM_TEXT_LIMIT:
+        base = "\n\n".join(header).strip()
+        cur = base
+        trimmed=[]
+        for block in rows:
+            candidate = (cur + "\n\n" + block).strip()
+            if len(candidate) > TELEGRAM_TEXT_LIMIT - 80:
+                break
+            cur = candidate
+            trimmed.append(block)
+        text = (base + "\n\n" + "\n\n".join(trimmed)).strip()
+        if len(text) > TELEGRAM_TEXT_LIMIT:
+            text = text[: TELEGRAM_TEXT_LIMIT - 50].rstrip() + "\n…"
+
+    return text, items, safe_page, total_pages
+
+
+def get_questions_pretty_period(user_id: int) -> str:
+    session = _get_session(user_id)
+    return session.pretty_period or ""
+
+
+# ---------------------------------------------------------------------------
+# Токены для компактных callback_data
+# ---------------------------------------------------------------------------
+
+
+def register_question_token(user_id: int, category: str, index: int) -> str:
+    """Регистрируем короткий токен для ссылок на вопрос из callback_data.
+
+    Сохраняем в сессии отображение token -> (category, index).
+    """
+    session = _get_session(user_id)
+    token = uuid.uuid4().hex[:8]
+    session.tokens[token] = (category, index)
+    return token
+
+
+def resolve_question_token(user_id: int, token: str) -> Optional[Question]:
+    """Восстанавливаем объект Question по токену, если он ещё в кеше."""
+    session = _get_session(user_id)
+    category_index = session.tokens.get(token)
+    if not category_index:
+        return None
+    category, index = category_index
+    return get_question_by_index(user_id, category, index)
 
 
 __all__ = [
     "refresh_questions",
-    "get_questions_pretty_period",
     "get_questions_table",
+    "get_question_by_index",
+    "get_question_index",
+    "get_questions_pretty_period",
+    "find_question",
+    "resolve_question_id",
     "format_question_card_text",
     "ensure_question_answer_text",
-    "find_question",
-    "get_question_by_index",
+    "register_question_token",
     "resolve_question_token",
-    "resolve_question_id",
 ]
+
