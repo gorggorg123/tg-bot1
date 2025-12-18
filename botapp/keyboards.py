@@ -30,6 +30,82 @@ class ChatCallbackData(CallbackData, prefix="c"):
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Инлайн-меню главных разделов."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📊 Финансы сегодня",
+                    callback_data=MenuCallbackData(
+                        section="fin_today",
+                        action="open",
+                    ).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📦 FBO за сегодня",
+                    callback_data=MenuCallbackData(
+                        section="fbo",
+                        action="summary",
+                    ).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⭐ Отзывы",
+                    callback_data=ReviewsCallbackData(
+                        action="list",
+                        category="all",
+                        page=0,
+                    ).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❓ Вопросы",
+                    callback_data=QuestionsCallbackData(
+                        action="list",
+                        category="all",
+                        page=0,
+                    ).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💬 Чаты с покупателями",
+                    callback_data=MenuCallbackData(
+                        section="chats",
+                        action="open",
+                    ).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🏬 Склад",
+                    callback_data=MenuCallbackData(
+                        section="warehouse",
+                        action="open",
+                    ).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⚙️ Аккаунт Ozon",
+                    callback_data=MenuCallbackData(
+                        section="account",
+                        action="open",
+                    ).pack(),
+                )
+            ],
+        ]
+    )
+
+
+def back_home_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура с одной кнопкой возврата в главное меню."""
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⭐ Отзывы", callback_data=MenuCallbackData(section="reviews").pack())],

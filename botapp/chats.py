@@ -78,16 +78,47 @@ class NormalizedMessage:
     raw: dict | None = None
 
 
-_USER_CACHE: dict[int, ChatsCache] = {}
-_USER_THREADS: dict[tuple[int, str], ThreadCache] = {}
+def _classify_chat(chat: dict) -> tuple[bool, bool]:
+    """Определить, является ли чат покупательским.
+
+    Возвращает кортеж (is_buyer, recognized), где recognized=True означает, что
+    решение было принято по явным правилам, а False — это консервативный фолбэк.
+    """
+
+    if not isinstance(chat, dict):
+        return False, False
+
+    raw = chat.get("_raw") if isinstance(chat.get("_raw"), dict) else {}
+
+    # 1) Явные служебные типы
+    chat_type = raw.get("chat_type") or raw.get("type")
+    if isinstance(chat_type, str) and chat_type.lower() in {"support", "ozon_support", "service"}:
+        return False, True
+
+    # 2) Явные признаки покупателя
+    buyer_block = chat.get("buyer") if isinstance(chat.get("buyer"), dict) else None
+    if not buyer_block and isinstance(raw.get("buyer"), dict):
+        buyer_block = raw["buyer"]
+    if buyer_block and buyer_block.get("name"):
+        return True, True
+
+    for key in ("posting_number", "order_id", "buyer_id", "customer_id"):
+        value = chat.get(key)
+        if value:
+            return True, True
+        raw_value = raw.get(key)
+        if raw_value:
+            return True, True
+
+    # 3) Ничего не нашли — консервативно False
+    return False, False
 
 
-def _cc(user_id: int) -> ChatsCache:
-    c = _USER_CACHE.get(user_id)
-    if c is None:
-        c = ChatsCache()
-        _USER_CACHE[user_id] = c
-    return c
+def is_buyer_chat(chat: dict) -> bool:
+    """Отфильтровать служебные/системные чаты и оставить только покупательские."""
+
+    is_buyer, _ = _classify_chat(chat)
+    return is_buyer
 
 
 def _tc(user_id: int, chat_id: str) -> ThreadCache:
@@ -220,12 +251,94 @@ async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = Fals
     cache = _cc(user_id)
     total = len(cache.chats)
 
-    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-    safe_page = max(0, min(int(page), total_pages - 1))
+    sorted_items = sorted(items_raw, key=_chat_sort_key, reverse=True)
+    total_loaded = len(sorted_items)
 
-    start = safe_page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    chunk = cache.chats[start:end]
+    classifications: dict[int, tuple[bool, bool]] = {}
+    buyer_count = 0
+    service_count = 0
+    unknown_count = 0
+    for chat in sorted_items:
+        chat_dict = chat if isinstance(chat, dict) else {}
+        is_buyer, recognized = _classify_chat(chat_dict)
+        classifications[id(chat)] = (is_buyer, recognized)
+        if is_buyer:
+            buyer_count += 1
+        elif recognized:
+            service_count += 1
+        else:
+            unknown_count += 1
+
+    buyer_chats = [chat for chat in sorted_items if classifications.get(id(chat), (False, False))[0]]
+    visible_items = sorted_items if show_service else buyer_chats
+    logger.debug(
+        "Chats list filter applied (show_service=%s): total=%s, after_filter=%s",
+        show_service,
+        total_loaded,
+        len(visible_items),
+    )
+    logger.debug(
+        "Chats classification stats: total=%s, buyer=%s, non_buyer=%s, unknown=%s",
+        total_loaded,
+        buyer_count,
+        service_count,
+        unknown_count,
+    )
+
+    cache: dict[str, dict] = {}
+    for chat in visible_items:
+        cid = _safe_chat_id(chat)
+        if cid:
+            cache[cid] = chat if isinstance(chat, dict) else {}
+
+    filtered_items = [chat for chat in visible_items if not unread_flag or _chat_unread_count(chat) > 0]
+    total_count = len(visible_items)
+    unread_total = sum(1 for chat in visible_items if _chat_unread_count(chat) > 0)
+    total_pages = max(1, math.ceil(max(1, len(filtered_items)) / CHAT_PAGE_SIZE))
+    safe_page = 0 if page >= total_pages else max(0, min(page, total_pages - 1))
+    start = safe_page * CHAT_PAGE_SIZE
+    end = start + CHAT_PAGE_SIZE
+    page_slice = filtered_items[start:end]
+
+    display_rows: list[str] = []
+    keyboard_items: list[tuple[str, str]] = []
+    history_cache = data.get("chat_history") if isinstance(data.get("chat_history"), list) else None
+    history_chat_id = data.get("current_chat_id")
+    for idx, chat in enumerate(page_slice, start=start + 1):
+        cid_history = history_cache if history_chat_id == _safe_chat_id(chat) else None
+        chat_id_val, title, short_title, unread_count, preview, last_dt = _chat_display(
+            chat, history=cid_history
+        )
+        if not chat_id_val:
+            continue
+        is_service_chat = not classifications.get(id(chat), (False, False))[0]
+        badge = f"🔴{unread_count}" if unread_count > 0 else "⚪"
+        ts_label = last_dt.strftime("%d.%m %H:%M") if last_dt else ""
+        preview_label = preview or ""
+        display_title = f"🛠 {title}" if show_service and is_service_chat else title
+        line_parts = [
+            f"{idx}) {badge} {display_title}",
+            ts_label,
+            preview_label,
+        ]
+        display_rows.append(" | ".join([part for part in line_parts if part]))
+        kb_caption_parts = [badge, _truncate_text(display_title, limit=30)]
+        if ts_label:
+            kb_caption_parts.append(ts_label)
+        if preview_label:
+            kb_caption_parts.append(_truncate_text(preview_label, limit=50))
+        kb_caption = " | ".join(kb_caption_parts)
+        keyboard_items.append((chat_id_val, kb_caption))
+
+    lines = ["💬 Чаты с покупателями"]
+    lines.append(f"Всего: {total_count} | Непрочитано: {unread_total}")
+    lines.append(
+        "Фильтр: "
+        + ("все" if show_service else "только покупатели")
+        + f" | Только непрочитанные: {'ON' if unread_flag else 'OFF'}"
+    )
+    lines.append(f"Стр. {safe_page + 1}/{total_pages}")
+    lines.append("")
 
     items: list[dict] = []
     for c in chunk:

@@ -244,10 +244,196 @@ async def refresh_reviews(user_id: int, *, force: bool = False) -> None:
     cache.views = _build_views(items)
     cache.fetched_at = _now_utc()
 
-    cache.token_to_rid.clear()
-    cache.rid_to_token.clear()
-    for r in items:
-        _short_token(user_id, r.id)
+    seller_comments.sort(key=lambda x: x[0] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    latest_dt, latest_text = seller_comments[0]
+    card.answer_text = latest_text
+    card.answer_created_at = latest_dt or card.answer_created_at
+    card.status = card.status or "ANSWERED"
+    card.answered = True
+
+
+def _calc_stats(cards: List[ReviewCard]) -> Tuple[int, float, Dict[int, int]]:
+    dist = {i: 0 for i in range(1, 6)}
+    total = 0
+    sum_rating = 0.0
+    for c in cards:
+        if 1 <= c.rating <= 5:
+            dist[c.rating] += 1
+            total += 1
+            sum_rating += c.rating
+    avg = (sum_rating / total) if total else 0.0
+    return total, avg, dist
+
+
+def _product_article(card: ReviewCard) -> tuple[str | None, str | None]:
+    if card.offer_id:
+        return "SKU", card.offer_id
+    if card.product_id:
+        return "ID", card.product_id
+    return None, None
+
+
+def _pick_product_label(card: ReviewCard) -> str:
+    product = safe_strip(card.product_name)
+    article_label, article_value = _product_article(card)
+
+    if product and article_label and article_value:
+        return f"{product} ({article_label}: {article_value})"
+    if product and card.product_id:
+        return f"{product} (ID: {card.product_id})"
+    if product:
+        return product
+    if article_label and article_value:
+        title = "Артикул" if article_label == "SKU" else article_label
+        return f"{title}: {article_value}"
+    if card.product_id:
+        return f"ID: {card.product_id}"
+    return "— (название недоступно)"
+
+
+def _pick_short_product_label(card: ReviewCard) -> str:
+    """Короткое имя товара для таблицы."""
+
+    name_raw = card.product_name
+    name = safe_strip(name_raw) if name_raw is not None else ""
+
+    article_label, article_value = _product_article(card)
+
+    if name:
+        return name[:47] + "…" if len(name) > 50 else name
+    if article_label and article_value:
+        title = "Артикул" if article_label == "SKU" else article_label
+        return f"{title}: {article_value}"
+    if card.product_id:
+        return f"ID: {card.product_id}"
+    return "—"
+
+
+async def ensure_review_product_name(card: ReviewCard) -> None:
+    """Попробовать подтянуть название товара для карточки отзыва."""
+
+    if not card or safe_strip(card.product_name):
+        return
+
+    product_id = card.offer_id or card.product_id
+    if not product_id:
+        return
+
+    try:
+        client = get_client()
+    except Exception as exc:  # pragma: no cover - нет кредов/клиента
+        logger.debug("Cannot init Ozon client for review product: %s", exc)
+        return
+
+    try:
+        name = await client.get_product_name(str(product_id))
+    except Exception as exc:  # pragma: no cover - сеть/HTTP
+        logger.debug("Failed to load product name for review %s: %s", card.id, exc)
+        return
+
+    if name:
+        card.product_name = name
+
+
+def format_review_card_text(
+    *,
+    card: ReviewCard,
+    index: int,
+    total: int,
+    period_title: str,
+    user_id: int,
+    current_answer: str | None = None,
+) -> str:
+    """Сформировать карточку одного отзыва с блоком текущего ответа."""
+
+    date_line = _fmt_dt_msk(card.created_at)
+    stars = f"{card.rating}★" if card.rating else "—"
+    product_line = _pick_product_label(card)
+    status_icon, status_label = _status_badge(card)
+    answer_text = safe_strip(current_answer) or safe_strip(card.answer_text)
+    answer_dt = _fmt_dt_msk(card.answer_created_at)
+
+    title_parts = [f"{stars}"]
+    if date_line:
+        title_parts.append(date_line)
+    title = " • ".join(title_parts) if title_parts else "Отзыв"
+
+    text_body = card.text or "(пустой отзыв)"
+    answer_lines: list[str] = []
+    answer_block_title = "Ответ продавца"
+    if current_answer:
+        answer_block_title = "Черновик ответа"
+    elif is_answered(card, user_id):
+        answer_block_title = "Ответ продавца (опубликован на Ozon)"
+
+    if answer_text:
+        header = answer_block_title
+        if answer_dt:
+            header = f"Ответ продавца от {answer_dt}"
+        answer_lines.extend([header + ":", answer_text])
+    else:
+        answer_lines.append(f"{answer_block_title}: Ответа продавца пока нет.")
+
+    lines = [
+        f"{title} • {period_title}",
+        "",
+        f"Позиция: {product_line}",
+        "",
+        "Текст отзыва:",
+        text_body,
+        "",
+        f"Статус: {status_icon} {status_label}",
+        "",
+        *answer_lines,
+    ]
+    if card.id:
+        lines.insert(3, f"ID отзыва: {card.id}")
+
+    body = "\n".join(lines).strip()
+    return trim_for_telegram(body)
+
+
+def trim_for_telegram(text: str, max_len: int = TELEGRAM_SOFT_LIMIT) -> str:
+    if len(text) <= max_len:
+        return text
+    suffix = "… (обрезано)"
+    return text[: max_len - len(suffix)] + suffix
+
+
+def _iso_no_ms(dt: datetime) -> str:
+    """ISO-строка без миллисекунд с суффиксом Z для UTC."""
+
+    if dt.tzinfo:
+        dt = dt.astimezone(timezone.utc)
+    else:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _iso_date(dt: datetime) -> str:
+    if dt.tzinfo:
+        dt = dt.astimezone(timezone.utc)
+    return dt.date().isoformat()
+
+
+async def _resolve_product_names(
+    cards: List[ReviewCard],
+    client: OzonClient,
+    product_cache: Dict[str, str | None] | None = None,
+    *,
+    analytics_from: str | None = None,
+    analytics_to: str | None = None,
+) -> None:
+    cache = product_cache if product_cache is not None else {}
+
+    sku_set: set[str] = set()
+    for card in cards:
+        if not card.product_id and card.offer_id:
+            card.product_id = card.offer_id
+
+        sku = card.product_id
+        if not sku:
+            continue
 
 
 async def refresh_reviews_from_api(user_id: int) -> None:
@@ -348,10 +534,133 @@ async def get_reviews_table(*, user_id: int, category: str, page: int) -> tuple[
 async def get_review_and_card(user_id: int, category: str, *, index: int, review_id: str | None = None) -> tuple[ReviewsView, ReviewCard | None]:
     await refresh_reviews(user_id)
 
-    c = _rc(user_id)
-    ids = c.views.get(category) or c.views.get("all") or []
-    total = len(ids)
-    period = _pretty_period_title(c)
+    logger.info(
+        "Reviews date span (MSK): raw=%s filtered=%s | raw_span_utc=%s | year_counts=%s",
+        _range_summary_msk(raw_dates_msk),
+        _range_summary_msk(filtered_dates_msk),
+        _range_summary_msk(raw_dates_utc),
+        year_counts,
+    )
+
+    if stats.get("dropped_by_date") == len(cards) and cards:
+        logger.warning(
+            "All reviews dropped by date: window_msk=%s..%s, raw_span=%s",
+            since_msk,
+            to_msk,
+            _range_summary_msk(raw_dates_msk),
+        )
+
+    debug_dates = False
+    if debug_dates:
+        for sample in filtered_cards[:5]:
+            logger.info(
+                "Review debug: id=%s created_at_raw=%r created_at_parsed=%s created_at_msk=%s",
+                sample.id,
+                sample.raw_created_at,
+                sample.created_at,
+                _to_msk(sample.created_at),
+            )
+    logger.info(
+        "Reviews after filter: %s items for period=%s (МСК), filter=all | unanswered=%s | answered=%s | missing_dates=%s | dropped_by_date=%s",
+        len(filtered_cards),
+        pretty,
+        unanswered_count,
+        answered_count,
+        stats.get("missing_dates", 0),
+        stats.get("dropped_by_date", len(cards) - len(filtered_cards)),
+    )
+    return filtered_cards, pretty
+
+
+def _slice_cards(cards: List[ReviewCard], page: int, page_size: int) -> tuple[List[ReviewCard], int, int]:
+    total = len(cards)
+    total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+    safe_page = max(0, min(page, total_pages - 1))
+    start = safe_page * page_size
+    end = start + page_size
+    return cards[start:end], safe_page, total_pages
+
+
+def build_reviews_table(
+    *,
+    cards: List[ReviewCard],
+    pretty_period: str,
+    category: str,
+    user_id: int,
+    page: int = 0,
+    page_size: int = REVIEWS_PAGE_SIZE,
+) -> tuple[str, List[tuple[str, str | None, int]], int, int]:
+    """Собрать текст таблицы и кнопки для списка отзывов."""
+
+    SNIPPET_MAX_LEN = 100
+    category_label = {
+        "unanswered": "Без ответа",
+        "answered": "С ответом",
+    }.get((category or "all").lower(), "Все")
+
+    if not cards:
+        return (
+            "Отзывы не найдены за выбранный период.",
+            [],
+            0,
+            0,
+        )
+
+    slice_items, safe_page, total_pages = _slice_cards(cards, page, page_size)
+    rows: List[str] = [
+        "⭐ Отзывы покупателей",
+        f"Период: {pretty_period}",
+        "",
+        f"Категория: {category_label}",
+        "",
+        f"Страница {safe_page + 1}/{total_pages}",
+        "",
+    ]
+    items: List[tuple[str, str | None, int]] = []
+
+    for idx, card in enumerate(slice_items):
+        global_index = safe_page * page_size + idx
+        status_icon, status_text = _status_badge(card)
+        stars = f"{card.rating}★" if card.rating else "—"
+        product_short = safe_str(_pick_short_product_label(card))
+        snippet_raw = safe_strip(card.text)
+        snippet = snippet_raw or "—"
+        if len(snippet) > SNIPPET_MAX_LEN:
+            snippet = snippet[: SNIPPET_MAX_LEN - 1] + "…"
+        date_part = _fmt_dt_msk(card.created_at) or "дата неизвестна"
+        age = _human_age(card.created_at)
+        age_part = f" ({age})" if age else ""
+        status_label = status_text.upper() if status_text else ""
+        label = (
+            f"{status_icon} {stars} | {date_part}{age_part} | "
+            f"Товар: {product_short} | {status_label or 'СТАТУС НЕИЗВЕСТЕН'}"
+        )
+        label = f"{label} | Отзыв: {snippet}"
+        token = _get_review_token(user_id, card.id)
+        items.append((label, token, global_index))
+
+    text = "\n".join(rows)
+    return trim_for_telegram(text), items, safe_page, total_pages
+
+
+def _build_review_view(cards: List[ReviewCard], index: int, pretty: str, user_id: int) -> ReviewView:
+    if not cards:
+        return ReviewView(
+            text="Отзывы за выбранный период не найдены.",
+            index=0,
+            total=0,
+            period=pretty,
+        )
+
+    safe_index = max(0, min(index, len(cards) - 1))
+    text = format_review_card_text(
+        card=cards[safe_index],
+        index=safe_index,
+        total=len(cards),
+        period_title=pretty,
+        user_id=user_id,
+    )
+    return ReviewView(text=text, index=safe_index, total=len(cards), period=pretty)
 
     if total == 0:
         return ReviewsView(text=f"<b>{period}</b>\n\nПока нет отзывов в категории <b>{_escape(category)}</b>.", period=period, total=0), None
@@ -434,5 +743,8 @@ __all__ = [
     "mark_review_answered",
     "encode_review_id",
     "resolve_review_id",
-    "find_review",
+    "format_review_card_text",
+    "build_reviews_preview",
+    "refresh_review_from_api",
+    "ensure_review_product_name",
 ]
