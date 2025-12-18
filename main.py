@@ -1,19 +1,13 @@
+# main.py
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
 from contextlib import suppress
-from datetime import datetime, timezone
-from typing import Dict, Tuple
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
-from fastapi import FastAPI
 from dotenv import load_dotenv
+from fastapi import FastAPI
 
 from botapp.account import get_account_info_text
 from botapp.finance import get_finance_today_text
@@ -109,12 +103,11 @@ except Exception:  # pragma: no cover - fallback for import issues during deploy
         manual = State()
         reprompt = State()
 
-load_dotenv()
+from botapp.config import load_ozon_config
+from botapp.ozon_client import close_clients, get_client, has_write_credentials
+from botapp.router import router as root_router
+from botapp.storage import flush_storage
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 logger = logging.getLogger("main")
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
@@ -1450,312 +1443,144 @@ async def cb_questions(callback: CallbackQuery, callback_data: QuestionsCallback
     )
 
 
-@router.message(ReviewAnswerStates.reprompt)
-async def handle_reprompt(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    review_id = data.get("review_id")
-    category = data.get("category") or "all"
-    page = int(data.get("page") or 0)
-    user_id = message.from_user.id
 
-    text_payload = (message.text or message.caption or "").strip()
-    if not text_payload:
-        await send_ephemeral_message(
-                message.bot,
-                chat_id=message.chat.id,
-                text="Ответ пустой, пришлите текст.",
-            user_id=user_id,
-        )
-        return
-
-    review, resolved_index = await get_review_by_id(user_id, category, review_id)
-    if not review:
-        await send_ephemeral_message(
-                message.bot,
-                chat_id=message.chat.id,
-                text="Не удалось найти отзыв для пересборки.",
-            user_id=user_id,
-        )
-        await delete_section_message(user_id, SECTION_REVIEW_PROMPT, message.bot, force=True)
-        await state.clear()
-        return
-
-    await _handle_ai_reply(
-        callback=message,  # type: ignore[arg-type]
-        category=category,
-        page=page,
-        review=review,
-        index=resolved_index or 0,
-        user_prompt=text_payload,
-    )
-    await delete_section_message(user_id, SECTION_REVIEW_PROMPT, message.bot, force=True)
-    await state.clear()
+def _env(*names: str, default: str = "") -> str:
+    for n in names:
+        v = (os.getenv(n) or "").strip()
+        if v:
+            return v
+    return (default or "").strip()
 
 
-@router.message(ReviewAnswerStates.manual)
-async def handle_manual_answer(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    review_id = data.get("review_id")
-    category = data.get("category") or "all"
-    page = int(data.get("page") or 0)
-    user_id = message.from_user.id
-
-    text = (message.text or message.caption or "").strip()
-    if not text:
-        await send_ephemeral_message(
-                message.bot,
-                chat_id=message.chat.id,
-                text="Ответ пустой, пришлите текст.",
-            user_id=user_id,
-        )
-        return
-
-    await delete_section_message(user_id, SECTION_REVIEW_PROMPT, message.bot, force=True)
-    await state.clear()
-    await _remember_local_answer(user_id, review_id, text)
-    await _send_review_card(
-        user_id=user_id,
-        category=category,
-        index=0,
-        message=message,
-        review_id=review_id,
-        page=page,
-        answer_override=text,
+def setup_logging() -> None:
+    level = _env("LOG_LEVEL", default="INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
 
-@router.message(QuestionAnswerStates.reprompt)
-async def handle_question_reprompt(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    question_token = data.get("question_token")
-    question_id = data.get("question_id")
-    category = data.get("category") or "all"
-    page = int(data.get("page") or 0)
-    user_id = message.from_user.id
+def validate_env() -> None:
+    """
+    Фейлимся заранее, чтобы не ловить “странные” ошибки по месту.
+    """
+    token = _env("TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("Не задан TG_BOT_TOKEN (или TELEGRAM_BOT_TOKEN).")
 
-    text_payload = (message.text or message.caption or "").strip()
-    if not text_payload:
-        await send_ephemeral_message(
-                message.bot,
-                chat_id=message.chat.id,
-                text="Ответ пустой, пришлите текст.",
-            user_id=user_id,
+    cfg = load_ozon_config()
+    if not cfg.client_id or not cfg.api_key:
+        raise RuntimeError(
+            "Не заданы OZON credentials (OZON_CLIENT_ID/OZON_API_KEY или OZON_SELLER_CLIENT_ID/OZON_SELLER_API_KEY)."
         )
-        return
 
-    question = resolve_question_token(user_id, question_token) if question_token else None
-    if question is None and question_id:
-        question = find_question(user_id, question_id) or await api_get_question_by_id(
-            question_id
+    # OpenAI — не делаем fatal, но предупреждаем (ИИ-кнопки будут падать при вызове)
+    if not _env("OPENAI_API_KEY"):
+        logger.warning("OPENAI_API_KEY не задан — ИИ-генерация будет недоступна.")
+
+    if not has_write_credentials():
+        logger.warning(
+            "Write-доступ к Ozon не задан (OZON_WRITE_* / OZON_SELLER_WRITE_*). "
+            "Отправка ответов/сообщений будет недоступна."
         )
-    if not question:
-        await send_ephemeral_message(
-                message.bot,
-                chat_id=message.chat.id,
-                text="Не удалось найти вопрос для пересборки.",
-            user_id=user_id,
-        )
-        await delete_section_message(user_id, SECTION_QUESTION_PROMPT, message.bot, force=True)
-        await state.clear()
-        return
-
-    previous = get_last_question_answer(user_id, question.id) or question.answer_text
-    prompt = text_payload
-    ai_answer = await generate_answer_for_question(
-        question_text=question.question_text,
-        product_name=question.product_name,
-        existing_answer=previous,
-        user_prompt=prompt,
-    )
-    _remember_question_answer(user_id, question.id, ai_answer, status="ai_edited")
-    upsert_question_answer(
-        question_id=question.id,
-        created_at=question.created_at,
-        sku=question.sku,
-        product_name=question.product_name,
-        question=question.question_text,
-        answer=ai_answer,
-        answer_source="ai_edited",
-        answer_sent_to_ozon=False,
-        meta={"chat_id": message.chat.id, "message_id": message.message_id},
-    )
-    await _send_question_card(
-        user_id=user_id,
-        category=category,
-        page=page,
-        message=message,
-        answer_override=ai_answer,
-        token=question_token,
-        question=question,
-    )
-    await delete_section_message(user_id, SECTION_QUESTION_PROMPT, message.bot, force=True)
-    await state.clear()
 
 
-@router.message(QuestionAnswerStates.manual)
-async def handle_question_manual(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    question_token = data.get("question_token")
-    question_id = data.get("question_id")
-    category = data.get("category") or "all"
-    page = int(data.get("page") or 0)
-    user_id = message.from_user.id
+def build_fsm_storage():
+    """
+    Опционально Redis FSM:
+      REDIS_URL=redis://:pass@host:6379/0
+    """
+    redis_url = _env("REDIS_URL")
+    if not redis_url:
+        return MemoryStorage()
 
-    text = (message.text or message.caption or "").strip()
-    if not text:
-        await send_ephemeral_message(
-                message.bot,
-                chat_id=message.chat.id,
-                text="Ответ пустой, пришлите текст.",
-            user_id=user_id,
-        )
-        return
-
-    question = resolve_question_token(user_id, question_token) if question_token else None
-    if question is None and question_id:
-        question = find_question(user_id, question_id) or await api_get_question_by_id(
-            question_id
-        )
-    if not question:
-        await send_ephemeral_message(
-                message.bot,
-                chat_id=message.chat.id,
-                text="Не удалось найти вопрос.",
-            user_id=user_id,
-        )
-        await delete_section_message(user_id, SECTION_QUESTION_PROMPT, message.bot, force=True)
-        await state.clear()
-        return
-
-    _remember_question_answer(user_id, question.id, text, status="manual")
-    upsert_question_answer(
-        question_id=question.id,
-        created_at=question.created_at,
-        sku=question.sku,
-        product_name=question.product_name,
-        question=question.question_text,
-        answer=text,
-        answer_source="manual",
-        answer_sent_to_ozon=False,
-        meta={"chat_id": message.chat.id, "message_id": message.message_id},
-    )
-    await _send_question_card(
-        user_id=user_id,
-        category=category,
-        page=page,
-        message=message,
-        answer_override=text,
-        token=question_token,
-        question=question,
-    )
-    await delete_section_message(user_id, SECTION_QUESTION_PROMPT, message.bot, force=True)
-    await state.clear()
+    try:
+        from aiogram.fsm.storage.redis import RedisStorage  # type: ignore
+        logger.info("Using Redis FSM storage")
+        return RedisStorage.from_url(redis_url)
+    except Exception as exc:
+        logger.warning("Failed to init RedisStorage (%s). Falling back to MemoryStorage.", exc)
+        return MemoryStorage()
 
 
-@router.message()
-async def handle_any(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await _clear_sections(
-        message.bot,
-        message.from_user.id,
-        [
-            SECTION_FBO,
-            SECTION_FINANCE_TODAY,
-            SECTION_ACCOUNT,
-            SECTION_REVIEWS_LIST,
-            SECTION_REVIEW_CARD,
-            SECTION_QUESTIONS_LIST,
-            SECTION_QUESTION_CARD,
-            SECTION_REVIEW_PROMPT,
-            SECTION_QUESTION_PROMPT,
-            SECTION_CHATS_LIST,
-            SECTION_CHAT_HISTORY,
-            SECTION_CHAT_PROMPT,
-        ],
-        force=True,
-    )
-    await send_section_message(
-        SECTION_MENU,
-        text="Выберите действие в меню ниже",
-        reply_markup=main_menu_keyboard(),
-        message=message,
-    )
+# -----------------------------------------------------------------------------
+# Global app/bot/dp (для uvicorn main:app)
+# -----------------------------------------------------------------------------
 
+setup_logging()
+validate_env()
 
-def build_dispatcher() -> Dispatcher:
-    dp = Dispatcher()
-    dp.include_router(chats_router)
-    dp.include_router(warehouse_router)
-    dp.include_router(router)
-    return dp
+TG_BOT_TOKEN = _env("TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
+ENABLE_TG_POLLING = _env("ENABLE_TG_POLLING", default="1") == "1"
+DROP_PENDING_UPDATES = _env("DROP_PENDING_UPDATES", default="1") in ("1", "true", "True", "yes", "YES")
 
+bot = Bot(token=TG_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=build_fsm_storage())
+dp.include_router(root_router)
 
-bot = Bot(
-    token=TG_BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
-dp = build_dispatcher()
 app = FastAPI()
 
+_polling_task: asyncio.Task | None = None
+_polling_lock = asyncio.Lock()
 
-async def start_bot() -> None:
-    """Стартуем polling один раз за процесс."""
 
+async def start_polling_once() -> None:
+    """
+    Стартуем polling ровно один раз на процесс.
+    """
     global _polling_task
     async with _polling_lock:
         if _polling_task and not _polling_task.done():
-            logger.info("Polling уже запущен, повторно не стартуем")
+            logger.info("Polling already running")
             return
-        if _polling_task and _polling_task.done():
-            _polling_task = None
-
-        # На Render запускается только один web-инстанс с ENABLE_TG_POLLING=1.
-        # Второй инстанс/воркер должен выставлять ENABLE_TG_POLLING=0, иначе Telegram
-        # вернёт TelegramConflictError из-за параллельного polling.
-        logger.info("Telegram bot polling started (single instance)")
         _polling_task = asyncio.create_task(
             dp.start_polling(
                 bot,
                 allowed_updates=dp.resolve_used_update_types(),
+                drop_pending_updates=DROP_PENDING_UPDATES,
             )
         )
 
     try:
         await _polling_task
     except asyncio.CancelledError:
-        logger.info("Polling task cancelled, shutting down")
+        raise
+    except Exception as exc:
+        logger.exception("Polling crashed: %s", exc)
         raise
 
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    logger.info("Startup: validating Ozon credentials")
+    logger.info("Startup: init Ozon client")
     get_client()
 
     if not ENABLE_TG_POLLING:
-        # Локально ставим ENABLE_TG_POLLING=0, чтобы не лезть в Telegram,
-        # пока прод на Render работает с ENABLE_TG_POLLING=1.
-        logger.info("Telegram polling is disabled by ENABLE_TG_POLLING=0")
+        logger.info("ENABLE_TG_POLLING=0 — Telegram polling disabled")
         return
 
-    logger.info("Startup: creating polling task")
-    asyncio.create_task(start_bot())
+    logger.info("Startup: starting Telegram polling task")
+    asyncio.create_task(start_polling_once())
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
-    logger.info("Shutdown: closing Ozon client and bot")
-    try:
-        client = get_client()
-    except Exception:
-        client = None
-    if client:
-        await client.aclose()
+    logger.info("Shutdown: flushing storage, stopping polling, closing clients")
+
+    with suppress(Exception):
+        flush_storage()
+
+    global _polling_task
     if _polling_task and not _polling_task.done():
         _polling_task.cancel()
         with suppress(asyncio.CancelledError):
             await _polling_task
-    await bot.session.close()
+
+    with suppress(Exception):
+        await close_clients()
+
+    with suppress(Exception):
+        await bot.session.close()
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -1763,15 +1588,9 @@ async def root() -> dict:
     return {"status": "ok", "detail": "Ozon bot is running"}
 
 
-@app.get("/reviews")
-async def reviews(days: int = 30) -> dict:
-    """HTTP-эндпоинт для выборки отзывов и названий товаров по SKU."""
-
-    return await build_reviews_preview(days=days)
+@app.get("/health")
+async def health() -> dict:
+    return {"ok": True}
 
 
-# Summary of latest changes:
-# - Added a safe fallback for QuestionAnswerStates import to prevent FSM NameErrors on deploy.
-# - Kept question list handling on Ozon-approved statuses with Pydantic parsing and user-facing warnings.
-
-__all__ = ["app", "bot", "dp", "router"]
+__all__ = ["app", "bot", "dp"]
