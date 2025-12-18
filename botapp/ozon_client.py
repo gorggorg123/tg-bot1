@@ -14,6 +14,9 @@ import httpx
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+# Разрешаем использовать поля с префиксом ``model_`` (ozonapi модели с model_id/model_info).
+BaseModel.model_config = ConfigDict(**dict(BaseModel.model_config), protected_namespaces=())
+
 try:  # ozonapi-async 0.19.x содержит seller_info, 0.1.0 — нет
     from ozonapi import SellerAPI
 except Exception:  # pragma: no cover - совместимость, если пакет не установлен
@@ -1417,6 +1420,10 @@ class ChatMessage(BaseModel):
         return data
 
 
+# Совместимость с устаревшим типом в botapp.chats.
+ChatListItem = dict[str, object]
+
+
 class ChatHistoryResponse(BaseModel):
     messages: list[dict] = Field(default_factory=list)
     items: list[dict] | None = None
@@ -1460,6 +1467,7 @@ async def chat_list(
     chat_status: str = "ALL",
     unread_only: bool = False,
     include_service: bool = False,
+    refresh: bool | None = None,  # backward-compatible no-op
 ) -> list[dict]:
     """List chats (v2).
 
@@ -1810,6 +1818,18 @@ def get_write_client() -> OzonClient | None:
     return get_client()
 
 
+async def close_clients() -> None:
+    """Закрыть общий http‑клиент и сбросить кеш."""
+
+    global _client_read
+    if _client_read is not None:
+        try:
+            await _client_read.aclose()
+        except Exception:  # pragma: no cover - best effort
+            logger.warning("Failed to close Ozon client HTTP session", exc_info=True)
+        _client_read = None
+
+
 # ---------- Questions helpers ----------
 
 
@@ -1926,7 +1946,7 @@ class Question:
     question_text: str
     answer_text: str | None
     answer_created_at: str | None = None
-    status: str | None
+    status: str | None = None
     has_answer: bool = False
     answer_id: str | None = None
     answers_count: int | None = None
@@ -2265,6 +2285,3 @@ async def get_question_by_id(question_id: str) -> Question | None:
         if q.id == question_id:
             return q
     return None
-
-
-

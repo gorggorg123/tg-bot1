@@ -280,7 +280,7 @@ async def _prefetch_question_product_names(questions: List[Question]) -> None:
             q.product_name = name
 
 
-async def refresh_questions(user_id: int, category: str) -> List[Question]:
+async def refresh_questions(user_id: int, category: str = "all", *, force: bool = False) -> List[Question]:
     """Запрашиваем список вопросов с Ozon и обновляем кеш для пользователя.
 
     Возвращаем список уже отфильтрованный по категории.
@@ -671,4 +671,3 @@ __all__ = [
     "register_question_token",
     "resolve_question_token",
 ]
-
