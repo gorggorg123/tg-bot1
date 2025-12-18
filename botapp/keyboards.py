@@ -110,7 +110,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                     text="❓ Вопросы",
                     callback_data=QuestionsCallbackData(
                         action="list",
-                        category="unanswered",
+                        category="all",
                         page=0,
                     ).pack(),
                 )

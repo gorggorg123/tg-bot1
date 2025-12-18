@@ -690,6 +690,32 @@ def _pick_short_product_label(card: ReviewCard) -> str:
     return "—"
 
 
+async def ensure_review_product_name(card: ReviewCard) -> None:
+    """Попробовать подтянуть название товара для карточки отзыва."""
+
+    if not card or safe_strip(card.product_name):
+        return
+
+    product_id = card.offer_id or card.product_id
+    if not product_id:
+        return
+
+    try:
+        client = get_client()
+    except Exception as exc:  # pragma: no cover - нет кредов/клиента
+        logger.debug("Cannot init Ozon client for review product: %s", exc)
+        return
+
+    try:
+        name = await client.get_product_name(str(product_id))
+    except Exception as exc:  # pragma: no cover - сеть/HTTP
+        logger.debug("Failed to load product name for review %s: %s", card.id, exc)
+        return
+
+    if name:
+        card.product_name = name
+
+
 def format_review_card_text(
     *,
     card: ReviewCard,
@@ -705,7 +731,7 @@ def format_review_card_text(
     stars = f"{card.rating}★" if card.rating else "—"
     product_line = _pick_product_label(card)
     status_icon, status_label = _status_badge(card)
-    answer_text = current_answer or card.answer_text
+    answer_text = safe_strip(current_answer) or safe_strip(card.answer_text)
     answer_dt = _fmt_dt_msk(card.answer_created_at)
 
     title_parts = [f"{stars}"]
@@ -715,13 +741,19 @@ def format_review_card_text(
 
     text_body = card.text or "(пустой отзыв)"
     answer_lines: list[str] = []
+    answer_block_title = "Ответ продавца"
+    if current_answer:
+        answer_block_title = "Черновик ответа"
+    elif is_answered(card, user_id):
+        answer_block_title = "Ответ продавца (опубликован на Ozon)"
+
     if answer_text:
-        header = "Ответ продавца"
+        header = answer_block_title
         if answer_dt:
             header = f"Ответ продавца от {answer_dt}"
         answer_lines.extend([header + ":", answer_text])
     else:
-        answer_lines.append("Ответа продавца пока нет.")
+        answer_lines.append(f"{answer_block_title}: Ответа продавца пока нет.")
 
     lines = [
         f"{title} • {period_title}",
@@ -1019,6 +1051,12 @@ def build_reviews_table(
 ) -> tuple[str, List[tuple[str, str | None, int]], int, int]:
     """Собрать текст таблицы и кнопки для списка отзывов."""
 
+    SNIPPET_MAX_LEN = 100
+    category_label = {
+        "unanswered": "Без ответа",
+        "answered": "С ответом",
+    }.get((category or "all").lower(), "Все")
+
     if not cards:
         return (
             "Отзывы не найдены за выбранный период.",
@@ -1028,17 +1066,26 @@ def build_reviews_table(
         )
 
     slice_items, safe_page, total_pages = _slice_cards(cards, page, page_size)
-    rows: List[str] = [f"⭐ Отзывы ({category})", pretty_period, ""]
+    rows: List[str] = [
+        "⭐ Отзывы покупателей",
+        f"Период: {pretty_period}",
+        "",
+        f"Категория: {category_label}",
+        "",
+        f"Страница {safe_page + 1}/{total_pages}",
+        "",
+    ]
     items: List[tuple[str, str | None, int]] = []
 
     for idx, card in enumerate(slice_items):
         global_index = safe_page * page_size + idx
         status_icon, status_text = _status_badge(card)
         stars = f"{card.rating}★" if card.rating else "—"
-        product_short = _pick_short_product_label(card)
-        snippet = safe_strip(card.text)
-        if len(snippet) > 50:
-            snippet = snippet[:47] + "…"
+        product_short = safe_str(_pick_short_product_label(card))
+        snippet_raw = safe_strip(card.text)
+        snippet = snippet_raw or "—"
+        if len(snippet) > SNIPPET_MAX_LEN:
+            snippet = snippet[: SNIPPET_MAX_LEN - 1] + "…"
         date_part = _fmt_dt_msk(card.created_at) or "дата неизвестна"
         age = _human_age(card.created_at)
         age_part = f" ({age})" if age else ""
@@ -1047,12 +1094,10 @@ def build_reviews_table(
             f"{status_icon} {stars} | {date_part}{age_part} | "
             f"Товар: {product_short} | {status_label or 'СТАТУС НЕИЗВЕСТЕН'}"
         )
-        if snippet:
-            label = f"{label} | {snippet}"
+        label = f"{label} | Отзыв: {snippet}"
         token = _get_review_token(user_id, card.id)
         items.append((label, token, global_index))
 
-    rows.append(f"Страница {safe_page + 1}/{total_pages}")
     text = "\n".join(rows)
     return trim_for_telegram(text), items, safe_page, total_pages
 
@@ -1371,5 +1416,5 @@ __all__ = [
     "format_review_card_text",
     "build_reviews_preview",
     "refresh_review_from_api",
+    "ensure_review_product_name",
 ]
-
