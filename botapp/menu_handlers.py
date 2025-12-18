@@ -7,7 +7,7 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-from botapp.keyboards import MenuCallbackData, main_menu_keyboard
+from botapp.keyboards import MenuCallbackData, back_home_keyboard, main_menu_keyboard
 from botapp.message_gc import (
     SECTION_ACCOUNT,
     SECTION_CHAT_HISTORY,
@@ -102,3 +102,31 @@ async def menu_alias(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await _close_all_sections(callback.message.bot, user_id, preserve_menu=False)
     await _show_menu(user_id=user_id, callback=callback)
+
+
+@router.callback_query(MenuCallbackData.filter(F.section == "fbo"))
+async def menu_fbo(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    await state.clear()
+    await _close_all_sections(callback.message.bot, user_id, preserve_menu=True)
+    await send_section_message(
+        SECTION_FBO,
+        user_id=user_id,
+        text="Раздел ФБО в разработке. Скоро добавим подробности.",
+        reply_markup=back_home_keyboard(),
+        callback=callback,
+    )
+
+
+@router.callback_query(MenuCallbackData.filter(F.section == "fin_today"))
+async def menu_finance(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    await state.clear()
+    await _close_all_sections(callback.message.bot, user_id, preserve_menu=True)
+    await send_section_message(
+        SECTION_FINANCE_TODAY,
+        user_id=user_id,
+        text="Финансы: раздел в разработке. Скоро здесь появится сводка.",
+        reply_markup=back_home_keyboard(),
+        callback=callback,
+    )

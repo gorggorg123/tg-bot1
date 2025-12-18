@@ -297,6 +297,16 @@ def resolve_review_id(user_id: int, review_ref: str | None) -> str | None:
     return mapping.get(review_ref, review_ref)
 
 
+def find_review(user_id: int, review_id: str | None) -> ReviewCard | None:
+    session = _sessions.get(user_id)
+    if not session or not review_id:
+        return None
+    for card in session.all_reviews:
+        if card.id == review_id:
+            return card
+    return None
+
+
 def encode_review_id(user_id: int, review_id: str | None) -> str | None:
     """Вернуть короткий токен для review_id."""
 
@@ -1118,6 +1128,7 @@ def build_reviews_table(
     cards: List[ReviewCard],
     pretty_period: str,
     category: str,
+    user_id: int | None = None,
     page: int = 0,
     page_size: int = REVIEWS_PAGE_SIZE,
 ) -> tuple[str, List[tuple[str, str, int]], int, int]:
@@ -1350,6 +1361,10 @@ async def refresh_reviews(user_id: int, client: OzonClient | None = None) -> Rev
     return session
 
 
+async def refresh_reviews_from_api(user_id: int, client: OzonClient | None = None) -> ReviewSession:
+    return await refresh_reviews(user_id, client or get_client())
+
+
 async def get_ai_reply_for_review(review: ReviewCard) -> str:
     return await generate_review_reply(
         review_text=review.text,
@@ -1511,4 +1526,3 @@ __all__ = [
     "build_reviews_preview",
     "refresh_review_from_api",
 ]
-
