@@ -114,6 +114,42 @@ def _classify_chat(chat: dict) -> tuple[bool, bool]:
     return False, False
 
 
+def _classify_chat(chat: dict) -> tuple[bool, bool]:
+    """Определить, является ли чат покупательским.
+
+    Возвращает кортеж (is_buyer, recognized), где recognized=True означает, что
+    решение было принято по явным правилам, а False — это консервативный фолбэк.
+    """
+
+    if not isinstance(chat, dict):
+        return False, False
+
+    raw = chat.get("_raw") if isinstance(chat.get("_raw"), dict) else {}
+
+    # 1) Явные служебные типы
+    chat_type = raw.get("chat_type") or raw.get("type")
+    if isinstance(chat_type, str) and chat_type.lower() in {"support", "ozon_support", "service"}:
+        return False, True
+
+    # 2) Явные признаки покупателя
+    buyer_block = chat.get("buyer") if isinstance(chat.get("buyer"), dict) else None
+    if not buyer_block and isinstance(raw.get("buyer"), dict):
+        buyer_block = raw["buyer"]
+    if buyer_block and buyer_block.get("name"):
+        return True, True
+
+    for key in ("posting_number", "order_id", "buyer_id", "customer_id"):
+        value = chat.get(key)
+        if value:
+            return True, True
+        raw_value = raw.get(key)
+        if raw_value:
+            return True, True
+
+    # 3) Ничего не нашли — консервативно False
+    return False, False
+
+
 def is_buyer_chat(chat: dict) -> bool:
     """Отфильтровать служебные/системные чаты и оставить только покупательские."""
 
