@@ -349,6 +349,32 @@ async def ensure_question_answer_text(question: Question, user_id: Optional[int]
         }
 
 
+async def ensure_question_product_name(question: Question) -> None:
+    """Попробовать дополнить вопрос названием товара для карточки/списка."""
+
+    if not question or safe_strip(getattr(question, "product_name", None)):
+        return
+
+    product_id = getattr(question, "product_id", None) or getattr(question, "sku", None)
+    if not product_id:
+        return
+
+    try:
+        client = get_client()
+    except Exception as exc:  # pragma: no cover - если нет кредов на чтение
+        logger.debug("Cannot init Ozon client for question product: %s", exc)
+        return
+
+    try:
+        name = await client.get_product_name(str(product_id))
+    except Exception as exc:  # pragma: no cover - сеть/HTTP
+        logger.debug("Failed to load product name for question %s: %s", question.id, exc)
+        return
+
+    if name:
+        question.product_name = name
+
+
 # ---------------------------------------------------------------------------
 # Пагинация и таблица списка вопросов
 # ---------------------------------------------------------------------------
@@ -444,9 +470,14 @@ def format_question_card_text(
 
     header_date = _fmt_dt_msk(created) or "—"
 
+    product_label = safe_str(product_name)
+    if not product_label:
+        pid = getattr(question, "product_id", None) or getattr(question, "sku", None)
+        product_label = safe_str(pid) or "—"
+
     lines: List[str] = [
         f"❓ • {header_date} • {period_title}",
-        f"Позиция: {product_name}{sku_part}",
+        f"Позиция: {product_label}{sku_part}",
         f"ID вопроса: {getattr(question, 'id', '—')}",
         "",
         "Текст вопроса:",
@@ -455,17 +486,22 @@ def format_question_card_text(
         or getattr(question, "message", None)
         or "—",
         "",
-        f"Статус: {status_icon} {status_text}",
-        "",
-        "Ответ продавца:",
     ]
 
     answer_text = safe_strip(answer_override) or safe_strip(getattr(question, "answer_text", None))
-
-    if not answer_text:
-        answer_text = "Ответа продавца пока нет."
-
-    lines.append(answer_text)
+    answer_block_title = "Ответ продавца"
+    if answer_override:
+        answer_block_title = "Черновик ответа"
+    elif getattr(question, "has_answer", False) or answer_text:
+        answer_block_title = "Ответ продавца (опубликован на Ozon)"
+    lines.extend(
+        [
+            f"Статус: {status_icon} {status_text}",
+            "",
+            f"{answer_block_title}:",
+            answer_text or "Ответа продавца пока нет.",
+        ]
+    )
 
     return "\n".join(lines)
 
@@ -511,10 +547,19 @@ def build_questions_table(
 ) -> tuple[str, List[tuple[str, str, int]], int, int]:
     """Собрать текст таблицы и кнопки для списка вопросов."""
 
+    SNIPPET_MAX_LEN = 100
+    TELEGRAM_TEXT_LIMIT = 4096
+
     slice_items, safe_page, total_pages = _slice_questions(cards, page, page_size)
+    category_label = {
+        "unanswered": "Без ответа",
+        "answered": "С ответом",
+    }.get((category or "all").lower(), "Все")
     rows: List[str] = [
-        f"❓ Вопросы ({category})",
-        pretty_period,
+        "❓ Вопросы покупателей",
+        f"Период: {pretty_period}",
+        "",
+        f"Категория: {category_label}",
         "",
         f"Страница {safe_page + 1}/{total_pages}",
         "",
@@ -524,12 +569,16 @@ def build_questions_table(
     for idx, q in enumerate(slice_items, start=1):
         global_index = safe_page * page_size + (idx - 1)
         status_icon, status_text = _status_badge_question(q)
-        product_short = _pick_short_product_label_question(q)
-        snippet = safe_strip(
-            getattr(q, "question_text", None) or getattr(q, "text", None) or ""
+        product_short = safe_str(_pick_short_product_label_question(q))
+        snippet_raw = safe_strip(
+            getattr(q, "question_text", None)
+            or getattr(q, "text", None)
+            or getattr(q, "message", None)
+            or ""
         )
-        if len(snippet) > 50:
-            snippet = snippet[:47] + "…"
+        snippet = snippet_raw or "—"
+        if len(snippet) > SNIPPET_MAX_LEN:
+            snippet = snippet[: SNIPPET_MAX_LEN - 1] + "…"
         created_at = _parse_date(getattr(q, "created_at", None))
         date_part = _fmt_dt_msk(created_at) or "дата неизвестна"
         age = _human_age(created_at)
@@ -539,8 +588,7 @@ def build_questions_table(
             f"{idx}) {status_icon} {date_part}{age_part} | "
             f"Товар: {product_short} | {status_label or 'СТАТУС НЕИЗВЕСТЕН'}"
         )
-        if snippet:
-            line = f"{line} | Вопрос: {snippet}"
+        line = f"{line} | Вопрос: {snippet}"
         rows.append(line)
 
         question_id = getattr(q, "id", None)
@@ -550,6 +598,30 @@ def build_questions_table(
         items.append((button_label, safe_str(question_id), global_index))
 
     text = "\n".join(rows)
+    if len(text) > TELEGRAM_TEXT_LIMIT:
+        truncated_rows: List[str] = []
+        current_length = 0
+        suffix = " (обрезано)"
+
+        for row in rows:
+            if not truncated_rows:
+                projected_length = len(row)
+            else:
+                projected_length = current_length + 1 + len(row)
+
+            if projected_length > TELEGRAM_TEXT_LIMIT - len(suffix):
+                break
+
+            truncated_rows.append(row)
+            current_length = projected_length
+
+        if truncated_rows:
+            truncated_rows[-1] = f"{truncated_rows[-1]}{suffix}"
+        else:
+            truncated_rows.append(suffix.strip())
+
+        text = "\n".join(truncated_rows)
+
     return text, items, safe_page, total_pages
 
 
@@ -594,7 +666,7 @@ __all__ = [
     "resolve_question_id",
     "format_question_card_text",
     "ensure_question_answer_text",
+    "ensure_question_product_name",
     "register_question_token",
     "resolve_question_token",
 ]
-
