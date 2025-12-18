@@ -60,6 +60,8 @@ class ChatsCallbackData(CallbackData, prefix="chats"):
     page: Optional[int] = None
     token: Optional[str] = None
     
+# Backward-compatible alias
+ChatCallbackData = ChatsCallbackData
 
 class WarehouseCallbackData(CallbackData, prefix="warehouse"):
     action: str
@@ -950,6 +952,39 @@ def chats_list_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def chat_header_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить",
+                    callback_data=ChatsCallbackData(action="refresh_thread", token=token).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="⬇️ Старые",
+                    callback_data=ChatsCallbackData(action="older", token=token).pack(),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🤖 ИИ-ответ",
+                    callback_data=ChatsCallbackData(action="ai", token=token).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="🧹 Очистить",
+                    callback_data=ChatsCallbackData(action="clear", token=token).pack(),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ К списку чатов",
+                    callback_data=ChatsCallbackData(action="exit", token=token).pack(),
+                )
+            ],
+        ]
+    )
+
+
 def chat_actions_keyboard(
     chat_id: str,
     *,
@@ -1068,6 +1103,10 @@ def chat_ai_confirm_keyboard(chat_id: str) -> InlineKeyboardMarkup:
     return chat_draft_keyboard(chat_id)
 
 
+def chat_ai_draft_keyboard(chat_id: str) -> InlineKeyboardMarkup:
+    return chat_draft_keyboard(chat_id)
+
+
 def chat_draft_keyboard(chat_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1126,8 +1165,10 @@ __all__ = [
     "question_card_keyboard",
     "review_draft_keyboard",
     "chats_list_keyboard",
+    "chat_header_keyboard",
     "chat_actions_keyboard",
     "chat_ai_confirm_keyboard",
+    "chat_ai_draft_keyboard",
     "chat_draft_keyboard",
     "account_keyboard",
 ]
