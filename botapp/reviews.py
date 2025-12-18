@@ -1128,6 +1128,7 @@ def build_reviews_table(
     cards: List[ReviewCard],
     pretty_period: str,
     category: str,
+    user_id: int | None = None,
     page: int = 0,
     page_size: int = REVIEWS_PAGE_SIZE,
 ) -> tuple[str, List[tuple[str, str, int]], int, int]:

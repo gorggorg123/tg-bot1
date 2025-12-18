@@ -1939,11 +1939,11 @@ class QuestionAnswer:
 @dataclass
 class Question:
     id: str
+    question_text: str
     created_at: str | None
     sku: int | None
     product_id: str | None
     product_name: str | None
-    question_text: str
     answer_text: str | None
     answer_created_at: str | None = None
     status: str | None = None

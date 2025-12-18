@@ -59,7 +59,13 @@ async def _show_questions_list(
         await refresh_questions(user_id, category=category, force=True)
 
     text, items, safe_page, total_pages = await get_questions_table(user_id=user_id, category=category, page=page)
-    markup = questions_list_keyboard(category=category, page=safe_page, total_pages=total_pages, items=items)
+    markup = questions_list_keyboard(
+        user_id=user_id,
+        category=category,
+        page=safe_page,
+        total_pages=total_pages,
+        items=items,
+    )
 
     sent = await send_section_message(
         SECTION_QUESTIONS_LIST,
