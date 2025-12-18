@@ -1,324 +1,256 @@
-"""Helpers to keep only one active screen message per section for each user."""
+# botapp/message_gc.py
 from __future__ import annotations
 
 import logging
-import asyncio
-from contextlib import suppress
 from dataclasses import dataclass
-from typing import Dict
+from datetime import datetime, timezone
+from typing import Optional
 
-from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 logger = logging.getLogger(__name__)
 
+# -----------------------------------------------------------------------------
+# Section IDs (единый реестр "экранов")
+# -----------------------------------------------------------------------------
+
 SECTION_MENU = "menu"
+
 SECTION_REVIEWS_LIST = "reviews_list"
 SECTION_REVIEW_CARD = "review_card"
+SECTION_REVIEW_PROMPT = "review_prompt"
+
 SECTION_QUESTIONS_LIST = "questions_list"
 SECTION_QUESTION_CARD = "question_card"
 SECTION_QUESTION_PROMPT = "question_prompt"
-SECTION_REVIEW_PROMPT = "review_prompt"
+
 SECTION_CHATS_LIST = "chats_list"
-SECTION_CHAT_HISTORY = "chat_history"
-SECTION_CHAT_PROMPT = "chat_prompt"
-SECTION_WAREHOUSE_MENU = "warehouse_menu"
-SECTION_WAREHOUSE_PROMPT = "warehouse_prompt"
-SECTION_WAREHOUSE_PLAN = "warehouse_plan"
+SECTION_CHAT_HISTORY = "chat_history"   # “шапка” чата с кнопками
+SECTION_CHAT_PROMPT = "chat_prompt"     # ИИ-черновик / репромпт / редактирование
+
 SECTION_FBO = "fbo"
 SECTION_FINANCE_TODAY = "finance_today"
 SECTION_ACCOUNT = "account"
 
+SECTION_WAREHOUSE_MENU = "warehouse_menu"
+SECTION_WAREHOUSE_PLAN = "warehouse_plan"
+SECTION_WAREHOUSE_PROMPT = "warehouse_prompt"
 
-@dataclass
-class SectionMessage:
+# -----------------------------------------------------------------------------
+# In-memory registry: user_id + section -> (chat_id, message_id)
+# -----------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class SectionRef:
     chat_id: int
     message_id: int
-    persistent: bool = False
-
-_section_messages: Dict[int, Dict[str, SectionMessage]] = {}
-# Serialize updates per (chat_id, section) to avoid edit/delete races on rapid clicks.
-_locks: dict[tuple[int, str], asyncio.Lock] = {}
+    updated_at: datetime
 
 
-def get_section_message(user_id: int, section: str) -> SectionMessage | None:
-    """Return stored message binding for section if present."""
-
-    return _section_messages.get(user_id, {}).get(section)
+_REGISTRY: dict[tuple[int, str], SectionRef] = {}
 
 
-def remember_section_message(
-    user_id: int, section: str, chat_id: int, message_id: int, *, persistent: bool = False
-) -> None:
-    """Public wrapper to store section binding (used by safe_edit_text)."""
-
-    _remember_message(user_id, section, chat_id, message_id, persistent=persistent)
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def get_section_message(user_id: int, section: str) -> SectionMessage | None:
-    """Return stored message binding for section if present."""
-
-    return _section_messages.get(user_id, {}).get(section)
+def _key(user_id: int, section: str) -> tuple[int, str]:
+    return (int(user_id), str(section))
 
 
-def remember_section_message(
-    user_id: int, section: str, chat_id: int, message_id: int, *, persistent: bool = False
-) -> None:
-    """Public wrapper to store section binding (used by safe_edit_text)."""
-
-    _remember_message(user_id, section, chat_id, message_id, persistent=persistent)
+def _get_ref(user_id: int, section: str) -> SectionRef | None:
+    return _REGISTRY.get(_key(user_id, section))
 
 
-async def delete_message_safe(bot: Bot, chat_id: int, message_id: int) -> None:
-    """Delete a Telegram message, swallowing benign errors."""
+def _set_ref(user_id: int, section: str, chat_id: int, message_id: int) -> None:
+    _REGISTRY[_key(user_id, section)] = SectionRef(chat_id=int(chat_id), message_id=int(message_id), updated_at=_now_utc())
 
+
+def _pop_ref(user_id: int, section: str) -> SectionRef | None:
+    return _REGISTRY.pop(_key(user_id, section), None)
+
+
+# -----------------------------------------------------------------------------
+# Safe Telegram ops
+# -----------------------------------------------------------------------------
+
+async def _safe_delete(bot, chat_id: int, message_id: int) -> bool:
     try:
-        await bot.delete_message(chat_id, message_id)
-        logger.info("Deleted message %s for chat %s", message_id, chat_id)
-    except TelegramBadRequest as exc:
-        # Message already gone or too old – this is fine for GC purposes.
-        logger.debug("Skip delete message %s in chat %s: %s", message_id, chat_id, exc)
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return False
     except Exception:
-        logger.exception("Failed to delete message %s in chat %s", message_id, chat_id)
+        logger.exception("Unexpected error while deleting message %s/%s", chat_id, message_id)
+        return False
 
 
-def _remember_message(
-    user_id: int, section: str, chat_id: int, message_id: int, *, persistent: bool = False
-) -> None:
-    section_state = _section_messages.setdefault(user_id, {})
-    section_state[section] = SectionMessage(chat_id, message_id, persistent=persistent)
-
-
-def _pop_section(user_id: int, section: str) -> SectionMessage | None:
-    return _section_messages.get(user_id, {}).pop(section, None)
-
-
-async def delete_section_message(
-    user_id: int,
-    section: str,
-    bot: Bot,
+async def _safe_edit(
+    bot,
     *,
-    preserve_message_id: int | None = None,
-    force: bool = False,
-) -> None:
-    """Remove stored message for section if it exists.
-
-    If ``preserve_message_id`` equals the stored message id, we only forget the
-    section without deleting the Telegram message (useful when the message was
-    reused via ``edit_text`` for another section).
-    """
-
-    stored = _pop_section(user_id, section)
-    if stored:
-        chat_id, message_id, persistent = stored.chat_id, stored.message_id, stored.persistent
-        if preserve_message_id is not None and preserve_message_id == message_id:
-            logger.debug(
-                "Skip deleting section '%s' message %s for user %s (preserved)",
-                section,
-                message_id,
-                user_id,
-            )
-            return
-
-        if persistent and not force:
-            logger.info(
-                "Skip auto-delete for persistent section '%s' message %s (user %s)",
-                section,
-                message_id,
-                user_id,
-            )
-            _remember_message(user_id, section, chat_id, message_id, persistent=True)
-            return
-
-        logger.info(
-            "Deleting previous section '%s' message %s for user %s", section, message_id, user_id
+    chat_id: int,
+    message_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None,
+    parse_mode: str = "HTML",
+) -> Optional[Message]:
+    try:
+        res = await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=True,
         )
-        await delete_message_safe(bot, chat_id, message_id)
+        if isinstance(res, Message):
+            return res
+        return None
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return None
+        return None
+    except (TelegramForbiddenError,):
+        return None
+    except Exception:
+        logger.exception("Unexpected error while editing message %s/%s", chat_id, message_id)
+        return None
 
 
-def _resolve_context(
-    message: Message | None,
-    callback: CallbackQuery | None,
-    bot: Bot | None,
-    chat_id: int | None,
-    user_id: int | None,
-) -> tuple[Bot, int, int]:
-    active_bot = bot
-    active_chat = chat_id
-    active_user = user_id
-
-    if callback:
-        active_bot = active_bot or (callback.message.bot if callback.message else callback.bot)
-        active_chat = active_chat or (callback.message.chat.id if callback.message else None)
-        active_user = active_user or callback.from_user.id
-
-    if message:
-        active_bot = active_bot or message.bot
-        active_chat = active_chat or message.chat.id
-        active_user = active_user or message.from_user.id
-
-    if not active_bot or active_chat is None or active_user is None:
-        raise ValueError("Cannot resolve bot/chat/user context for section message")
-
-    return active_bot, active_chat, active_user
-
+# -----------------------------------------------------------------------------
+# Public API: send/update one “section message”
+# -----------------------------------------------------------------------------
 
 async def send_section_message(
     section: str,
     *,
     text: str,
-    reply_markup=None,
-    message: Message | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
     callback: CallbackQuery | None = None,
-    bot: Bot | None = None,
-    chat_id: int | None = None,
+    message: Message | None = None,
     user_id: int | None = None,
-    persistent: bool = False,
-    **kwargs,
-) -> Message:
-    """Send or edit a section screen, cleaning previous one for the user."""
+) -> Message | None:
+    """
+    Единая точка для “экранов”:
+      - если секция уже есть: пытаемся редактировать существующее сообщение
+      - если не получается: отправляем новое, а старое (если было) — удаляем
+    """
+    if callback is None and message is None:
+        return None
 
-    active_bot, active_chat, active_user = _resolve_context(message, callback, bot, chat_id, user_id)
-    lock = _locks.setdefault((active_chat, section), asyncio.Lock())
+    bot = callback.message.bot if callback and callback.message else message.bot if message else None
+    if bot is None:
+        return None
 
-    async with lock:
-        stored = _section_messages.get(active_user, {}).get(section)
+    if user_id is None:
+        if callback and callback.from_user:
+            user_id = callback.from_user.id
+        elif message and message.from_user:
+            user_id = message.from_user.id
+    if user_id is None:
+        return None
 
-        if stored and stored.chat_id == active_chat:
-            try:
-                edited = await active_bot.edit_message_text(
-                    text=text,
-                    chat_id=stored.chat_id,
-                    message_id=stored.message_id,
-                    reply_markup=reply_markup,
-                    **kwargs,
-                )
-                _remember_message(
-                    active_user,
-                    section,
-                    stored.chat_id,
-                    edited.message_id,
-                    persistent=stored.persistent or persistent,
-                )
-                return edited
-            except TelegramBadRequest as exc:
-                lower_exc = str(exc).lower()
-                if "message is not modified" in lower_exc:
-                    logger.debug(
-                        "Section '%s' message %s for user %s is unchanged; keeping as-is",
-                        section,
-                        stored.message_id,
-                        active_user,
-                    )
-                    _remember_message(
-                        active_user,
-                        section,
-                        stored.chat_id,
-                        stored.message_id,
-                        persistent=stored.persistent or persistent,
-                    )
-                    if callback and callback.message and callback.message.message_id == stored.message_id:
-                        return callback.message
-                    if message and message.message_id == stored.message_id:
-                        return message
-                    fallback = callback.message if callback and callback.message else message
-                    return fallback
+    chat_id = None
+    if callback and callback.message and callback.message.chat:
+        chat_id = callback.message.chat.id
+    elif message and message.chat:
+        chat_id = message.chat.id
+    if chat_id is None:
+        return None
 
-                logger.info(
-                    "Cannot edit previous section '%s' message %s for user %s: %s",
-                    section,
-                    stored.message_id,
-                    active_user,
-                    exc,
-                )
-                if not stored.persistent and not (
-                    callback
-                    and callback.message
-                    and callback.message.message_id == stored.message_id
-                ):
-                    await delete_message_safe(active_bot, stored.chat_id, stored.message_id)
-            except Exception:
-                logger.exception(
-                    "Failed to edit previous section '%s' message %s for user %s",
-                    section,
-                    stored.message_id,
-                    active_user,
-                )
-                if not stored.persistent and not (
-                    callback
-                    and callback.message
-                    and callback.message.message_id == stored.message_id
-                ):
-                    await delete_message_safe(active_bot, stored.chat_id, stored.message_id)
+    if callback and callback.message:
+        current_mid = callback.message.message_id
+        prev = _get_ref(user_id, section)
 
-        # If callback message exists, try to reuse it before sending a brand new one
-        if callback and callback.message and callback.message.chat.id == active_chat:
-            try:
-                edited = await callback.message.edit_text(text, reply_markup=reply_markup, **kwargs)
-                _remember_message(
-                    active_user, section, active_chat, edited.message_id, persistent=persistent
-                )
-                # Remove stale stored message if it differs
-                if stored and stored.message_id != edited.message_id and not stored.persistent:
-                    with suppress(Exception):
-                        await delete_message_safe(active_bot, stored.chat_id, stored.message_id)
-                return edited
-            except TelegramBadRequest as exc:
-                lower_exc = str(exc).lower()
-                if "message is not modified" in lower_exc:
-                    logger.debug(
-                        "Callback message for section '%s' in chat %s unchanged; keeping",
-                        section,
-                        active_chat,
-                    )
-                    _remember_message(
-                        active_user,
-                        section,
-                        active_chat,
-                        callback.message.message_id,
-                        persistent=persistent,
-                    )
-                    return callback.message
+        if prev and (prev.chat_id != chat_id or prev.message_id != current_mid):
+            await _safe_delete(bot, prev.chat_id, prev.message_id)
 
-                logger.info(
-                    "Callback message edit failed for section '%s' in chat %s: %s",
-                    section,
-                    active_chat,
-                    exc,
-                )
-            except Exception:
-                logger.exception("Failed to edit callback message for section '%s'", section)
-
-        if stored and not stored.persistent and not (
-            callback and callback.message and callback.message.message_id == stored.message_id
-        ):
-            await delete_message_safe(active_bot, stored.chat_id, stored.message_id)
-
-        sent = await active_bot.send_message(active_chat, text, reply_markup=reply_markup, **kwargs)
-        _remember_message(
-            active_user, section, active_chat, sent.message_id, persistent=persistent
+        await _safe_edit(
+            bot,
+            chat_id=chat_id,
+            message_id=current_mid,
+            text=text,
+            reply_markup=reply_markup,
         )
-        return sent
+        _set_ref(user_id, section, chat_id, current_mid)
+        return callback.message
+
+    prev = _get_ref(user_id, section)
+    if prev and prev.chat_id == chat_id:
+        edited = await _safe_edit(
+            bot,
+            chat_id=prev.chat_id,
+            message_id=prev.message_id,
+            text=text,
+            reply_markup=reply_markup,
+        )
+        if edited is not None:
+            _set_ref(user_id, section, prev.chat_id, prev.message_id)
+            return edited
+
+    try:
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logger.exception("Failed to send section message section=%s user_id=%s", section, user_id)
+        return None
+
+    if prev:
+        await _safe_delete(bot, prev.chat_id, prev.message_id)
+
+    _set_ref(user_id, section, chat_id, sent.message_id)
+    return sent
+
+
+async def delete_section_message(
+    user_id: int,
+    section: str,
+    bot,
+    *,
+    force: bool = False,
+    preserve_message_id: int | None = None,
+) -> bool:
+    """
+    Удаляет сообщение секции, если оно зарегистрировано.
+    """
+    ref = _get_ref(user_id, section)
+    if not ref:
+        return False
+
+    if preserve_message_id is not None and int(preserve_message_id) == int(ref.message_id):
+        return False
+
+    ok = await _safe_delete(bot, ref.chat_id, ref.message_id)
+    _pop_ref(user_id, section)
+
+    if force:
+        return True
+    return ok
 
 
 __all__ = [
     "SECTION_MENU",
     "SECTION_REVIEWS_LIST",
     "SECTION_REVIEW_CARD",
+    "SECTION_REVIEW_PROMPT",
     "SECTION_QUESTIONS_LIST",
     "SECTION_QUESTION_CARD",
+    "SECTION_QUESTION_PROMPT",
     "SECTION_CHATS_LIST",
     "SECTION_CHAT_HISTORY",
     "SECTION_CHAT_PROMPT",
     "SECTION_FBO",
     "SECTION_FINANCE_TODAY",
     "SECTION_ACCOUNT",
-    "SECTION_QUESTION_PROMPT",
-    "SECTION_REVIEW_PROMPT",
-    "get_section_message",
-    "remember_section_message",
-    "delete_message_safe",
-    "delete_section_message",
+    "SECTION_WAREHOUSE_MENU",
+    "SECTION_WAREHOUSE_PLAN",
+    "SECTION_WAREHOUSE_PROMPT",
     "send_section_message",
+    "delete_section_message",
 ]
