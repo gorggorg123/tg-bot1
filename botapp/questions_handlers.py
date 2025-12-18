@@ -56,7 +56,7 @@ async def _show_questions_list(
     force_refresh: bool = False,
 ) -> None:
     if force_refresh:
-        await refresh_questions(user_id, force=True)
+        await refresh_questions(user_id, category=category, force=True)
 
     text, items, safe_page, total_pages = await get_questions_table(user_id=user_id, category=category, page=page)
     markup = questions_list_keyboard(category=category, page=safe_page, total_pages=total_pages, items=items)
@@ -85,7 +85,7 @@ async def _show_question_card(
     force_refresh: bool = False,
 ) -> None:
     if force_refresh:
-        await refresh_questions(user_id, force=True)
+        await refresh_questions(user_id, category=category, force=True)
 
     q = resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
     if not q:

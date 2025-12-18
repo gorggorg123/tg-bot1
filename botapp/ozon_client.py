@@ -1467,6 +1467,7 @@ async def chat_list(
     chat_status: str = "ALL",
     unread_only: bool = False,
     include_service: bool = False,
+    refresh: bool | None = None,  # backward-compatible no-op
 ) -> list[dict]:
     """List chats (v2).
 
