@@ -12,7 +12,22 @@ from urllib.parse import urlparse, unquote
 
 import httpx
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+# Pydantic v2 is the primary target, but provide a minimal fallback for v1 to
+# avoid NameError on platforms that ship only pydantic.v1 by default.
+try:  # pragma: no cover - import-time guard
+    from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+except Exception:  # pragma: no cover - compatibility with pydantic.v1
+    from pydantic.v1 import BaseModel, Field, ValidationError, validator
+
+    class ConfigDict(dict):
+        """Lightweight shim so model_config assignments do not crash under v1."""
+
+    def field_validator(*fields, **kwargs):
+        def wrapper(func):
+            return validator(*fields, **kwargs)(func)
+
+        return wrapper
 
 try:  # ozonapi-async 0.19.x содержит seller_info, 0.1.0 — нет
     from ozonapi import SellerAPI
@@ -1331,6 +1346,7 @@ class ChatSummary(BaseModel):
     id: str | None = None
     posting_number: str | None = None
     order_id: str | None = None
+    raw: dict = Field(default_factory=dict, alias="_raw")
     buyer_name: str | None = None
     client_name: str | None = None
     customer_name: str | None = None
@@ -1342,10 +1358,10 @@ class ChatSummary(BaseModel):
     is_unread: bool | None = None
     has_unread: bool | None = None
 
-    model_config = ConfigDict(extra="ignore", protected_namespaces=(), populate_by_name=True)
+    model_config = ConfigDict(extra="allow", protected_namespaces=(), populate_by_name=True)
 
     def to_dict(self) -> dict:
-        data = self.model_dump(exclude_none=True, by_alias=False)
+        data = self.model_dump(exclude_none=True, by_alias=True)
         if not data.get("chat_id") and self.id:
             data["chat_id"] = str(self.id)
         if self.last_message is not None:
@@ -1470,10 +1486,31 @@ async def chat_list(
     remaining = max_limit
     items_raw: list[dict] = []
 
+    async def _fetch_page(page_limit: int, offset_value: int) -> tuple[int, dict | None]:
+        filter_base: dict[str, object] = {
+            "chat_status": "all",
+            "chat_type": "all" if include_service else "buyer",
+        }
+        payload_variants = [
+            {"limit": page_limit, "offset": offset_value, "filter": filter_base},
+            {"limit": page_limit, "offset": offset_value, "filter": {"chat_status": "all"}},
+            {"limit": page_limit, "offset": offset_value, "filter": {}},
+        ]
+        last_status: int | None = None
+        last_data: dict | None = None
+
+        for body in payload_variants:
+            status_code, data = await client._post_with_status("/v3/chat/list", body)
+            last_status = status_code
+            last_data = data if isinstance(data, dict) else None
+            if status_code < 400 and isinstance(data, dict):
+                return status_code, data
+
+        return last_status or 500, last_data
+
     while remaining > 0:
         page_limit = min(50, remaining)
-        body = {"limit": page_limit, "offset": offset_cur, "filter": {}}
-        status_code, data = await client._post_with_status("/v3/chat/list", body)
+        status_code, data = await _fetch_page(page_limit, offset_cur)
         if status_code >= 400 or not isinstance(data, dict):
             message = None
             if isinstance(data, dict):
@@ -1563,6 +1600,7 @@ async def chat_list(
                 logger.debug("Skip service chat (%s): %s", chat_type_str or "empty", merged)
                 continue
         try:
+            merged["_raw"] = merged.copy()
             items.append(ChatSummary.model_validate(merged).to_dict())
         except ValidationError as exc:
             logger.warning("Failed to normalize chat summary: %s", exc)
@@ -2287,6 +2325,3 @@ async def get_question_by_id(question_id: str) -> Question | None:
         if q.id == question_id:
             return q
     return None
-
-
-

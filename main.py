@@ -58,6 +58,7 @@ from botapp.reviews import (
     get_reviews_table,
     mark_review_answered,
     refresh_review_from_api,
+    ensure_review_product_name,
     encode_review_id,
     resolve_review_id,
     refresh_reviews,
@@ -72,6 +73,7 @@ from botapp.questions import (
     get_questions_pretty_period,
     get_questions_table,
     ensure_question_answer_text,
+    ensure_question_product_name,
     refresh_questions,
     register_question_token,
     resolve_question_id,
@@ -507,6 +509,7 @@ async def _send_review_card(
         if client:
             await refresh_review_from_api(card, client)
         current_answer = answer_override or await _get_local_answer(user_id, card.id)
+        await ensure_review_product_name(card)
         text = format_review_card_text(
             card=card,
             index=view.index,
@@ -648,6 +651,7 @@ async def _send_question_card(
                 user_id=user_id, category=category, index=idx
             )
 
+    await ensure_question_product_name(resolved_question)
     await ensure_question_answer_text(resolved_question, user_id=user_id)
 
     period_title = get_questions_pretty_period(user_id)
