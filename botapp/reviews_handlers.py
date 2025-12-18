@@ -1,0 +1,432 @@
+# botapp/reviews_handlers.py
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+
+from aiogram import F, Router
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, Message
+
+from botapp.ai_client import generate_review_reply
+from botapp.keyboards import MenuCallbackData, ReviewsCallbackData, review_card_keyboard, reviews_list_keyboard
+from botapp.message_gc import (
+    SECTION_REVIEW_CARD,
+    SECTION_REVIEW_PROMPT,
+    SECTION_REVIEWS_LIST,
+    delete_section_message,
+    send_section_message,
+)
+from botapp.ozon_client import OzonAPIError, get_client, get_write_client, has_write_credentials
+from botapp.reviews import (
+    find_review,
+    format_review_card_text,
+    get_review_and_card,
+    get_reviews_table,
+    mark_review_answered,
+    refresh_review_from_api,
+    refresh_reviews_from_api,
+    resolve_review_id,
+)
+from botapp.storage import get_review_reply, upsert_review_reply
+from botapp.utils import send_ephemeral_message
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+
+class ReviewStates(StatesGroup):
+    reprompt = State()
+    manual = State()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def _clear_other_review_sections(bot, user_id: int) -> None:
+    await delete_section_message(user_id, SECTION_REVIEW_PROMPT, bot, force=True)
+
+
+async def _show_reviews_list(
+    *,
+    user_id: int,
+    category: str,
+    page: int,
+    callback: CallbackQuery | None = None,
+    message: Message | None = None,
+    force_refresh: bool = False,
+) -> None:
+    text, items, safe_page, total_pages = await get_reviews_table(
+        user_id=user_id,
+        category=category,
+        page=page,
+    )
+    markup = reviews_list_keyboard(category=category, page=safe_page, total_pages=total_pages, items=items)
+    sent = await send_section_message(
+        SECTION_REVIEWS_LIST,
+        text=text,
+        reply_markup=markup,
+        callback=callback,
+        message=message,
+        user_id=user_id,
+    )
+    if sent:
+        await delete_section_message(user_id, SECTION_REVIEW_CARD, sent.bot, force=True)
+        await delete_section_message(user_id, SECTION_REVIEW_PROMPT, sent.bot, force=True)
+
+
+async def _show_review_card(
+    *,
+    user_id: int,
+    category: str,
+    page: int,
+    token: str,
+    callback: CallbackQuery | None = None,
+    message: Message | None = None,
+    force_refresh: bool = False,
+) -> None:
+    rid = resolve_review_id(user_id, token) or token
+    if not rid:
+        await send_ephemeral_message(callback or message, text="⚠️ Не удалось открыть отзыв (нет review_id).")
+        return
+
+    card = find_review(user_id, rid)
+    if card is None:
+        await refresh_reviews_from_api(user_id)
+        card = find_review(user_id, rid)
+
+    if card is None:
+        await send_ephemeral_message(callback or message, text="⚠️ Отзыв не найден. Обновите список.")
+        return
+
+    # Lazy-load details/comments when opening a card
+    try:
+        await refresh_review_from_api(card, get_client())
+    except Exception:
+        pass
+
+    saved = get_review_reply(card.id) or {}
+    draft = (saved.get("draft") or "").strip() or None
+
+    can_send = bool(has_write_credentials() and draft and not (card.has_answer or (card.seller_comment or "").strip()))
+    period_title = "Отзывы"
+    view, _ = await get_review_and_card(user_id, category, index=0, review_id=card.id)
+    if view and view.period:
+        period_title = view.period
+
+    text = format_review_card_text(
+        card=card,
+        index=(view.index if view else 0),
+        total=(view.total if view else 1),
+        period_title=period_title,
+        user_id=user_id,
+        current_answer=draft,
+    )
+    markup = review_card_keyboard(category=category, page=page, token=token, can_send=can_send)
+
+    sent = await send_section_message(
+        SECTION_REVIEW_CARD,
+        text=text,
+        reply_markup=markup,
+        callback=callback,
+        message=message,
+        user_id=user_id,
+    )
+    if sent:
+        await delete_section_message(user_id, SECTION_REVIEW_PROMPT, sent.bot, force=True)
+
+
+@router.message(F.text == "/reviews")
+async def cmd_reviews(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await _show_reviews_list(user_id=message.from_user.id, category="unanswered", page=0, message=message, force_refresh=True)
+
+
+@router.callback_query(MenuCallbackData.filter(F.section == "reviews"))
+async def menu_reviews(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await _show_reviews_list(user_id=callback.from_user.id, category="unanswered", page=0, callback=callback, force_refresh=True)
+
+
+@router.callback_query(ReviewsCallbackData.filter())
+async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    data = ReviewsCallbackData.unpack(callback.data)
+
+    action = (data.action or "").strip()
+    category = (data.category or "all").strip()
+    page = int(data.page or 0)
+    token = (data.token or "").strip()
+
+    with_exception = False
+    try:
+        await callback.answer()
+    except Exception:
+        with_exception = True
+
+    if action in ("noop", ""):
+        return
+
+    if action in ("list", "page", "refresh"):
+        await _show_reviews_list(
+            user_id=user_id,
+            category=category,
+            page=page,
+            callback=callback,
+            force_refresh=(action == "refresh"),
+        )
+        return
+
+    if action == "open":
+        await _show_review_card(user_id=user_id, category=category, page=page, token=token, callback=callback, force_refresh=True)
+        return
+
+    if action == "ai":
+        rid = resolve_review_id(user_id, token) or token
+        card = find_review(user_id, rid)
+        if not card:
+            await send_ephemeral_message(callback, text="⚠️ Отзыв не найден. Обновите список.")
+            return
+
+        try:
+            await refresh_review_from_api(card, get_client())
+        except Exception:
+            pass
+
+        if not (card.text or "").strip():
+            await send_ephemeral_message(callback, text="⚠️ Нет текста отзыва (не удалось загрузить детали).")
+            return
+
+        saved = get_review_reply(card.id) or {}
+        previous = (saved.get("draft") or "").strip() or None
+
+        try:
+            draft = await generate_review_reply(
+                review_text=card.text or "",
+                product_name=card.product_name,
+                rating=card.rating,
+                previous_answer=previous,
+                user_prompt=None,
+            )
+        except Exception as exc:
+            await send_ephemeral_message(callback, text=f"⚠️ ИИ-ответ не получился: {exc}")
+            return
+
+        draft = (draft or "").strip()
+        if len(draft) < 2:
+            await send_ephemeral_message(callback, text="⚠️ ИИ вернул пустой ответ.")
+            return
+
+        upsert_review_reply(
+            review_id=card.id,
+            created_at=card.created_at,
+            product_name=card.product_name,
+            rating=card.rating,
+            review_text=card.text,
+            draft=draft,
+            draft_source="ai",
+            sent_to_ozon=False,
+            sent_at=None,
+            meta={"generated_at": _now_iso()},
+        )
+
+        await send_ephemeral_message(callback, text="✅ Черновик создан. Открой карточку — он появится там.", ttl=3)
+        await _show_review_card(user_id=user_id, category=category, page=page, token=token, callback=callback, force_refresh=False)
+        return
+
+    if action == "reprompt":
+        await state.set_state(ReviewStates.reprompt)
+        await state.update_data(category=category, page=page, token=token)
+        await send_section_message(
+            SECTION_REVIEW_PROMPT,
+            text=(
+                "<b>Пересобрать ответ на отзыв</b>\n\n"
+                "Напиши пожелания к ответу (тон, стиль, что обязательно учесть).\n"
+                "Отмена: /cancel"
+            ),
+            reply_markup=None,
+            callback=callback,
+            user_id=user_id,
+        )
+        return
+
+    if action == "manual":
+        await state.set_state(ReviewStates.manual)
+        await state.update_data(category=category, page=page, token=token)
+        await send_section_message(
+            SECTION_REVIEW_PROMPT,
+            text=(
+                "<b>Ввод ответа вручную</b>\n\n"
+                "Отправь текст ответа одним сообщением.\n"
+                "Отмена: /cancel"
+            ),
+            reply_markup=None,
+            callback=callback,
+            user_id=user_id,
+        )
+        return
+
+    if action == "send":
+        rid = resolve_review_id(user_id, token) or token
+        card = find_review(user_id, rid)
+        if not card:
+            await send_ephemeral_message(callback, text="⚠️ Отзыв не найден.")
+            return
+
+        saved = get_review_reply(card.id) or {}
+        draft = (saved.get("draft") or "").strip()
+        if len(draft) < 2:
+            await send_ephemeral_message(callback, text="⚠️ Нет черновика. Сначала сгенерируй ИИ-ответ или введи вручную.")
+            return
+
+        if not has_write_credentials():
+            await send_ephemeral_message(callback, text="⚠️ Нет write-доступа к Ozon (ключи OZON_WRITE_*).")
+            return
+
+        client = get_write_client()
+        if client is None:
+            await send_ephemeral_message(callback, text="⚠️ Write-client не инициализирован.")
+            return
+
+        try:
+            await client.review_comment_create(card.id, draft)
+        except OzonAPIError as exc:
+            await send_ephemeral_message(callback, text=f"⚠️ Ozon отклонил отправку: {exc}")
+            return
+        except Exception:
+            logger.exception("review_comment_create failed")
+            await send_ephemeral_message(callback, text="⚠️ Не удалось отправить ответ. Попробуй позже.")
+            return
+
+        upsert_review_reply(
+            review_id=card.id,
+            created_at=card.created_at,
+            product_name=card.product_name,
+            rating=card.rating,
+            review_text=card.text,
+            draft=draft,
+            draft_source=(saved.get("draft_source") or "manual"),
+            sent_to_ozon=True,
+            sent_at=_now_iso(),
+            meta={"sent": True},
+        )
+
+        mark_review_answered(card.id, user_id, text=draft)
+
+        await send_ephemeral_message(callback, text="✅ Ответ отправлен в Ozon.", ttl=4)
+        await _show_review_card(user_id=user_id, category=category, page=page, token=token, callback=callback, force_refresh=True)
+        return
+
+    await send_ephemeral_message(callback, text=f"⚠️ Неизвестное действие: {action}")
+
+
+@router.message(F.text == "/cancel")
+async def cancel_review_fsm(message: Message, state: FSMContext) -> None:
+    st = await state.get_state()
+    if st not in (ReviewStates.reprompt.state, ReviewStates.manual.state):
+        return
+    await state.clear()
+    await send_ephemeral_message(message, text="Ок, отменил.", ttl=3)
+
+
+@router.message(ReviewStates.reprompt)
+async def review_reprompt_text(message: Message, state: FSMContext) -> None:
+    user_id = message.from_user.id
+    payload = await state.get_data()
+    await state.clear()
+
+    token = (payload.get("token") or "").strip()
+    category = (payload.get("category") or "all").strip()
+    page = int(payload.get("page") or 0)
+
+    rid = resolve_review_id(user_id, token) or token
+    card = find_review(user_id, rid)
+    if not card:
+        await send_ephemeral_message(message, text="⚠️ Отзыв не найден. Открой карточку заново.")
+        return
+
+    wish = (message.text or "").strip()
+    if len(wish) < 2:
+        await send_ephemeral_message(message, text="⚠️ Слишком коротко.", ttl=3)
+        return
+
+    try:
+        await refresh_review_from_api(card, get_client())
+    except Exception:
+        pass
+
+    saved = get_review_reply(card.id) or {}
+    previous = (saved.get("draft") or "").strip() or None
+
+    try:
+        draft = await generate_review_reply(
+            review_text=card.text or "",
+            product_name=card.product_name,
+            rating=card.rating,
+            previous_answer=previous,
+            user_prompt=wish,
+        )
+    except Exception as exc:
+        await send_ephemeral_message(message, text=f"⚠️ ИИ-ответ не получился: {exc}")
+        return
+
+    draft = (draft or "").strip()
+    if len(draft) < 2:
+        await send_ephemeral_message(message, text="⚠️ ИИ вернул пустой ответ.")
+        return
+
+    upsert_review_reply(
+        review_id=card.id,
+        created_at=card.created_at,
+        product_name=card.product_name,
+        rating=card.rating,
+        review_text=card.text,
+        draft=draft,
+        draft_source="reprompt",
+        sent_to_ozon=False,
+        sent_at=None,
+        meta={"wish": wish, "generated_at": _now_iso()},
+    )
+
+    await send_ephemeral_message(message, text="✅ Пересобрал. Открой карточку — черновик обновлён.", ttl=4)
+    await _show_review_card(user_id=user_id, category=category, page=page, token=token, message=message, force_refresh=False)
+
+
+@router.message(ReviewStates.manual)
+async def review_manual_text(message: Message, state: FSMContext) -> None:
+    user_id = message.from_user.id
+    payload = await state.get_data()
+    await state.clear()
+
+    token = (payload.get("token") or "").strip()
+    category = (payload.get("category") or "all").strip()
+    page = int(payload.get("page") or 0)
+
+    rid = resolve_review_id(user_id, token) or token
+    card = find_review(user_id, rid)
+    if not card:
+        await send_ephemeral_message(message, text="⚠️ Отзыв не найден. Открой карточку заново.")
+        return
+
+    txt = (message.text or "").strip()
+    if len(txt) < 2:
+        await send_ephemeral_message(message, text="⚠️ Слишком коротко.", ttl=3)
+        return
+
+    upsert_review_reply(
+        review_id=card.id,
+        created_at=card.created_at,
+        product_name=card.product_name,
+        rating=card.rating,
+        review_text=card.text,
+        draft=txt,
+        draft_source="manual",
+        sent_to_ozon=False,
+        sent_at=None,
+        meta={"saved_at": _now_iso()},
+    )
+
+    await send_ephemeral_message(message, text="✅ Сохранил черновик.", ttl=3)
+    await _show_review_card(user_id=user_id, category=category, page=page, token=token, message=message, force_refresh=False)
