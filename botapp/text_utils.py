@@ -1,23 +1,4 @@
-"""Small text helpers to safely coerce optional/typed values to strings."""
+"""Shim for backward compatibility with moved utilities."""
+from botapp.utils.text_utils import *  # noqa: F401,F403
 
-from __future__ import annotations
-
-
-def safe_str(value) -> str:
-    """Convert value to string; None becomes empty string."""
-
-    if value is None:
-        return ""
-    try:
-        return str(value)
-    except Exception:
-        return ""
-
-
-def safe_strip(value) -> str:
-    """Stringify and strip whitespace safely."""
-
-    return safe_str(value).strip()
-
-
-__all__ = ["safe_str", "safe_strip"]
+__all__ = [name for name in globals().keys() if not name.startswith("__")]
