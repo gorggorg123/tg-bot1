@@ -4,9 +4,9 @@ from __future__ import annotations
 from aiogram import Router
 
 from botapp.menu_handlers import router as menu_router
-from botapp.reviews_handlers import router as reviews_router
-from botapp.questions_handlers import router as questions_router
-from botapp.chats_handlers import router as chats_router
+from botapp.sections.reviews.handlers import router as reviews_router
+from botapp.sections.questions.handlers import router as questions_router
+from botapp.sections.chats.handlers import router as chats_router
 
 
 router = Router()

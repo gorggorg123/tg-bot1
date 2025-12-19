@@ -7,8 +7,16 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-from botapp.keyboards import MenuCallbackData, back_home_keyboard, main_menu_keyboard
-from botapp.message_gc import (
+from botapp.keyboards import (
+    MenuCallbackData,
+    back_home_keyboard,
+    fbo_menu_keyboard,
+    finance_menu_keyboard,
+    main_menu_keyboard,
+)
+from botapp.sections.finance import logic as finance
+from botapp.sections.fbo import logic as orders
+from botapp.utils.message_gc import (
     SECTION_ACCOUNT,
     SECTION_CHAT_HISTORY,
     SECTION_CHAT_PROMPT,
@@ -109,11 +117,23 @@ async def menu_fbo(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
     await _close_all_sections(callback.message.bot, user_id, preserve_menu=True)
+    data = MenuCallbackData.unpack(callback.data)
+    action = data.action
+
+    if action in {"open", "summary", None}:
+        text = await orders.get_orders_today_text()
+    elif action == "month":
+        text = await orders.get_orders_month_text()
+    elif action == "filter":
+        text = "🔍 Фильтр скоро будет доступен."
+    else:
+        text = "📦 FBO: выберите действие."
+
     await send_section_message(
         SECTION_FBO,
         user_id=user_id,
-        text="Раздел ФБО в разработке. Скоро добавим подробности.",
-        reply_markup=back_home_keyboard(),
+        text=text,
+        reply_markup=fbo_menu_keyboard(),
         callback=callback,
     )
 
@@ -123,10 +143,20 @@ async def menu_finance(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
     await _close_all_sections(callback.message.bot, user_id, preserve_menu=True)
+    data = MenuCallbackData.unpack(callback.data)
+    action = data.action
+
+    if action in {"open", "summary", None}:
+        text = await finance.get_finance_today_text()
+    elif action == "month":
+        text = await finance.get_finance_month_summary_text()
+    else:
+        text = "🏦 Финансы: выберите период."
+
     await send_section_message(
         SECTION_FINANCE_TODAY,
         user_id=user_id,
-        text="Финансы: раздел в разработке. Скоро здесь появится сводка.",
-        reply_markup=back_home_keyboard(),
+        text=text,
+        reply_markup=finance_menu_keyboard(),
         callback=callback,
     )

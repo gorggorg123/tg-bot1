@@ -21,7 +21,7 @@ from botapp.keyboards import (
     warehouse_receive_keyboard,
     warehouse_results_keyboard,
 )
-from botapp.message_gc import (
+from botapp.utils.message_gc import (
     SECTION_WAREHOUSE_MENU,
     SECTION_WAREHOUSE_PLAN,
     SECTION_WAREHOUSE_PROMPT,

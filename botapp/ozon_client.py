@@ -1940,13 +1940,13 @@ class QuestionAnswer:
 class Question:
     id: str
     question_text: str
-    created_at: str | None
-    sku: int | None
-    product_id: str | None
-    product_name: str | None
-    answer_text: str | None
-    answer_created_at: str | None = None
+    created_at: str | None = None
+    sku: int | None = None
+    product_id: str | None = None
+    product_name: str | None = None
+    answer_text: str | None = None
     status: str | None = None
+    answer_created_at: str | None = None
     has_answer: bool = False
     answer_id: str | None = None
     answers_count: int | None = None

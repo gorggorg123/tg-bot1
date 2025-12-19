@@ -42,9 +42,11 @@ class ReviewsCallbackData(CallbackData, prefix="reviews"):
 
     action: str
     category: Optional[str] = None
+    token: Optional[str] = None
+    page: Optional[int] = None
+    # Legacy fields (ignored by new handlers but keep for safe parsing)
     index: Optional[int] = None
     review_id: Optional[str] = None
-    page: Optional[int] = None
 
 
 class QuestionsCallbackData(CallbackData, prefix="questions"):
@@ -389,6 +391,42 @@ def fbo_menu_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def finance_menu_keyboard() -> InlineKeyboardMarkup:
+    """Инлайн-меню раздела Финансы."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📅 Сегодня",
+                    callback_data=MenuCallbackData(
+                        section="fin_today",
+                        action="summary",
+                    ).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗓 Месяц",
+                    callback_data=MenuCallbackData(
+                        section="fin_today",
+                        action="month",
+                    ).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ В главное меню",
+                    callback_data=MenuCallbackData(
+                        section="home",
+                        action="open",
+                    ).pack(),
+                )
+            ],
+        ]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Отзывы: корень и карточка
 # ---------------------------------------------------------------------------
@@ -482,6 +520,7 @@ def review_card_keyboard(
     category: str,
     index: int,
     review_id: str | None,
+    token: str | None = None,
     page: int = 0,
     can_send: bool = True,
 ) -> InlineKeyboardMarkup:
@@ -490,10 +529,11 @@ def review_card_keyboard(
             InlineKeyboardButton(
                 text="✉️ Ответ через ИИ",
                 callback_data=ReviewsCallbackData(
-                    action="card_ai",
+                    action="ai",
                     category=category,
                     index=index,
                     review_id=review_id,
+                    token=token,
                     page=page,
                 ).pack(),
             )
@@ -502,10 +542,11 @@ def review_card_keyboard(
             InlineKeyboardButton(
                 text="✏️ Ввести ответ вручную",
                 callback_data=ReviewsCallbackData(
-                    action="card_manual",
+                    action="manual",
                     category=category,
                     index=index,
                     review_id=review_id,
+                    token=token,
                     page=page,
                 ).pack(),
             )
@@ -514,15 +555,32 @@ def review_card_keyboard(
             InlineKeyboardButton(
                 text="🔁 Пересобрать по моему промту",
                 callback_data=ReviewsCallbackData(
-                    action="card_reprompt",
+                    action="reprompt",
                     category=category,
                     index=index,
                     review_id=review_id,
+                    token=token,
                     page=page,
                 ).pack(),
             )
         ],
     ]
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🗑 Очистить черновик",
+                callback_data=ReviewsCallbackData(
+                    action="clear",
+                    category=category,
+                    index=index,
+                    review_id=review_id,
+                    token=token,
+                    page=page,
+                ).pack(),
+            )
+        ]
+    )
 
     if can_send and has_write_credentials():
         rows.append(
@@ -534,6 +592,7 @@ def review_card_keyboard(
                         category=category,
                         index=index,
                         review_id=review_id,
+                        token=token,
                         page=page,
                     ).pack(),
                 )
@@ -546,10 +605,11 @@ def review_card_keyboard(
                 InlineKeyboardButton(
                     text="⬅️ Назад к списку",
                     callback_data=ReviewsCallbackData(
-                        action="list_page",
+                        action="page",
                         category=category,
                         index=index,
                         review_id=review_id,
+                        token=token,
                         page=page,
                     ).pack(),
                 )
@@ -584,7 +644,7 @@ def question_card_keyboard(
             InlineKeyboardButton(
                 text="✉️ Ответ через ИИ",
                 callback_data=QuestionsCallbackData(
-                    action="card_ai",
+                    action="ai",
                     category=category,
                     page=page,
                     token=token,
@@ -595,7 +655,7 @@ def question_card_keyboard(
             InlineKeyboardButton(
                 text="✏️ Ввести ответ вручную",
                 callback_data=QuestionsCallbackData(
-                    action="card_manual",
+                    action="manual",
                     category=category,
                     page=page,
                     token=token,
@@ -606,7 +666,7 @@ def question_card_keyboard(
             InlineKeyboardButton(
                 text="🔁 Пересобрать по моему промту",
                 callback_data=QuestionsCallbackData(
-                    action="card_reprompt",
+                    action="reprompt",
                     category=category,
                     page=page,
                     token=token,
@@ -620,7 +680,7 @@ def question_card_keyboard(
             0,
             [
                 InlineKeyboardButton(
-                    text="✏️ Обновить ответ",
+                    text="↪️ Подставить опубликованный ответ",
                     callback_data=QuestionsCallbackData(
                         action="prefill",
                         category=category,
@@ -630,6 +690,20 @@ def question_card_keyboard(
                 )
             ],
         )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🗑 Очистить черновик",
+                callback_data=QuestionsCallbackData(
+                    action="clear_draft",
+                    category=category,
+                    page=page,
+                    token=token,
+                ).pack(),
+            )
+        ]
+    )
 
     if can_send and has_write_credentials():
         rows.append(
@@ -699,16 +773,17 @@ def reviews_list_keyboard(
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
 
-    for label, review_id, idx in items:
+    for label, token, idx in items:
         rows.append(
             [
                 InlineKeyboardButton(
                     text=label,
                     callback_data=ReviewsCallbackData(
-                        action="open_card",
+                        action="open",
                         category=category,
                         index=idx,
-                        review_id=review_id,
+                        token=token,
+                        review_id=None,
                         page=page,
                     ).pack(),
                 )
@@ -735,7 +810,7 @@ def reviews_list_keyboard(
         InlineKeyboardButton(
             text="⏮️" if page > 0 else "◀️ Назад",
             callback_data=ReviewsCallbackData(
-                action="list_page", category=category, page=max(page - 1, 0)
+                action="page", category=category, page=max(page - 1, 0)
             ).pack(),
         ),
         InlineKeyboardButton(
@@ -745,7 +820,7 @@ def reviews_list_keyboard(
         InlineKeyboardButton(
             text="Вперёд ▶️" if page + 1 < total_pages else "⏭️",
             callback_data=ReviewsCallbackData(
-                action="list_page",
+                action="page",
                 category=category,
                 page=min(page + 1, max(total_pages - 1, 0)),
             ).pack(),
@@ -754,6 +829,14 @@ def reviews_list_keyboard(
 
     rows.append(filter_row)
     rows.append(nav_row)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔄 Обновить",
+                callback_data=ReviewsCallbackData(action="refresh", category=category, page=page).pack(),
+            )
+        ]
+    )
     rows.append(
         [
             InlineKeyboardButton(
@@ -837,6 +920,14 @@ def questions_list_keyboard(
 
     rows.append(filter_row)
     rows.append(nav_row)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔄 Обновить",
+                callback_data=QuestionsCallbackData(action="refresh", category=category, page=page).pack(),
+            )
+        ]
+    )
     rows.append(
         [
             InlineKeyboardButton(
@@ -1157,6 +1248,7 @@ __all__ = [
     "main_menu_keyboard",
     "back_home_keyboard",
     "fbo_menu_keyboard",
+    "finance_menu_keyboard",
     "reviews_root_keyboard",
     "reviews_navigation_keyboard",
     "review_card_keyboard",
