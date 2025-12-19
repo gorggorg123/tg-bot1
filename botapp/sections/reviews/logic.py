@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Tuple
 
 from botapp.api.ai_client import AIClientError, generate_review_reply
 from botapp.api.ozon_client import OzonClient, _product_name_cache, get_client
+from botapp.ui.listing import format_period_header, slice_page
 from botapp.utils.text_utils import safe_strip, safe_str
 
 logger = logging.getLogger(__name__)
@@ -1115,15 +1116,6 @@ async def fetch_recent_reviews(
     return filtered_cards, pretty
 
 
-def _slice_cards(cards: List[ReviewCard], page: int, page_size: int) -> tuple[List[ReviewCard], int, int]:
-    total = len(cards)
-    total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
-    safe_page = max(0, min(page, total_pages - 1))
-    start = safe_page * page_size
-    end = start + page_size
-    return cards[start:end], safe_page, total_pages
-
-
 def build_reviews_table(
     *,
     cards: List[ReviewCard],
@@ -1133,17 +1125,9 @@ def build_reviews_table(
     page: int = 0,
     page_size: int = REVIEWS_PAGE_SIZE,
 ) -> tuple[str, List[tuple[str, str, int]], int, int]:
-    """Собрать текст списка + кнопки выбора.
+    """Собрать шапку списка отзывов и кнопки выбора."""
 
-    Делаем «плотный» список, похожий на старый UX: каждая запись — мини-карточка,
-    а кнопки — короткие (✅ 1 / 🆕 2 ...).
-    """
-
-    TELEGRAM_TEXT_LIMIT = 4096
-    SNIP_REVIEW = 120
-    SNIP_ANSWER = 80
-
-    slice_items, safe_page, total_pages = _slice_reviews(cards, page, page_size)
+    slice_items, safe_page, total_pages = slice_page(cards, page, page_size)
 
     category_label = {
         "unanswered": "Без ответа",
@@ -1151,15 +1135,10 @@ def build_reviews_table(
         "all": "Все",
     }.get(category, category)
 
-    # Шапка
-    header = [
-        f"🗂 Отзывы: {category_label}",
-        f"Период: {pretty_period}",
-        f"Страница: {safe_page + 1}/{max(total_pages,1)}",
-        "",
-    ]
+    header = format_period_header(
+        f"🗂 Отзывы: {category_label}", pretty_period, safe_page, total_pages
+    )
 
-    rows: list[str] = []
     items: list[tuple[str, str, int]] = []
 
     for i, card in enumerate(slice_items, start=1 + safe_page * page_size):
@@ -1169,42 +1148,17 @@ def build_reviews_table(
         stars = "⭐" * rating if rating else "—"
 
         prod = _pick_short_product_label(card) or "—"
-        text_snip = safe_str(card.text, max_len=SNIP_REVIEW)
-        ans_snip = safe_str(card.answer_text, max_len=SNIP_ANSWER)
 
         is_pub_answer = bool(safe_strip(card.answer_text))
         badge = "✅" if is_pub_answer else "🆕"
 
-        block = [
-            f"{i}) {badge} {stars} • {created}",
-            f"   🛒 {prod}",
-            f"   📝 {text_snip}",
-        ]
-        if is_pub_answer:
-            block.append(f"   ↪️ {ans_snip}")
-        rows.append("\n".join(block))
-
         review_id = card.id or ""
         token = encode_review_id(user_id, review_id)
         if review_id:
-            items.append((f"{badge} {i}", token or review_id, i - 1))
+            label = f"{i}) {badge} {created} · {stars} · {prod}"
+            items.append((label, token or review_id, i - 1))
 
-    # Собираем общий текст, обрезаем аккуратно, если слишком длинно
-    text = "\n\n".join(header + rows).strip()
-    if len(text) > TELEGRAM_TEXT_LIMIT:
-        # режем по блокам снизу
-        trimmed_rows: list[str] = []
-        base = "\n\n".join(header).strip()
-        cur = base
-        for block in rows:
-            candidate = (cur + "\n\n" + block).strip() if cur else block
-            if len(candidate) > TELEGRAM_TEXT_LIMIT - 80:
-                break
-            cur = candidate
-            trimmed_rows.append(block)
-        text = (base + "\n\n" + "\n\n".join(trimmed_rows)).strip()
-        if len(text) > TELEGRAM_TEXT_LIMIT:
-            text = text[: TELEGRAM_TEXT_LIMIT - 50].rstrip() + "\n…"
+    text = header or " "
 
     return text, items, safe_page, total_pages
 

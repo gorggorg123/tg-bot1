@@ -23,6 +23,7 @@ from botapp.api.ozon_client import (
     get_question_answers,
     get_questions_list,
 )
+from botapp.ui.listing import format_period_header, slice_page
 from botapp.utils.text_utils import safe_strip, safe_str
 
 logger = logging.getLogger(__name__)
@@ -535,15 +536,6 @@ def format_question_card_text(
     return "\n".join(lines)
 
 
-def _slice_questions(items: List[Question], page: int, page_size: int) -> tuple[List[Question], int, int]:
-    total = len(items)
-    total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
-    safe_page = max(0, min(page, total_pages - 1))
-    start = safe_page * page_size
-    end = start + page_size
-    return items[start:end], safe_page, total_pages
-
-
 def _status_badge_question(q: Question) -> tuple[str, str]:
     if (
         getattr(q, "has_answer", False)
@@ -596,27 +588,19 @@ def build_questions_table(
     page: int = 0,
     page_size: int = QUESTIONS_PAGE_SIZE,
 ) -> tuple[str, List[tuple[str, str, int]], int, int]:
-    """Собрать «старый» плотный список вопросов + кнопки выбора."""
+    """Собрать шапку списка вопросов и кнопки выбора."""
 
-    TELEGRAM_TEXT_LIMIT = 4096
-    SNIP_Q = 140
-    SNIP_A = 80
-
-    slice_items, safe_page, total_pages = _slice_questions(cards, page, page_size)
+    slice_items, safe_page, total_pages = slice_page(cards, page, page_size)
     category_label = {
         "unanswered": "Без ответа",
         "answered": "С ответом",
         "all": "Все",
     }.get(category, category)
 
-    header = [
-        f"🗂 Вопросы: {category_label}",
-        f"Период: {pretty_period}",
-        f"Страница: {safe_page + 1}/{max(total_pages,1)}",
-        "",
-    ]
+    header = format_period_header(
+        f"🗂 Вопросы: {category_label}", pretty_period, safe_page, total_pages
+    )
 
-    rows: list[str] = []
     items: list[tuple[str, str, int]] = []
 
     for i, q in enumerate(slice_items, start=1 + safe_page * page_size):
@@ -627,39 +611,17 @@ def build_questions_table(
 
         product = _pick_short_product_label_question(q)
 
-        q_text = safe_str(getattr(q, "question_text", None), max_len=SNIP_Q)
-        a_text = safe_str(getattr(q, "answer_text", None), max_len=SNIP_A)
+        a_text = safe_str(getattr(q, "answer_text", None))
 
         has_answer = bool(getattr(q, "has_answer", False)) or bool(safe_strip(a_text))
         badge = "✅" if has_answer else "🆕"
 
-        block = [
-            f"{i}) {badge} • {date_part} • {status_label}",
-            f"   🛒 {product}",
-            f"   ❓ {q_text}",
-        ]
-        if has_answer and a_text.strip("— "):
-            block.append(f"   ↪️ {a_text}")
-        rows.append("\n".join(block))
-
         qid = safe_strip(getattr(q, "id", None))
         if qid:
-            items.append((f"{badge} {i}", qid, i - 1))
+            label = f"{i}) {badge} {date_part} · {status_label} · {product}"
+            items.append((label, qid, i - 1))
 
-    text = "\n\n".join(header + rows).strip()
-    if len(text) > TELEGRAM_TEXT_LIMIT:
-        base = "\n\n".join(header).strip()
-        cur = base
-        trimmed=[]
-        for block in rows:
-            candidate = (cur + "\n\n" + block).strip()
-            if len(candidate) > TELEGRAM_TEXT_LIMIT - 80:
-                break
-            cur = candidate
-            trimmed.append(block)
-        text = (base + "\n\n" + "\n\n".join(trimmed)).strip()
-        if len(text) > TELEGRAM_TEXT_LIMIT:
-            text = text[: TELEGRAM_TEXT_LIMIT - 50].rstrip() + "\n…"
+    text = header or " "
 
     return text, items, safe_page, total_pages
 

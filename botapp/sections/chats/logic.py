@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import html
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
@@ -11,6 +12,7 @@ from typing import Any, Iterable
 from botapp.api.ozon_client import (
     ChatHistoryResponse,
     ChatListItem,
+    OzonAPIError,
     chat_history as ozon_chat_history,
     chat_list as ozon_chat_list,
 )
@@ -46,6 +48,15 @@ def _escape(s: str) -> str:
     return html.escape((s or "").strip())
 
 
+def _is_premium_plus_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if "obsolete" in message and "chat" in message:
+        return True
+    if "premium plus" in message:
+        return True
+    return bool(re.search(r"code\s*[:=]?\s*9\b", message))
+
+
 def _short_token(user_id: int, chat_id: str) -> str:
     return hashlib.blake2s(f"{user_id}:c:{chat_id}".encode("utf-8"), digest_size=8).hexdigest()
 
@@ -56,6 +67,7 @@ class ChatsCache:
     chats: list[ChatListItem] = field(default_factory=list)
     token_to_chat_id: dict[str, str] = field(default_factory=dict)
     chat_id_to_token: dict[str, str] = field(default_factory=dict)
+    error: str | None = None
 
 
 @dataclass(slots=True)
@@ -85,6 +97,10 @@ class NormalizedMessage:
 
 _USER_CACHE: dict[int, ChatsCache] = {}
 _USER_THREADS: dict[tuple[int, str], ThreadCache] = {}
+
+
+class PremiumPlusRequired(RuntimeError):
+    """Raised when chat API is blocked for the account."""
 
 
 def _cc(user_id: int) -> ChatsCache:
@@ -202,7 +218,18 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
     if not force and cache.chats and _cache_fresh(cache.fetched_at, CACHE_TTL_SECONDS):
         return
 
-    resp = await ozon_chat_list(limit=200, offset=0, refresh=True)
+    try:
+        resp = await ozon_chat_list(limit=200, offset=0, refresh=True)
+    except OzonAPIError as exc:
+        if _is_premium_plus_error(exc):
+            cache.error = "premium_plus_required"
+            cache.chats = []
+            cache.fetched_at = _now_utc()
+            cache.token_to_chat_id.clear()
+            cache.chat_id_to_token.clear()
+            return
+        raise
+
     chats = resp.chats or []
 
     # simple ordering: unread first, then by last_message_id desc
@@ -210,6 +237,7 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
 
     cache.chats = chats
     cache.fetched_at = _now_utc()
+    cache.error = None
 
     cache.token_to_chat_id.clear()
     cache.chat_id_to_token.clear()
@@ -223,6 +251,10 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
 async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = False) -> tuple[str, list[dict], int, int]:
     await refresh_chats_list(user_id, force=force_refresh)
     cache = _cc(user_id)
+
+    if cache.error == "premium_plus_required":
+        raise PremiumPlusRequired()
+
     total = len(cache.chats)
 
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)

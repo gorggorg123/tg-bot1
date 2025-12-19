@@ -224,6 +224,7 @@ async def delete_section_message(
         return False
 
     if preserve_message_id is not None and int(preserve_message_id) == int(ref.message_id):
+        _pop_ref(user_id, section)
         return False
 
     ok = await _safe_delete(bot, ref.chat_id, ref.message_id)

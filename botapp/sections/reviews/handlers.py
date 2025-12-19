@@ -151,13 +151,13 @@ async def _show_review_card(
 @router.message(F.text == "/reviews")
 async def cmd_reviews(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await _show_reviews_list(user_id=message.from_user.id, category="unanswered", page=0, message=message, force_refresh=True)
+    await _show_reviews_list(user_id=message.from_user.id, category="all", page=0, message=message, force_refresh=False)
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "reviews"))
 async def menu_reviews(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await _show_reviews_list(user_id=callback.from_user.id, category="unanswered", page=0, callback=callback, force_refresh=True)
+    await _show_reviews_list(user_id=callback.from_user.id, category="all", page=0, callback=callback, force_refresh=False)
 
 
 @router.callback_query(ReviewsCallbackData.filter())

@@ -11,6 +11,7 @@ from aiogram.types import CallbackQuery, Message
 
 from botapp.api.ai_client import generate_chat_reply
 from botapp.sections.chats.logic import (
+    PremiumPlusRequired,
     get_chat_bubbles_for_ui,
     get_chats_table,
     load_older_messages,
@@ -18,7 +19,14 @@ from botapp.sections.chats.logic import (
     refresh_chat_thread,
     resolve_chat_id,
 )
-from botapp.keyboards import ChatCallbackData, MenuCallbackData, chat_ai_draft_keyboard, chat_header_keyboard, chats_list_keyboard
+from botapp.keyboards import (
+    ChatCallbackData,
+    MenuCallbackData,
+    back_home_keyboard,
+    chat_ai_draft_keyboard,
+    chat_header_keyboard,
+    chats_list_keyboard,
+)
 from botapp.utils.message_gc import (
     SECTION_ACCOUNT,
     SECTION_CHAT_HISTORY,
@@ -103,8 +111,15 @@ async def _clear_other_sections(bot, user_id: int) -> None:
 
 
 async def _show_chats_list(user_id: int, page: int, callback: CallbackQuery | None = None, message: Message | None = None, force_refresh: bool = False) -> None:
-    text, items, safe_page, total_pages = await get_chats_table(user_id=user_id, page=page, force_refresh=force_refresh)
-    markup = chats_list_keyboard(page=safe_page, total_pages=total_pages, items=items)
+    try:
+        text, items, safe_page, total_pages = await get_chats_table(user_id=user_id, page=page, force_refresh=force_refresh)
+        markup = chats_list_keyboard(page=safe_page, total_pages=total_pages, items=items)
+    except PremiumPlusRequired:
+        text = (
+            "Чаты через Seller API доступны только при подписке Premium Plus (Ozon).\n"
+            "seller-edu.ozon.ru"
+        )
+        markup = back_home_keyboard()
 
     sent = await send_section_message(
         SECTION_CHATS_LIST,

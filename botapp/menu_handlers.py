@@ -41,7 +41,13 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
-async def _close_all_sections(bot, user_id: int, *, preserve_menu: bool = False) -> None:
+async def _close_all_sections(
+    bot,
+    user_id: int,
+    *,
+    preserve_menu: bool = False,
+    preserve_message_id: int | None = None,
+) -> None:
     sections = [
         SECTION_REVIEWS_LIST,
         SECTION_REVIEW_CARD,
@@ -64,7 +70,13 @@ async def _close_all_sections(bot, user_id: int, *, preserve_menu: bool = False)
 
     for sec in sections:
         try:
-            await delete_section_message(user_id, sec, bot, force=True)
+            await delete_section_message(
+                user_id,
+                sec,
+                bot,
+                force=True,
+                preserve_message_id=preserve_message_id,
+            )
         except Exception:
             continue
 
@@ -100,7 +112,13 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 async def menu_home(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
-    await _close_all_sections(callback.message.bot, user_id, preserve_menu=False)
+    preserve_mid = callback.message.message_id if callback.message else None
+    await _close_all_sections(
+        callback.message.bot,
+        user_id,
+        preserve_menu=False,
+        preserve_message_id=preserve_mid,
+    )
     await _show_menu(user_id=user_id, callback=callback)
 
 
@@ -108,7 +126,13 @@ async def menu_home(callback: CallbackQuery, state: FSMContext) -> None:
 async def menu_alias(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
-    await _close_all_sections(callback.message.bot, user_id, preserve_menu=False)
+    preserve_mid = callback.message.message_id if callback.message else None
+    await _close_all_sections(
+        callback.message.bot,
+        user_id,
+        preserve_menu=False,
+        preserve_message_id=preserve_mid,
+    )
     await _show_menu(user_id=user_id, callback=callback)
 
 
