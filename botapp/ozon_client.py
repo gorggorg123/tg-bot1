@@ -1357,8 +1357,23 @@ class ChatSummary(BaseModel):
         return data
 
 
+class ChatListItem(BaseModel):
+    chat_id: str | None = None
+    id: str | None = None
+    title: str | None = None
+    chat_type: str | None = None
+    unread_count: int | None = None
+    last_message_id: int | None = None
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=(), populate_by_name=True)
+
+    @property
+    def safe_chat_id(self) -> str | None:
+        return str(self.chat_id or self.id).strip() if (self.chat_id or self.id) else None
+
+
 class ChatListResponse(BaseModel):
-    chats: list[dict] = Field(default_factory=list)
+    chats: list[ChatListItem] = Field(default_factory=list)
     items: list[dict] | None = None
     result: list[dict] | dict | None = None
 
@@ -1367,7 +1382,7 @@ class ChatListResponse(BaseModel):
     def iter_items(self):
         candidates: list[list[dict]] = []
         if self.chats:
-            candidates.append(self.chats)
+            candidates.append([c.model_dump(mode="python") for c in self.chats])
         if isinstance(self.items, list):
             candidates.append(self.items)
         if isinstance(self.result, list):
@@ -1380,48 +1395,10 @@ class ChatListResponse(BaseModel):
 
         for bucket in candidates:
             for item in bucket:
-                yield item
-
-
-class ChatMessage(BaseModel):
-    message_id: str | int | None = None
-    id: str | int | None = None
-    text: str | None = None
-    message: str | None = None
-    content: str | None = None
-    author: dict | str | None = None
-    sender: str | None = Field(default=None, alias="from")
-    created_at: str | None = None
-    send_time: str | None = None
-
-    model_config = ConfigDict(
-        extra="allow",
-        protected_namespaces=(),
-        populate_by_name=True,
-    )
-
-    def to_dict(self) -> dict:
-        data = self.model_dump(exclude_none=True, by_alias=False)
-        mid = data.get("message_id")
-        if mid is not None:
-            data["message_id"] = str(mid)
-        elif self.id is not None:
-            data["message_id"] = str(self.id)
-        if not data.get("text"):
-            for key in ("message", "content"):
-                value = getattr(self, key, None)
-                if isinstance(value, str) and value:
-                    data["text"] = value
-                    break
-        if self.author is not None:
-            data["author"] = self.author
-        if self.sender and "from" not in data:
-            data["from"] = self.sender
-        return data
-
-
-# Совместимость с устаревшим типом в botapp.chats.
-ChatListItem = dict[str, object]
+                try:
+                    yield ChatListItem.model_validate(item)
+                except ValidationError:
+                    continue
 
 
 class ChatHistoryResponse(BaseModel):
@@ -1468,7 +1445,7 @@ async def chat_list(
     unread_only: bool = False,
     include_service: bool = False,
     refresh: bool | None = None,  # backward-compatible no-op
-) -> list[dict]:
+) -> ChatListResponse:
     """List chats (v2).
 
     Important: Ozon's /v2/chat/list требует непустой filter. Пустой объект часто даёт 400.
@@ -1552,7 +1529,14 @@ async def chat_list(
 
         offset_cur += len(raw_items)
 
-    return collected
+    normalized: list[ChatListItem] = []
+    for item in collected:
+        try:
+            normalized.append(ChatListItem.model_validate(item))
+        except ValidationError:
+            normalized.append(ChatListItem.model_validate({"chat_id": str(item.get("chat_id") or item.get("id") or "")}))
+
+    return ChatListResponse(chats=normalized)
 
 
 async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:
@@ -1940,13 +1924,13 @@ class QuestionAnswer:
 class Question:
     id: str
     question_text: str
-    created_at: str | None
-    sku: int | None
-    product_id: str | None
-    product_name: str | None
-    answer_text: str | None
-    answer_created_at: str | None = None
+    created_at: str | None = None
+    sku: int | None = None
+    product_id: str | None = None
+    product_name: str | None = None
+    answer_text: str | None = None
     status: str | None = None
+    answer_created_at: str | None = None
     has_answer: bool = False
     answer_id: str | None = None
     answers_count: int | None = None

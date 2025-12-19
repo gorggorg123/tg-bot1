@@ -7,8 +7,16 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-from botapp.keyboards import MenuCallbackData, back_home_keyboard, main_menu_keyboard
-from botapp.message_gc import (
+from botapp.keyboards import (
+    MenuCallbackData,
+    back_home_keyboard,
+    fbo_menu_keyboard,
+    finance_menu_keyboard,
+    main_menu_keyboard,
+)
+from botapp.sections.finance import logic as finance
+from botapp.sections.fbo import logic as orders
+from botapp.utils.message_gc import (
     SECTION_ACCOUNT,
     SECTION_CHAT_HISTORY,
     SECTION_CHAT_PROMPT,
@@ -33,7 +41,13 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
-async def _close_all_sections(bot, user_id: int, *, preserve_menu: bool = False) -> None:
+async def _close_all_sections(
+    bot,
+    user_id: int,
+    *,
+    preserve_menu: bool = False,
+    preserve_message_id: int | None = None,
+) -> None:
     sections = [
         SECTION_REVIEWS_LIST,
         SECTION_REVIEW_CARD,
@@ -56,7 +70,13 @@ async def _close_all_sections(bot, user_id: int, *, preserve_menu: bool = False)
 
     for sec in sections:
         try:
-            await delete_section_message(user_id, sec, bot, force=True)
+            await delete_section_message(
+                user_id,
+                sec,
+                bot,
+                force=True,
+                preserve_message_id=preserve_message_id,
+            )
         except Exception:
             continue
 
@@ -92,7 +112,13 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 async def menu_home(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
-    await _close_all_sections(callback.message.bot, user_id, preserve_menu=False)
+    preserve_mid = callback.message.message_id if callback.message else None
+    await _close_all_sections(
+        callback.message.bot,
+        user_id,
+        preserve_menu=False,
+        preserve_message_id=preserve_mid,
+    )
     await _show_menu(user_id=user_id, callback=callback)
 
 
@@ -100,7 +126,13 @@ async def menu_home(callback: CallbackQuery, state: FSMContext) -> None:
 async def menu_alias(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
-    await _close_all_sections(callback.message.bot, user_id, preserve_menu=False)
+    preserve_mid = callback.message.message_id if callback.message else None
+    await _close_all_sections(
+        callback.message.bot,
+        user_id,
+        preserve_menu=False,
+        preserve_message_id=preserve_mid,
+    )
     await _show_menu(user_id=user_id, callback=callback)
 
 
@@ -109,11 +141,23 @@ async def menu_fbo(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
     await _close_all_sections(callback.message.bot, user_id, preserve_menu=True)
+    data = MenuCallbackData.unpack(callback.data)
+    action = data.action
+
+    if action in {"open", "summary", None}:
+        text = await orders.get_orders_today_text()
+    elif action == "month":
+        text = await orders.get_orders_month_text()
+    elif action == "filter":
+        text = "🔍 Фильтр скоро будет доступен."
+    else:
+        text = "📦 FBO: выберите действие."
+
     await send_section_message(
         SECTION_FBO,
         user_id=user_id,
-        text="Раздел ФБО в разработке. Скоро добавим подробности.",
-        reply_markup=back_home_keyboard(),
+        text=text,
+        reply_markup=fbo_menu_keyboard(),
         callback=callback,
     )
 
@@ -123,10 +167,20 @@ async def menu_finance(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
     await _close_all_sections(callback.message.bot, user_id, preserve_menu=True)
+    data = MenuCallbackData.unpack(callback.data)
+    action = data.action
+
+    if action in {"open", "summary", None}:
+        text = await finance.get_finance_today_text()
+    elif action == "month":
+        text = await finance.get_finance_month_summary_text()
+    else:
+        text = "🏦 Финансы: выберите период."
+
     await send_section_message(
         SECTION_FINANCE_TODAY,
         user_id=user_id,
-        text="Финансы: раздел в разработке. Скоро здесь появится сводка.",
-        reply_markup=back_home_keyboard(),
+        text=text,
+        reply_markup=finance_menu_keyboard(),
         callback=callback,
     )
