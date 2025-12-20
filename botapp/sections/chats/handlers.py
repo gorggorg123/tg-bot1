@@ -94,7 +94,7 @@ def _build_ai_context_text(norm_msgs) -> str:
     return "\n".join(lines[-80:])
 
 
-async def _clear_other_sections(bot, user_id: int) -> None:
+async def _clear_other_sections(bot, user_id: int, preserve_message_id: int | None = None) -> None:
     for section in (
         SECTION_FBO,
         SECTION_FINANCE_TODAY,
@@ -109,7 +109,13 @@ async def _clear_other_sections(bot, user_id: int) -> None:
         SECTION_WAREHOUSE_PLAN,
         SECTION_WAREHOUSE_PROMPT,
     ):
-        await delete_section_message(user_id, section, bot, force=True)
+        await delete_section_message(
+            user_id,
+            section,
+            bot,
+            force=True,
+            preserve_message_id=preserve_message_id,
+        )
 
 
 async def _show_chats_list(user_id: int, page: int, callback: CallbackQuery | None = None, message: Message | None = None, force_refresh: bool = False) -> None:
@@ -196,7 +202,7 @@ async def _show_chat_thread(user_id: int, token: str, callback: CallbackQuery | 
 async def cmd_chats(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
     await state.clear()
-    await _clear_other_sections(message.bot, user_id)
+    await _clear_other_sections(message.bot, user_id, preserve_message_id=message.message_id)
     await _show_chats_list(user_id=user_id, page=0, message=message, force_refresh=True)
 
 
@@ -204,7 +210,10 @@ async def cmd_chats(message: Message, state: FSMContext) -> None:
 async def open_chats_from_menu(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
-    await _clear_other_sections(callback.message.bot, user_id)
+    preserve_mid = callback.message.message_id if callback.message else None
+    await _clear_other_sections(
+        callback.message.bot, user_id, preserve_message_id=preserve_mid
+    )
     await _show_chats_list(user_id=user_id, page=0, callback=callback, force_refresh=True)
 
 

@@ -1,6 +1,7 @@
 # botapp/reviews_handlers.py
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -41,6 +42,7 @@ from botapp.utils import send_ephemeral_message
 
 logger = logging.getLogger(__name__)
 router = Router()
+_send_locks: dict[tuple[int, str], asyncio.Lock] = {}
 
 
 class ReviewStates(StatesGroup):
@@ -63,6 +65,22 @@ def _review_text_for_ai(card: "ReviewCard") -> tuple[str, bool]:
     if raw:
         return raw, False
     return "(отзыв без текста)", True
+
+
+async def _safe_callback_answer(cb: CallbackQuery | None, text: str | None = None, *, show_alert: bool = False) -> None:
+    if cb is None:
+        return
+    try:
+        await cb.answer(text=text, show_alert=show_alert)
+    except Exception:
+        logger.debug("callback.answer failed", exc_info=True)
+
+
+def _get_send_lock(user_id: int, review_id: str | None) -> asyncio.Lock:
+    key = (user_id, review_id or "")
+    if key not in _send_locks:
+        _send_locks[key] = asyncio.Lock()
+    return _send_locks[key]
 
 
 async def _clear_other_review_sections(bot, user_id: int) -> None:
@@ -96,8 +114,20 @@ async def _show_reviews_list(
         user_id=user_id,
     )
     if sent:
-        await delete_section_message(user_id, SECTION_REVIEW_CARD, sent.bot, force=True)
-        await delete_section_message(user_id, SECTION_REVIEW_PROMPT, sent.bot, force=True)
+        await delete_section_message(
+            user_id,
+            SECTION_REVIEW_CARD,
+            sent.bot,
+            force=True,
+            preserve_message_id=sent.message_id,
+        )
+        await delete_section_message(
+            user_id,
+            SECTION_REVIEW_PROMPT,
+            sent.bot,
+            force=True,
+            preserve_message_id=sent.message_id,
+        )
 
 
 async def _show_review_card(
@@ -169,7 +199,13 @@ async def _show_review_card(
         user_id=user_id,
     )
     if sent:
-        await delete_section_message(user_id, SECTION_REVIEW_PROMPT, sent.bot, force=True)
+        await delete_section_message(
+            user_id,
+            SECTION_REVIEW_PROMPT,
+            sent.bot,
+            force=True,
+            preserve_message_id=sent.message_id,
+        )
 
 
 @router.message(F.text == "/reviews")
@@ -194,11 +230,7 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
     page = int(data.page or 0)
     token = (data.token or data.review_id or "").strip()
 
-    with_exception = False
-    try:
-        await callback.answer()
-    except Exception:
-        with_exception = True
+    await callback.answer()
 
     if action in ("noop", ""):
         return
@@ -224,6 +256,8 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     if action in ("ai", "card_ai"):
+        await _safe_callback_answer(callback, "Пересобираю…")
+
         rid = resolve_review_id(user_id, token) or token
         card = find_review(user_id, rid)
         if not card:
@@ -271,7 +305,6 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             meta={"generated_at": _now_iso()},
         )
 
-        await send_ephemeral_message(callback, text="✅ Черновик создан. Открой карточку — он появится там.", ttl=3)
         await _show_review_card(user_id=user_id, category=category, page=page, token=token, callback=callback)
         return
 
@@ -308,6 +341,8 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     if action == "clear":
+        await _safe_callback_answer(callback, "Очищаю черновик…")
+
         rid = resolve_review_id(user_id, token) or token
         card = find_review(user_id, rid)
         if not card:
@@ -332,71 +367,92 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     if action == "send":
+        await _safe_callback_answer(callback, "Отправляю…")
+
         rid = resolve_review_id(user_id, token) or token
         card = find_review(user_id, rid)
         if not card:
-            await send_ephemeral_message(callback, text="⚠️ Отзыв не найден.")
+            await _safe_callback_answer(callback, "⚠️ Отзыв не найден", show_alert=True)
             return
 
-        saved = get_review_reply(card.id) or {}
-        draft = (saved.get("draft") or "").strip()
-        if len(draft) < 2:
-            await send_ephemeral_message(callback, text="⚠️ Нет черновика. Сначала сгенерируй ИИ-ответ или введи вручную.")
-            return
+        lock = _get_send_lock(user_id, card.id)
+        async with lock:
+            saved = get_review_reply(card.id) or {}
+            draft = (saved.get("draft") or "").strip()
+            if len(draft) < 2:
+                await _safe_callback_answer(
+                    callback,
+                    "⚠️ Нет черновика. Сначала сгенерируй ИИ-ответ или введи вручную.",
+                    show_alert=True,
+                )
+                return
 
-        if not has_write_credentials():
-            await send_ephemeral_message(callback, text="⚠️ Нет write-доступа к Ozon (ключи OZON_WRITE_*).")
-            return
+            if not has_write_credentials():
+                await _safe_callback_answer(
+                    callback,
+                    "⚠️ Нет write-доступа к Ozon (ключи OZON_WRITE_*).",
+                    show_alert=True,
+                )
+                return
 
-        client = get_write_client()
-        if client is None:
-            await send_ephemeral_message(callback, text="⚠️ Write-client не инициализирован.")
-            return
+            client = get_write_client()
+            if client is None:
+                await _safe_callback_answer(callback, "⚠️ Write-client не инициализирован.", show_alert=True)
+                return
 
-        try:
-            await client.review_comment_create(card.id, draft)
-        except OzonAPIError as exc:
-            await send_ephemeral_message(callback, text=f"⚠️ Ozon отклонил отправку: {exc}")
-            return
-        except Exception:
-            logger.exception("review_comment_create failed")
-            await send_ephemeral_message(callback, text="⚠️ Не удалось отправить ответ. Попробуй позже.")
-            return
+            try:
+                await client.review_comment_create(card.id, draft)
+            except OzonAPIError as exc:
+                await _safe_callback_answer(callback, f"⚠️ Ozon отклонил отправку: {exc}", show_alert=True)
+                return
+            except Exception:
+                logger.exception("review_comment_create failed")
+                await _safe_callback_answer(
+                    callback, "⚠️ Не удалось отправить ответ. Попробуй позже.", show_alert=True
+                )
+                return
 
-        draft_source = (saved.get("draft_source") or "manual")
-        upsert_review_reply(
-            review_id=card.id,
-            created_at=_to_iso(card.created_at),
-            product_name=card.product_name,
-            rating=card.rating,
-            review_text=card.text,
-            draft=draft,
-            draft_source=draft_source,
-            sent_to_ozon=True,
-            sent_at=_now_iso(),
-            meta={"sent": True},
-        )
-
-        mark_review_answered(card.id, user_id, text=draft)
-
-        try:
-            rec = ApprovedAnswer.now_iso(
-                kind="review",
-                ozon_entity_id=str(card.id),
-                input_text=card.text or "",
-                answer_text=draft,
-                product_id=str(card.product_id or card.offer_id or "") or None,
+            draft_source = (saved.get("draft_source") or "manual")
+            upsert_review_reply(
+                review_id=card.id,
+                created_at=_to_iso(card.created_at),
                 product_name=card.product_name,
                 rating=card.rating,
-                meta={
-                    "answered_via": "ai" if draft_source == "ai" else "manual",
-                },
+                review_text=card.text,
+                draft="",
+                draft_source=draft_source,
+                sent_to_ozon=True,
+                sent_at=_now_iso(),
+                meta={"sent": True},
             )
-            get_approved_memory_store().add_approved_answer(rec)
-        except Exception:
-            logger.exception("Failed to persist review reply to memory")
 
-        await send_ephemeral_message(callback, text="✅ Ответ отправлен в Ozon.", ttl=4)
+            try:
+                mark_review_answered(card.id, user_id, text=draft)
+            except Exception:
+                logger.exception(
+                    "Failed to mark review answered locally review_id=%s", card.id
+                )
+
+            try:
+                rec = ApprovedAnswer.now_iso(
+                    kind="review",
+                    ozon_entity_id=str(card.id),
+                    input_text=card.text or "",
+                    answer_text=draft,
+                    product_id=str(card.product_id or card.offer_id or "") or None,
+                    product_name=card.product_name,
+                    rating=card.rating,
+                    meta={
+                        "answered_via": "ai" if draft_source == "ai" else "manual",
+                    },
+                )
+                get_approved_memory_store().add_approved_answer(rec)
+            except Exception:
+                logger.exception(
+                    "Failed to persist review reply to memory review_id=%s", card.id
+                )
+
+        await _safe_callback_answer(callback, "✅ Ответ отправлен в Ozon.")
         await _show_review_card(user_id=user_id, category=category, page=page, token=token, callback=callback)
         return
 
