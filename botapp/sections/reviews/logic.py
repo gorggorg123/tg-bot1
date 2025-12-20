@@ -525,6 +525,10 @@ def _merge_review_payload(card: ReviewCard, payload: Dict[str, Any]) -> None:
 
     normalized = _normalize_review(payload)
     card.status = normalized.status or card.status
+    if normalized.text:
+        card.text = normalized.text
+    if normalized.rating:
+        card.rating = normalized.rating
     if normalized.answer_text:
         card.answer_text = normalized.answer_text
     if normalized.answer_created_at:

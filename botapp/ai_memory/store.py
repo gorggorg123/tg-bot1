@@ -15,6 +15,7 @@ from .schemas import MemoryRecord
 logger = logging.getLogger(__name__)
 
 ITOM_MEMORY_DB_PATH_ENV = "ITOM_MEMORY_DB_PATH"
+ITOM_MEMORY_ENABLE_SEED_ENV = "ITOM_MEMORY_ENABLE_SEED"
 DEFAULT_DB_NAME = "data/itom_memory.sqlite"
 DEFAULT_MAX_RECORDS = 20_000
 
@@ -69,6 +70,10 @@ class MemoryStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_ts ON memory(ts)")
 
     def _maybe_seed_from_digest(self) -> None:
+        enabled = os.getenv(ITOM_MEMORY_ENABLE_SEED_ENV, "0").strip() in {"1", "true", "yes", "on"}
+        if not enabled:
+            return
+
         digest_path = Path(__file__).resolve().parents[2] / "data" / "itom_qna_digest.txt"
         if not digest_path.exists():
             return
@@ -191,7 +196,7 @@ class MemoryStore:
         with self._lock, sqlite3.connect(self.path) as conn:
             cur = conn.execute(
                 "SELECT ts, kind, entity_id, input_text, output_text, sku, product_title, meta, source, hash"
-                " FROM memory WHERE kind = ? AND source IN ('sent_to_ozon', 'seed')",
+                " FROM memory WHERE kind = ? AND source = 'sent_to_ozon'",
                 (kind,),
             )
             rows = cur.fetchall()
@@ -243,9 +248,6 @@ class MemoryStore:
         if sku and rec.sku and sku == rec.sku:
             score += 5.0
 
-        if rec.source == "seed":
-            score *= 0.65
-
         return score
 
 
@@ -259,4 +261,10 @@ def get_memory_store() -> MemoryStore:
     return _memory_store
 
 
-__all__ = ["MemoryStore", "MemoryRecord", "get_memory_store", "ITOM_MEMORY_DB_PATH_ENV"]
+__all__ = [
+    "MemoryStore",
+    "MemoryRecord",
+    "get_memory_store",
+    "ITOM_MEMORY_DB_PATH_ENV",
+    "ITOM_MEMORY_ENABLE_SEED_ENV",
+]
