@@ -83,8 +83,20 @@ async def _show_questions_list(
         user_id=user_id,
     )
     if sent:
-        await delete_section_message(user_id, SECTION_QUESTION_CARD, sent.bot, force=True)
-        await delete_section_message(user_id, SECTION_QUESTION_PROMPT, sent.bot, force=True)
+        await delete_section_message(
+            user_id,
+            SECTION_QUESTION_CARD,
+            sent.bot,
+            force=True,
+            preserve_message_id=sent.message_id,
+        )
+        await delete_section_message(
+            user_id,
+            SECTION_QUESTION_PROMPT,
+            sent.bot,
+            force=True,
+            preserve_message_id=sent.message_id,
+        )
 
 
 async def _show_question_card(

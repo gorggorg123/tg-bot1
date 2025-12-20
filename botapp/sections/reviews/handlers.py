@@ -96,8 +96,20 @@ async def _show_reviews_list(
         user_id=user_id,
     )
     if sent:
-        await delete_section_message(user_id, SECTION_REVIEW_CARD, sent.bot, force=True)
-        await delete_section_message(user_id, SECTION_REVIEW_PROMPT, sent.bot, force=True)
+        await delete_section_message(
+            user_id,
+            SECTION_REVIEW_CARD,
+            sent.bot,
+            force=True,
+            preserve_message_id=sent.message_id,
+        )
+        await delete_section_message(
+            user_id,
+            SECTION_REVIEW_PROMPT,
+            sent.bot,
+            force=True,
+            preserve_message_id=sent.message_id,
+        )
 
 
 async def _show_review_card(
@@ -169,7 +181,13 @@ async def _show_review_card(
         user_id=user_id,
     )
     if sent:
-        await delete_section_message(user_id, SECTION_REVIEW_PROMPT, sent.bot, force=True)
+        await delete_section_message(
+            user_id,
+            SECTION_REVIEW_PROMPT,
+            sent.bot,
+            force=True,
+            preserve_message_id=sent.message_id,
+        )
 
 
 @router.message(F.text == "/reviews")
@@ -377,7 +395,12 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             meta={"sent": True},
         )
 
-        mark_review_answered(card.id, user_id, text=draft)
+        try:
+            mark_review_answered(card.id, user_id, text=draft)
+        except Exception:
+            logger.exception(
+                "Failed to mark review answered locally review_id=%s", card.id
+            )
 
         try:
             rec = ApprovedAnswer.now_iso(
@@ -394,7 +417,9 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             )
             get_approved_memory_store().add_approved_answer(rec)
         except Exception:
-            logger.exception("Failed to persist review reply to memory")
+            logger.exception(
+                "Failed to persist review reply to memory review_id=%s", card.id
+            )
 
         await send_ephemeral_message(callback, text="✅ Ответ отправлен в Ozon.", ttl=4)
         await _show_review_card(user_id=user_id, category=category, page=page, token=token, callback=callback)

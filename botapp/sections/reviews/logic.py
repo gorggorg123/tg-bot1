@@ -58,7 +58,12 @@ class ReviewCard:
     # Backward-compatible aliases for older handler code
     @property
     def has_answer(self) -> bool:
-        return bool(self.answered or (self.answer_text or "").strip())
+        return bool(
+            (self.seller_comment or "").strip()
+            or getattr(self, "answer", None)
+            or getattr(self, "is_answered", False)
+            or self.answered
+        )
 
     @property
     def seller_comment(self) -> str | None:
@@ -382,10 +387,19 @@ def encode_review_id(user_id: int, review_id: str | None) -> str | None:
     return _get_review_token(user_id, review_id)
 
 
-def mark_review_answered(review_id: str | None, user_id: int, answer_text: str | None = None) -> None:
+def mark_review_answered(
+    review_id: str | None,
+    user_id: int,
+    answer_text: str | None = None,
+    **kwargs,
+) -> None:
     session = _sessions.get(user_id)
     if not session:
         return
+
+    alias_text = kwargs.pop("text", None)
+    if answer_text is None and alias_text is not None:
+        answer_text = alias_text
 
     for card in session.all_reviews:
         if review_id and card.id == review_id:
