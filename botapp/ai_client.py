@@ -210,8 +210,12 @@ def _style_guide_block() -> str:
     return "Справочник стиля и шаблонов ITOM:\n" + style
 
 
-def _examples_block(kind: str, *, input_text: str, sku: str | None = None, limit: int = 6) -> str:
-    examples = fetch_examples(kind=kind, input_text=input_text, sku=sku, limit=limit)
+def _examples_block(
+    kind: str, *, input_text: str, product_id: str | None = None, limit: int = 6
+) -> str:
+    examples = fetch_examples(
+        kind=kind, input_text=input_text, product_id=product_id, limit=limit
+    )
     return format_examples_block(examples)
 
 
@@ -224,6 +228,7 @@ async def generate_review_reply(
     previous_answer: str | None = None,
     user_prompt: str | None = None,
 ) -> str:
+    is_text_missing = not (review_text or "").strip() or review_text.strip() == "(отзыв без текста)"
     sys = (
         "Ты — помощник продавца на маркетплейсе Ozon. "
         "Пиши ответы на отзывы по-русски, вежливо, без воды, без обещаний того, что нельзя гарантировать. "
@@ -233,6 +238,12 @@ async def generate_review_reply(
         "\n\n"
         + _base_rules()
     )
+
+    if is_text_missing:
+        sys = (
+            sys
+            + "\n\nЕсли отзыв без текста: поблагодари за оценку, предложи написать детали при проблеме, ответ должен быть лаконичным и с одним уместным эмодзи."
+        )
 
     style_block = _style_guide_block()
     if style_block:
@@ -254,7 +265,7 @@ async def generate_review_reply(
         user.append("\nПожелания к ответу (пересборка):")
         user.append(user_prompt)
 
-    examples_block = _examples_block("review", input_text=review_text, sku=sku)
+    examples_block = _examples_block("review", input_text=review_text, product_id=sku)
     if examples_block:
         sys = sys + "\n\n" + examples_block
 
@@ -303,7 +314,9 @@ async def generate_answer_for_question(
         user.append("\nПожелания к ответу:")
         user.append(user_prompt)
 
-    examples_block = _examples_block("question", input_text=question_text, sku=sku)
+    examples_block = _examples_block(
+        "question", input_text=question_text, product_id=sku
+    )
     if examples_block:
         sys = sys + "\n\n" + examples_block
 
@@ -339,7 +352,9 @@ async def generate_chat_reply(*, messages_text: str, user_prompt: str | None = N
     user.append("Переписка (контекст):")
     user.append(_clamp_text(messages_text or "", 7000))
 
-    examples_block = _examples_block("chat", input_text=messages_text, sku=None, limit=4)
+    examples_block = _examples_block(
+        "chat", input_text=messages_text, product_id=None, limit=4
+    )
     if examples_block:
         sys = sys + "\n\n" + examples_block
     user.append(

@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-from botapp.ai_memory import MemoryRecord, get_memory_store
+from botapp.ai_memory import ApprovedAnswer, get_approved_memory_store
 from botapp.api.ai_client import generate_review_reply
 from botapp.keyboards import MenuCallbackData
 from botapp.sections.reviews.keyboards import (
@@ -54,6 +54,15 @@ def _now_iso() -> str:
 
 def _to_iso(dt) -> str | None:
     return dt.isoformat() if isinstance(dt, datetime) else None
+
+
+def _review_text_for_ai(card: "ReviewCard") -> tuple[str, bool]:
+    """Return review text for AI along with a flag indicating if it was empty."""
+
+    raw = (card.text or "").strip()
+    if raw:
+        return raw, False
+    return "(отзыв без текста)", True
 
 
 async def _clear_other_review_sections(bot, user_id: int) -> None:
@@ -123,7 +132,13 @@ async def _show_review_card(
     saved = get_review_reply(card.id) or {}
     draft = (saved.get("draft") or "").strip() or None
 
-    can_send = bool(has_write_credentials() and draft and not (card.answered or (card.answer_text or "").strip()))
+    already_answered = False
+    try:
+        already_answered = bool(card.has_answer)
+    except Exception:
+        already_answered = bool(card.answered or (card.answer_text or "").strip())
+
+    can_send = bool(has_write_credentials() and draft and not already_answered)
     period_title = "Отзывы"
     view, _ = await get_review_and_card(user_id, category, index=0, review_id=card.id)
     if view and view.period:
@@ -220,16 +235,14 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         except Exception:
             pass
 
-        if not (card.text or "").strip():
-            await send_ephemeral_message(callback, text="⚠️ Нет текста отзыва (не удалось загрузить детали).")
-            return
-
         saved = get_review_reply(card.id) or {}
         previous = (saved.get("draft") or "").strip() or None
 
+        review_text, _ = _review_text_for_ai(card)
+
         try:
             draft = await generate_review_reply(
-                review_text=card.text or "",
+                review_text=review_text,
                 product_name=card.product_name,
                 sku=str(card.product_id or card.offer_id or "") or None,
                 rating=card.rating,
@@ -367,19 +380,19 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         mark_review_answered(card.id, user_id, text=draft)
 
         try:
-            rec = MemoryRecord.now_iso(
+            rec = ApprovedAnswer.now_iso(
                 kind="review",
-                entity_id=str(card.id),
+                ozon_entity_id=str(card.id),
                 input_text=card.text or "",
-                output_text=draft,
-                sku=str(card.product_id or card.offer_id or "") or None,
-                product_title=card.product_name,
+                answer_text=draft,
+                product_id=str(card.product_id or card.offer_id or "") or None,
+                product_name=card.product_name,
+                rating=card.rating,
                 meta={
-                    "rating": card.rating,
                     "answered_via": "ai" if draft_source == "ai" else "manual",
                 },
             )
-            get_memory_store().add_record(rec)
+            get_approved_memory_store().add_approved_answer(rec)
         except Exception:
             logger.exception("Failed to persist review reply to memory")
 
@@ -427,10 +440,11 @@ async def review_reprompt_text(message: Message, state: FSMContext) -> None:
 
     saved = get_review_reply(card.id) or {}
     previous = (saved.get("draft") or "").strip() or None
+    review_text, _ = _review_text_for_ai(card)
 
     try:
         draft = await generate_review_reply(
-            review_text=card.text or "",
+            review_text=review_text,
             product_name=card.product_name,
             sku=str(card.product_id or card.offer_id or "") or None,
             rating=card.rating,

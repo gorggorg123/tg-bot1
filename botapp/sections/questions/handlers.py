@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-from botapp.ai_memory import MemoryRecord, get_memory_store
+from botapp.ai_memory import ApprovedAnswer, get_approved_memory_store
 from botapp.api.ai_client import generate_answer_for_question
 from botapp.keyboards import MenuCallbackData
 from botapp.sections.questions.keyboards import (
@@ -356,16 +356,17 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
         invalidate_answer_cache(q.id, user_id=user_id)
 
         try:
-            rec = MemoryRecord.now_iso(
+            rec = ApprovedAnswer.now_iso(
                 kind="question",
-                entity_id=str(q.id),
+                ozon_entity_id=str(q.id),
                 input_text=q.question_text or "",
-                output_text=draft,
-                sku=q.sku,
-                product_title=q.product_name,
+                answer_text=draft,
+                product_id=q.sku or q.product_id,
+                product_name=q.product_name,
+                rating=None,
                 meta={"answered_via": "ai" if answer_source == "ai" else "manual"},
             )
-            get_memory_store().add_record(rec)
+            get_approved_memory_store().add_approved_answer(rec)
         except Exception:
             logger.exception("Failed to persist question answer to memory")
 

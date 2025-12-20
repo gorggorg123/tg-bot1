@@ -698,6 +698,37 @@ class OzonClient:
             return None
         return data.get("result") if isinstance(data.get("result"), dict) else data
 
+    async def review_comment_create(
+        self, review_id: str, text: str, *, mark_as_processed: bool = True
+    ) -> dict | None:
+        """Отправить комментарий продавца к отзыву через /v1/review/comment/create."""
+
+        text_clean = (text or "").strip()
+        if len(text_clean) < 2:
+            raise OzonAPIError("Ответ пустой или слишком короткий для отправки в Ozon")
+
+        body: Dict[str, Any] = {
+            "review_id": review_id,
+            "text": text_clean,
+        }
+        if mark_as_processed:
+            body["mark_review_as_processed"] = True
+
+        logger.info(
+            "review_comment_create POST /v1/review/comment/create review_id=%s len=%s",
+            review_id,
+            len(text_clean),
+        )
+
+        data = await self.post("/v1/review/comment/create", body)
+        if not isinstance(data, dict):
+            logger.warning("Unexpected /v1/review/comment/create response: %r", data)
+            return None
+
+        result = data.get("result") if isinstance(data.get("result"), dict) else data
+        logger.info("review_comment_create %s ok", review_id)
+        return result
+
     async def question_list(self, *, limit: int = 50, page: int | None = None) -> GetQuestionListResponse | dict | None:
         """Обёртка над /v1/question/list с валидацией схемы."""
 

@@ -20,19 +20,23 @@ ChatCallbackData = ChatsCallbackData
 
 def chats_list_keyboard(
     *,
-    items: list[tuple[str, str]],
+    items: list[dict],
     page: int,
     total_pages: int,
     unread_only: bool = False,
     show_service: bool = False,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    for chat_id, caption in items:
+    for item in items:
+        token = item.get("token") or item.get("chat_id")
+        caption = item.get("title") or item.get("caption") or "(чат)"
+        if not token:
+            continue
         rows.append(
             [
                 InlineKeyboardButton(
                     text=caption,
-                    callback_data=ChatsCallbackData(action="open", chat_id=chat_id).pack(),
+                    callback_data=ChatsCallbackData(action="open", token=token, chat_id=token).pack(),
                 )
             ]
         )
@@ -88,11 +92,11 @@ def chat_header_keyboard(token: str) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔄 Обновить",
+                    text="➡️ Новые",
                     callback_data=ChatsCallbackData(action="refresh_thread", token=token).pack(),
                 ),
                 InlineKeyboardButton(
-                    text="⬇️ Старые",
+                    text="⬅️ Старые",
                     callback_data=ChatsCallbackData(action="older", token=token).pack(),
                 ),
             ],

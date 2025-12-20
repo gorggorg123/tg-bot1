@@ -6,29 +6,29 @@ from typing import Any, Dict
 
 
 @dataclass(slots=True)
-class MemoryRecord:
+class ApprovedAnswer:
     ts: str
     kind: str  # review | question | chat
-    entity_id: str
+    ozon_entity_id: str
     input_text: str
-    output_text: str
-    sku: str | None = None
-    product_title: str | None = None
+    answer_text: str
+    product_id: str | None = None
+    product_name: str | None = None
+    rating: int | None = None
     meta: Dict[str, Any] = field(default_factory=dict)
-    source: str = "sent_to_ozon"
     hash: str | None = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "ts": self.ts,
             "kind": self.kind,
-            "entity_id": self.entity_id,
+            "ozon_entity_id": self.ozon_entity_id,
             "input_text": self.input_text,
-            "output_text": self.output_text,
-            "sku": self.sku,
-            "product_title": self.product_title,
+            "answer_text": self.answer_text,
+            "product_id": self.product_id,
+            "product_name": self.product_name,
+            "rating": self.rating,
             "meta": self.meta or {},
-            "source": self.source,
             "hash": self.hash,
         }
 
@@ -37,25 +37,25 @@ class MemoryRecord:
         cls,
         *,
         kind: str,
-        entity_id: str,
+        ozon_entity_id: str,
         input_text: str,
-        output_text: str,
-        sku: str | None = None,
-        product_title: str | None = None,
+        answer_text: str,
+        product_id: str | None = None,
+        product_name: str | None = None,
+        rating: int | None = None,
         meta: Dict[str, Any] | None = None,
-        source: str = "sent_to_ozon",
-    ) -> "MemoryRecord":
+    ) -> "ApprovedAnswer":
         return cls(
             ts=datetime.now().astimezone().isoformat(),
             kind=kind,
-            entity_id=entity_id,
+            ozon_entity_id=ozon_entity_id,
             input_text=input_text,
-            output_text=output_text,
-            sku=sku,
-            product_title=product_title,
+            answer_text=answer_text,
+            product_id=product_id,
+            product_name=product_name,
+            rating=rating,
             meta=meta or {},
-            source=source,
         )
 
 
-__all__ = ["MemoryRecord"]
+__all__ = ["ApprovedAnswer"]

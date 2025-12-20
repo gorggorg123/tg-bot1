@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-from botapp.ai_memory import MemoryRecord, get_memory_store
+from botapp.ai_memory import ApprovedAnswer, get_approved_memory_store
 from botapp.api.ai_client import generate_chat_reply
 from botapp.sections.chats.logic import (
     PremiumPlusRequired,
@@ -113,6 +113,7 @@ async def _clear_other_sections(bot, user_id: int) -> None:
 
 
 async def _show_chats_list(user_id: int, page: int, callback: CallbackQuery | None = None, message: Message | None = None, force_refresh: bool = False) -> None:
+    items: list[dict] = []
     try:
         text, items, safe_page, total_pages = await get_chats_table(user_id=user_id, page=page, force_refresh=force_refresh)
         markup = chats_list_keyboard(page=safe_page, total_pages=total_pages, items=items)
@@ -126,6 +127,9 @@ async def _show_chats_list(user_id: int, page: int, callback: CallbackQuery | No
         logger.warning("Chat list unavailable for user %s: %s", user_id, exc)
         text = friendly_chat_error(exc)
         markup = back_home_keyboard()
+
+    if not items:
+        text += "\n\nЧаты пустые или нет доступа к методам чатов этим ключом/тарифом. Проверьте права/подписку."
 
     sent = await send_section_message(
         SECTION_CHATS_LIST,
@@ -168,9 +172,9 @@ async def _show_chat_thread(user_id: int, token: str, callback: CallbackQuery | 
             user_id=user_id,
             chat_id=ozon_chat_id,
             force_refresh=force_refresh,
-            customer_only=True,
-            include_seller=not show_only_buyer,
-            max_messages=18,
+            customer_only=False,
+            include_seller=True,
+            max_messages=30,
         )
     except OzonAPIError as exc:
         await send_ephemeral_message(callback or message, text=friendly_chat_error(exc))
@@ -346,14 +350,17 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
 
         try:
             buyer_text = last_buyer_message_text(user_id, ozon_chat_id) or ""
-            rec = MemoryRecord.now_iso(
+            rec = ApprovedAnswer.now_iso(
                 kind="chat",
-                entity_id=str(ozon_chat_id),
+                ozon_entity_id=str(ozon_chat_id),
                 input_text=buyer_text,
-                output_text=draft,
+                answer_text=draft,
+                product_id=None,
+                product_name=None,
+                rating=None,
                 meta={"answered_via": "ai"},
             )
-            get_memory_store().add_record(rec)
+            get_approved_memory_store().add_approved_answer(rec)
         except Exception:
             logger.exception("Failed to persist chat reply to memory")
 

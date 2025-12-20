@@ -138,6 +138,7 @@ class NormalizedMessage:
     role: str  # buyer | seller | ozon
     text: str
     created_at: str | None = None
+    attachments: list[str] = field(default_factory=list)
     raw: dict | None = None
 
 
@@ -247,6 +248,55 @@ def _extract_text(m: dict) -> str:
     return ""
 
 
+def _extract_attachments(m: dict) -> list[str]:
+    attachments: list[str] = []
+
+    def _human_size(size: int | float | None) -> str:
+        try:
+            sz = float(size or 0)
+        except Exception:
+            return ""
+        units = ["Б", "КБ", "МБ", "ГБ"]
+        idx = 0
+        while sz >= 1024 and idx < len(units) - 1:
+            sz /= 1024
+            idx += 1
+        return f"{sz:.0f} {units[idx]}" if sz else ""
+
+    def _append(item: dict | str) -> None:
+        if isinstance(item, str):
+            label = item.strip()
+            if label:
+                attachments.append(f"📎 {label}")
+            return
+        if not isinstance(item, dict):
+            return
+        name = item.get("file_name") or item.get("name") or item.get("filename") or item.get("title")
+        kind = item.get("type") or item.get("mime_type")
+        size = _human_size(item.get("size") or item.get("file_size"))
+        parts = [p for p in (name, kind, size) if p]
+        label = "; ".join(parts) if parts else "вложение"
+        attachments.append(f"📎 {label}")
+
+    for key in ("attachments", "files", "documents", "images", "photos"):
+        maybe = m.get(key)
+        if isinstance(maybe, list):
+            for entry in maybe:
+                _append(entry)
+        elif isinstance(maybe, dict):
+            _append(maybe)
+
+    payload = m.get("payload")
+    if isinstance(payload, dict):
+        for key in ("attachments", "files"):
+            maybe = payload.get(key)
+            if isinstance(maybe, list):
+                for entry in maybe:
+                    _append(entry)
+
+    return attachments
+
+
 def _extract_created_at(m: dict) -> str | None:
     for k in ("created_at", "create_time", "timestamp", "date", "time"):
         v = m.get(k)
@@ -262,7 +312,12 @@ def normalize_thread_messages(raw_messages: list[dict], *, customer_only: bool =
             continue
         role = _detect_sender_type(m)
         txt = _extract_text(m)
-        if not txt:
+        attachments = _extract_attachments(m)
+        if attachments and txt:
+            txt = txt + "\n" + "\n".join(attachments)
+        elif attachments and not txt:
+            txt = "\n".join(attachments)
+        if not (txt or attachments):
             continue
 
         if customer_only:
@@ -271,7 +326,15 @@ def normalize_thread_messages(raw_messages: list[dict], *, customer_only: bool =
             if role == "seller" and not include_seller:
                 continue
 
-        out.append(NormalizedMessage(role=role, text=txt, created_at=_extract_created_at(m), raw=m))
+        out.append(
+            NormalizedMessage(
+                role=role,
+                text=txt,
+                created_at=_extract_created_at(m),
+                attachments=attachments,
+                raw=m,
+            )
+        )
 
     return out
 
@@ -331,6 +394,9 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
             cache.chat_id_to_token[cid] = tok
             cache.token_to_chat_id[tok] = cid
 
+        if not chats:
+            logger.info("Chat list returned 0 items for user %s (HTTP 200)", user_id)
+
 
 async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = False) -> tuple[str, list[dict], int, int]:
     await refresh_chats_list(user_id, force=force_refresh)
@@ -356,15 +422,44 @@ async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = Fals
         tok = cache.chat_id_to_token.get(cid) or _short_token(user_id, cid)
         title = (c.title or "").strip() or f"Чат {cid}"
         title = _trim(title.replace("\n", " "), 42)
-        items.append({"token": tok, "title": title, "unread_count": int(c.unread_count or 0)})
+        extras = getattr(c, "model_extra", {}) or {}
+        last_message = extras.get("last_message") or getattr(c, "last_message", None)
+        if isinstance(last_message, dict):
+            last_snippet = _trim(_extract_text(last_message) or _extract_text(last_message.get("message") or {}) or "", 60)
+            if not last_snippet:
+                attach_preview = _extract_attachments(last_message)
+                last_snippet = attach_preview[0] if attach_preview else ""
+            last_time = _fmt_time(last_message.get("created_at") or last_message.get("time") or last_message.get("timestamp"))
+        else:
+            last_snippet = _trim(str(getattr(c, "last_message_text", "") or extras.get("last_message_text") or ""), 60)
+            last_time = _fmt_time(getattr(c, "last_message_time", None) or extras.get("last_message_time"))
+
+        badge = f" ({int(c.unread_count or 0)} непроч.)" if int(c.unread_count or 0) > 0 else ""
+        subtitle_parts = [p for p in (last_snippet, last_time) if p]
+        subtitle = " | ".join(subtitle_parts)
+        caption = title
+        if subtitle:
+            caption = _trim(f"{title}\n{subtitle}{badge}", 64)
+        elif badge:
+            caption = _trim(f"{title}{badge}", 64)
+
+        items.append({"token": tok, "title": caption or title, "unread_count": int(c.unread_count or 0)})
 
     stamp = cache.fetched_at.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC") if cache.fetched_at else "—"
-    text = (
-        f"<b>Чаты</b>\n"
-        f"Обновлено: <code>{stamp}</code>\n"
-        f"Всего: <b>{total}</b> | Страница: <b>{safe_page + 1}/{total_pages}</b>\n\n"
-        f"Выберите чат:"
-    )
+    if total == 0:
+        text = (
+            "<b>Чаты</b>\n"
+            f"Обновлено: <code>{stamp}</code>\n"
+            "Чаты пустые или нет доступа к методам чатов этим ключом/тарифом.\n"
+            "Проверьте права OZON_CLIENT_ID / OZON_API_KEY и подписку Premium Plus."
+        )
+    else:
+        text = (
+            f"<b>Чаты</b>\n"
+            f"Обновлено: <code>{stamp}</code>\n"
+            f"Всего: <b>{total}</b> | Страница: <b>{safe_page + 1}/{total_pages}</b>\n\n"
+            f"Выберите чат:"
+        )
     return text, items, safe_page, total_pages
 
 
@@ -436,12 +531,11 @@ def _bubble_text(msg: NormalizedMessage) -> str:
     tm = _fmt_time(msg.created_at)
     txt = _escape(msg.text)
 
-    # минималистично, чтобы было похоже на “пузырь”
-    if msg.role == "buyer":
-        return f"{txt}\n<i>{tm}</i>" if tm else txt
-    if msg.role == "seller":
-        return f"<b>Вы:</b> {txt}\n<i>{tm}</i>" if tm else f"<b>Вы:</b> {txt}"
-    return f"<i>{txt}</i>"
+    label = "Покупатель" if msg.role == "buyer" else ("Вы" if msg.role == "seller" else "Сервис")
+    prefix = f"<b>{label}:</b> "
+    if tm:
+        return f"{prefix}{txt}\n<i>{tm}</i>"
+    return prefix + txt
 
 
 async def get_chat_bubbles_for_ui(
@@ -454,7 +548,9 @@ async def get_chat_bubbles_for_ui(
     max_messages: int = 18,
 ) -> list[str]:
     th = await refresh_chat_thread(user_id=user_id, chat_id=chat_id, force=force_refresh, limit=DEFAULT_THREAD_LIMIT)
-    norm = normalize_thread_messages(th.raw_messages, customer_only=customer_only, include_seller=include_seller)
+    norm = normalize_thread_messages(
+        th.raw_messages, customer_only=customer_only, include_seller=include_seller
+    )
 
     # показываем последние max_messages
     tail = norm[-max(1, int(max_messages)) :]
