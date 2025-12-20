@@ -1438,6 +1438,55 @@ def _merge_nested_block(item: dict, key: str) -> dict:
     return item
 
 
+def _normalize_chat_history_payload(data: object) -> tuple[dict | None, bool]:
+    """Coerce chat history responses into a dict payload and flag anomalies."""
+
+    payload: object = data
+    payload_was_weird = False
+
+    if isinstance(data, dict):
+        result_block = data.get("result")
+        if isinstance(result_block, dict):
+            payload = result_block
+        elif isinstance(result_block, list):
+            payload = {"result": result_block}
+            payload_was_weird = True
+        else:
+            payload = data
+    else:
+        payload_was_weird = True
+
+    if not isinstance(payload, dict):
+        if isinstance(payload, list):
+            payload = {"items": payload}
+            payload_was_weird = True
+        else:
+            return None, True
+
+    return payload, payload_was_weird
+
+
+def _normalize_chat_list_payload(data: object) -> dict | None:
+    """Coerce chat list responses into a dict payload or return None."""
+
+    payload: object = data
+    if isinstance(data, dict):
+        result_block = data.get("result")
+        if isinstance(result_block, dict):
+            payload = result_block
+        elif isinstance(result_block, list):
+            payload = {"result": result_block}
+        else:
+            payload = data
+
+    if isinstance(payload, list):
+        payload = {"items": payload}
+
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
 async def chat_list(
     limit: int = 100,
     offset: int = 0,
@@ -1479,9 +1528,9 @@ async def chat_list(
         if status_code >= 400:
             raise OzonAPIError(f"Ozon API error {status_code} on /v3/chat/list: {data}")
 
-        payload = data.get("result") if isinstance(data, dict) else data
-        if not isinstance(payload, dict):
-            logger.warning("Chat list payload is not a dict: %r", payload)
+        payload = _normalize_chat_list_payload(data)
+        if payload is None:
+            logger.warning("Chat list payload is not a dict: %r", data)
             return ChatListResponse(chats=[])
         parsed_items: list[ChatListItem] = []
         try:
@@ -1535,12 +1584,19 @@ async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:
             f"Ошибка Ozon API при получении истории чата: HTTP {status_code} {message or data}"
         )
 
-    payload = data.get("result") if isinstance(data.get("result"), dict) else data
+    payload, payload_was_weird = _normalize_chat_history_payload(data)
+    if payload is None:
+        logger.warning("Chat history payload is not a dict: %r", data)
+        return [
+            {"text": "История пуста / не удалось разобрать ответ API", "_raw": data}
+        ]
+
     raw_items: list[dict] = []
     try:
         parsed = ChatHistoryResponse.model_validate(payload)
         raw_items = list(parsed.iter_items())
     except ValidationError as exc:
+        payload_was_weird = True
         logger.warning("Failed to parse chat history payload: %s", exc)
         if isinstance(payload, dict):
             for key in ("messages", "items", "result"):
@@ -1557,7 +1613,24 @@ async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:
                     if raw_items:
                         break
         if not raw_items:
-            return []
+            logger.warning("Chat history payload is empty or invalid: %r", payload)
+            return [
+                {
+                    "text": "История пуста / не удалось разобрать ответ API",
+                    "_raw": payload,
+                }
+            ]
+
+    if not raw_items:
+        if payload_was_weird:
+            logger.warning("Chat history payload has no messages: %r", payload)
+            return [
+                {
+                    "text": "История пуста / не удалось разобрать ответ API",
+                    "_raw": payload,
+                }
+            ]
+        return []
 
     messages: list[dict] = []
     for raw in raw_items:

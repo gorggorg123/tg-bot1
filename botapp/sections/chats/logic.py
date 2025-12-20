@@ -9,7 +9,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from botapp.api.ozon_client import (
-    ChatHistoryResponse,
     ChatListItem,
     OzonAPIError,
     chat_history as ozon_chat_history,
@@ -57,6 +56,36 @@ def _is_premium_plus_error(exc: Exception) -> bool:
 
 def _short_token(user_id: int, chat_id: str) -> str:
     return _chat_tokens.generate(user_id, chat_id, key=chat_id)
+
+
+def _extract_last_message_id(raw_messages: list[dict]) -> int | None:
+    last_id: int | None = None
+    for m in raw_messages or []:
+        if not isinstance(m, dict):
+            continue
+        for key in ("message_id", "id"):
+            candidate = m.get(key)
+            if candidate is None:
+                continue
+            try:
+                cid = int(candidate)
+            except (TypeError, ValueError):
+                continue
+            if last_id is None or cid > last_id:
+                last_id = cid
+            break
+
+        if last_id is None:
+            created = m.get("created_at") or m.get("timestamp")
+            if isinstance(created, str) and created:
+                try:
+                    ts_val = datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()
+                    pseudo_id = int(ts_val)
+                    if last_id is None or pseudo_id > last_id:
+                        last_id = pseudo_id
+                except Exception:
+                    continue
+    return last_id
 
 
 @dataclass(slots=True)
@@ -301,9 +330,9 @@ async def refresh_chat_thread(*, user_id: int, chat_id: str, force: bool = False
     if not force and t.raw_messages and is_cache_fresh(t.fetched_at, THREAD_TTL_SECONDS):
         return ThreadView(chat_id=cid, raw_messages=t.raw_messages, fetched_at=t.fetched_at, limit=t.limit, last_message_id=t.last_message_id)
 
-    resp: ChatHistoryResponse = await ozon_chat_history(cid, limit=t.limit)
-    t.raw_messages = resp.messages or []
-    t.last_message_id = resp.last_message_id
+    raw_messages = await ozon_chat_history(cid, limit=t.limit)
+    t.raw_messages = raw_messages or []
+    t.last_message_id = _extract_last_message_id(t.raw_messages)
     t.fetched_at = _now_utc()
 
     return ThreadView(chat_id=cid, raw_messages=t.raw_messages, fetched_at=t.fetched_at, limit=t.limit, last_message_id=t.last_message_id)

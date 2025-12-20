@@ -511,17 +511,16 @@ def format_question_card_text(
     product = _pick_product_label_question(question)
 
     qid = safe_strip(getattr(question, "id", None))
-    status = safe_strip(getattr(question, "status", None))
-    status_label = status.upper() if status else "СТАТУС НЕИЗВЕСТЕН"
-
     question_text = safe_strip(getattr(question, "question_text", None)) or "—"
 
     published_answer = safe_strip(getattr(question, "answer_text", None))
     answer_dt_raw = safe_strip(getattr(question, "answer_created_at", None))
     answer_dt = _fmt_dt_msk(_parse_date(answer_dt_raw)) if answer_dt_raw else None
+    has_answer = bool(getattr(question, "has_answer", False)) or bool(published_answer)
 
     lines: list[str] = []
-    lines.append(f"❓ Вопрос  •  {status_label}")
+    badge = "✅" if has_answer else "🆕"
+    lines.append(f"❓ Вопрос  •  {badge}")
     lines.append(f"📅 {created_part}{age_part}")
     lines.append(f"🛒 Товар: {product}")
     if qid:
@@ -623,12 +622,6 @@ def build_questions_table(
     for i, q in enumerate(slice_items, start=1 + safe_page * page_size):
         created_at = _parse_date(getattr(q, "created_at", None))
         date_part = _fmt_dt_msk(created_at) or "—"
-        raw_status_text = safe_strip(getattr(q, "status", None)) or ""
-        status_upper = raw_status_text.upper()
-        status_label = {"PROCESSED": "Опубликован"}.get(
-            status_upper, raw_status_text
-        )
-
         product = _pick_short_product_label_question(q)
 
         a_text = safe_str(getattr(q, "answer_text", None))
@@ -639,8 +632,6 @@ def build_questions_table(
         qid = safe_strip(getattr(q, "id", None))
         if qid:
             parts = [f"{i}) {badge}", date_part]
-            if status_label:
-                parts.append(status_label)
             parts.append(product)
             label = " · ".join(parts)
             items.append((label, qid, i - 1))

@@ -694,14 +694,14 @@ def format_review_card_text(
     rating = max(0, min(rating, 5))
     stars = "⭐" * rating + ("☆" * (5 - rating) if rating else "")
 
-    status_icon, status_text = _status_badge(card)
     product_label = safe_strip(_pick_product_label(card)) or _pick_product_label(card) or _pick_short_product_label(card) or "—"
 
     # Текст отзыва
     review_text = safe_strip(card.text) or "—"
 
     lines: list[str] = []
-    lines.append(f"📝 Отзыв {stars}  •  {status_icon} {status_text}")
+    badge = "✅" if card.answered else "🆕"
+    lines.append(f"📝 Отзыв {stars}  •  {badge}")
     lines.append(f"📅 {created_part}{age_part}")
     lines.append(f"🛒 Товар: {product_label}")
 
@@ -959,6 +959,9 @@ async def fetch_recent_reviews(
     max_reviews: int = MAX_REVIEWS_LOAD,
     product_cache: Dict[str, str | None] | None = None,
     target_filtered: int = REVIEWS_PAGE_SIZE * 3,
+    stale_pages_threshold: int = 3,
+    stale_recency_days: int = 3,
+    fallback_limit: int = 400,
 ) -> Tuple[List[ReviewCard], str]:
     """Загрузить свежие отзывы порционно, останавливаясь как только хватает данных.
 
@@ -979,10 +982,14 @@ async def fetch_recent_reviews(
     raw: list[Dict[str, Any]] = []
     filtered_cards: list[ReviewCard] = []
     last_id: str | None = None
-    page = 1
     target_count = max(target_filtered, REVIEWS_PAGE_SIZE)
     filter_from_date = since_msk.date()
     filter_to_date = to_msk.date()
+    stale_cutoff = _msk_now() - timedelta(days=stale_recency_days)
+    pages_fetched = 0
+    max_pages = 6
+    freshest_seen: datetime | None = None
+    early_stop_threshold = timedelta(days=1)
 
     def _should_stop() -> bool:
         if len(filtered_cards) >= target_count:
@@ -992,16 +999,23 @@ async def fetch_recent_reviews(
             )
             if oldest and oldest.date() <= filter_from_date:
                 return True
+        if len(filtered_cards) >= REVIEWS_PAGE_SIZE * 3:
+            oldest = min(
+                (_to_msk(c.created_at) for c in filtered_cards if c.created_at),
+                default=None,
+            )
+            if oldest and oldest.date() <= (filter_from_date - early_stop_threshold):
+                return True
         return False
 
     try:
-        while len(raw) < max_reviews:
+        while len(raw) < max_reviews and pages_fetched < max_pages:
+            pages_fetched += 1
             res = await client.review_list(
                 date_start=_iso_no_ms(fetch_from_utc or fetch_since_msk),
                 date_end=_iso_no_ms(fetch_to_utc or to_msk),
                 limit=limit_per_page,
                 last_id=last_id,
-                page=page if last_id is None else None,
             )
             if not isinstance(res, dict):
                 break
@@ -1020,6 +1034,19 @@ async def fetch_recent_reviews(
                     answer_filter="all",
                 )
                 filtered_cards.extend(chunk_filtered)
+                chunk_dates = [
+                    dt
+                    for dt in (
+                        _to_msk(c.created_at)
+                        for c in chunk_cards
+                        if c.created_at is not None
+                    )
+                    if dt is not None
+                ]
+                if chunk_dates:
+                    newest_chunk = max(chunk_dates)
+                    if freshest_seen is None or newest_chunk > freshest_seen:
+                        freshest_seen = newest_chunk
             else:
                 break
 
@@ -1033,10 +1060,62 @@ async def fetch_recent_reviews(
                 last_id = str(next_last_id)
                 continue
 
+            if has_next and not next_last_id:
+                logger.warning("/v1/review/list reports has_next without last_id, stopping pagination")
+                break
+
             if has_next:
-                page += 1
                 continue
             break
+
+        fallback_needed = (
+            pages_fetched >= stale_pages_threshold
+            and (freshest_seen is None or freshest_seen < stale_cutoff)
+        )
+
+        if fallback_needed:
+            logger.warning(
+                "Review pagination looks stale (freshest=%s, cutoff=%s, pages=%s). Running fallback fetch without date bounds.",
+                freshest_seen,
+                stale_cutoff,
+                pages_fetched,
+            )
+            raw_fallback: list[Dict[str, Any]] = []
+            last_id_fallback: str | None = None
+            fallback_pages = 0
+            while len(raw_fallback) < fallback_limit and fallback_pages < max_pages:
+                fallback_pages += 1
+                res_fb = await client.review_list(limit=limit_per_page, last_id=last_id_fallback)
+                if not isinstance(res_fb, dict):
+                    break
+                fb_items = res_fb.get("reviews") or res_fb.get("feedbacks") or res_fb.get("items") or []
+                fb_has_next = bool(res_fb.get("has_next") or res_fb.get("hasNext"))
+                fb_next_last_id = res_fb.get("last_id") or res_fb.get("lastId")
+
+                if not isinstance(fb_items, list):
+                    break
+
+                fb_new = [x for x in fb_items if isinstance(x, dict)]
+                raw_fallback.extend(fb_new)
+                if len(raw_fallback) >= fallback_limit:
+                    break
+
+                if fb_has_next and fb_next_last_id:
+                    last_id_fallback = str(fb_next_last_id)
+                    continue
+                if fb_has_next:
+                    continue
+                break
+
+            if raw_fallback:
+                raw = raw_fallback
+                normalized = [_normalize_review(r) for r in raw_fallback]
+                filtered_cards, _ = _filter_reviews_and_stats(
+                    normalized,
+                    period_from_msk=filter_from_date,
+                    period_to_msk=filter_to_date,
+                    answer_filter="all",
+                )
 
         if raw:
             # DEBUG: один пример для сверки схемы ReviewAPI, чтобы не спамить логи
@@ -1157,13 +1236,10 @@ def build_reviews_table(
 
         badge = "✅" if card.answered else "🆕"
 
-        status_text = safe_strip(card.status) or ""
-        status_label = status_text.upper() if status_text else stars
-
         review_id = card.id or ""
         token = encode_review_id(user_id, review_id)
         if review_id:
-            label = f"{i}) {badge} {created} · {status_label} · {prod}"
+            label = f"{i}) {badge} {created} · {stars} · {prod}"
             items.append((label, token or review_id, i - 1))
 
     text = header or " "
