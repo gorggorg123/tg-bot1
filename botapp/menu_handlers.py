@@ -140,7 +140,13 @@ async def menu_alias(callback: CallbackQuery, state: FSMContext) -> None:
 async def menu_fbo(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
-    await _close_all_sections(callback.message.bot, user_id, preserve_menu=True)
+    preserve_mid = callback.message.message_id if callback.message else None
+    await _close_all_sections(
+        callback.message.bot,
+        user_id,
+        preserve_menu=True,
+        preserve_message_id=preserve_mid,
+    )
     data = MenuCallbackData.unpack(callback.data)
     action = data.action
 
@@ -166,7 +172,13 @@ async def menu_fbo(callback: CallbackQuery, state: FSMContext) -> None:
 async def menu_finance(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
-    await _close_all_sections(callback.message.bot, user_id, preserve_menu=True)
+    preserve_mid = callback.message.message_id if callback.message else None
+    await _close_all_sections(
+        callback.message.bot,
+        user_id,
+        preserve_menu=True,
+        preserve_message_id=preserve_mid,
+    )
     data = MenuCallbackData.unpack(callback.data)
     action = data.action
 
