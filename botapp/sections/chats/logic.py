@@ -1,6 +1,7 @@
 # botapp/sections/chats/logic.py
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
@@ -21,9 +22,11 @@ logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 10
 CACHE_TTL_SECONDS = 30
-THREAD_TTL_SECONDS = 15
+THREAD_TTL_SECONDS = 10
 
 _chat_tokens = TokenStore(ttl_seconds=CACHE_TTL_SECONDS)
+_chat_list_locks: dict[int, asyncio.Lock] = {}
+_thread_locks: dict[tuple[int, str], asyncio.Lock] = {}
 
 DEFAULT_THREAD_LIMIT = 30
 MAX_THREAD_LIMIT = 180
@@ -56,6 +59,21 @@ def _is_premium_plus_error(exc: Exception) -> bool:
 
 def _short_token(user_id: int, chat_id: str) -> str:
     return _chat_tokens.generate(user_id, chat_id, key=chat_id)
+
+
+def friendly_chat_error(exc: Exception) -> str:
+    text = str(exc).strip() or "ошибка Ozon API"
+    lower = text.lower()
+    if "429" in lower or "too many" in lower or "rate" in lower:
+        return "Слишком много запросов. Подождите немного и попробуйте обновить чат."
+    if "403" in lower or "forbidden" in lower:
+        return (
+            "Чаты временно недоступны для этого аккаунта/покупателя. "
+            "Обновите чат позже или дождитесь ответа покупателя."
+        )
+    if _is_premium_plus_error(exc):
+        return "Чаты в Seller API доступны только с подпиской Premium Plus."
+    return f"Чат временно недоступен: {text}"
 
 
 def _extract_last_message_id(raw_messages: list[dict]) -> int | None:
@@ -103,6 +121,7 @@ class ThreadCache:
     limit: int = DEFAULT_THREAD_LIMIT
     raw_messages: list[dict] = field(default_factory=list)
     last_message_id: int | None = None
+    error: str | None = None
 
 
 @dataclass(slots=True)
@@ -119,6 +138,7 @@ class NormalizedMessage:
     role: str  # buyer | seller | ozon
     text: str
     created_at: str | None = None
+    attachments: list[str] = field(default_factory=list)
     raw: dict | None = None
 
 
@@ -145,6 +165,23 @@ def _tc(user_id: int, chat_id: str) -> ThreadCache:
         t = ThreadCache()
         _USER_THREADS[key] = t
     return t
+
+
+def _lock_for_chat_list(user_id: int) -> asyncio.Lock:
+    lock = _chat_list_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _chat_list_locks[user_id] = lock
+    return lock
+
+
+def _lock_for_thread(user_id: int, chat_id: str) -> asyncio.Lock:
+    key = (int(user_id), str(chat_id))
+    lock = _thread_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _thread_locks[key] = lock
+    return lock
 
 
 def resolve_chat_id(user_id: int, token: str | None) -> str | None:
@@ -211,6 +248,55 @@ def _extract_text(m: dict) -> str:
     return ""
 
 
+def _extract_attachments(m: dict) -> list[str]:
+    attachments: list[str] = []
+
+    def _human_size(size: int | float | None) -> str:
+        try:
+            sz = float(size or 0)
+        except Exception:
+            return ""
+        units = ["Б", "КБ", "МБ", "ГБ"]
+        idx = 0
+        while sz >= 1024 and idx < len(units) - 1:
+            sz /= 1024
+            idx += 1
+        return f"{sz:.0f} {units[idx]}" if sz else ""
+
+    def _append(item: dict | str) -> None:
+        if isinstance(item, str):
+            label = item.strip()
+            if label:
+                attachments.append(f"📎 {label}")
+            return
+        if not isinstance(item, dict):
+            return
+        name = item.get("file_name") or item.get("name") or item.get("filename") or item.get("title")
+        kind = item.get("type") or item.get("mime_type")
+        size = _human_size(item.get("size") or item.get("file_size"))
+        parts = [p for p in (name, kind, size) if p]
+        label = "; ".join(parts) if parts else "вложение"
+        attachments.append(f"📎 {label}")
+
+    for key in ("attachments", "files", "documents", "images", "photos"):
+        maybe = m.get(key)
+        if isinstance(maybe, list):
+            for entry in maybe:
+                _append(entry)
+        elif isinstance(maybe, dict):
+            _append(maybe)
+
+    payload = m.get("payload")
+    if isinstance(payload, dict):
+        for key in ("attachments", "files"):
+            maybe = payload.get(key)
+            if isinstance(maybe, list):
+                for entry in maybe:
+                    _append(entry)
+
+    return attachments
+
+
 def _extract_created_at(m: dict) -> str | None:
     for k in ("created_at", "create_time", "timestamp", "date", "time"):
         v = m.get(k)
@@ -226,7 +312,12 @@ def normalize_thread_messages(raw_messages: list[dict], *, customer_only: bool =
             continue
         role = _detect_sender_type(m)
         txt = _extract_text(m)
-        if not txt:
+        attachments = _extract_attachments(m)
+        if attachments and txt:
+            txt = txt + "\n" + "\n".join(attachments)
+        elif attachments and not txt:
+            txt = "\n".join(attachments)
+        if not (txt or attachments):
             continue
 
         if customer_only:
@@ -235,47 +326,76 @@ def normalize_thread_messages(raw_messages: list[dict], *, customer_only: bool =
             if role == "seller" and not include_seller:
                 continue
 
-        out.append(NormalizedMessage(role=role, text=txt, created_at=_extract_created_at(m), raw=m))
+        out.append(
+            NormalizedMessage(
+                role=role,
+                text=txt,
+                created_at=_extract_created_at(m),
+                attachments=attachments,
+                raw=m,
+            )
+        )
 
     return out
 
 
+def last_buyer_message_text(user_id: int, chat_id: str) -> str | None:
+    cid = str(chat_id).strip()
+    t = _tc(user_id, cid)
+    raw_messages = t.raw_messages or []
+    if not raw_messages:
+        return None
+
+    norm = normalize_thread_messages(raw_messages, customer_only=True, include_seller=False)
+    for msg in reversed(norm):
+        if msg.role == "buyer" and (msg.text or "").strip():
+            return msg.text.strip()
+    return None
+
+
 async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
     cache = _cc(user_id)
-    if not force and cache.chats and is_cache_fresh(cache.fetched_at, CACHE_TTL_SECONDS):
-        return
+    lock = _lock_for_chat_list(user_id)
 
-    try:
-        resp = await ozon_chat_list(limit=200, offset=0)
-    except OzonAPIError as exc:
-        if _is_premium_plus_error(exc):
-            cache.error = "premium_plus_required"
-            cache.chats = []
-            cache.fetched_at = _now_utc()
-            cache.token_to_chat_id.clear()
-            cache.chat_id_to_token.clear()
+    async with lock:
+        if not force and cache.chats and is_cache_fresh(cache.fetched_at, CACHE_TTL_SECONDS):
             return
-        raise
 
-    chats = resp.chats or list(resp.iter_items())
+        try:
+            resp = await ozon_chat_list(limit=200, offset=0)
+        except OzonAPIError as exc:
+            if _is_premium_plus_error(exc):
+                cache.error = "premium_plus_required"
+                cache.chats = []
+                cache.fetched_at = _now_utc()
+                cache.token_to_chat_id.clear()
+                cache.chat_id_to_token.clear()
+                return
+            cache.error = str(exc)
+            raise
 
-    # simple ordering: unread first, then by last_message_id desc
-    chats.sort(key=lambda c: (-(int(c.unread_count or 0)), -(int(c.last_message_id or 0))))
+        chats = resp.chats or list(resp.iter_items())
 
-    _chat_tokens.clear(user_id)
-    cache.chats = chats
-    cache.fetched_at = _now_utc()
-    cache.error = None
+        # simple ordering: unread first, then by last_message_id desc
+        chats.sort(key=lambda c: (-(int(c.unread_count or 0)), -(int(c.last_message_id or 0))))
 
-    cache.token_to_chat_id.clear()
-    cache.chat_id_to_token.clear()
-    for c in chats:
-        cid = c.safe_chat_id or str(c.chat_id or "").strip()
-        if not cid:
-            continue
-        tok = _short_token(user_id, cid)
-        cache.chat_id_to_token[cid] = tok
-        cache.token_to_chat_id[tok] = cid
+        _chat_tokens.clear(user_id)
+        cache.chats = chats
+        cache.fetched_at = _now_utc()
+        cache.error = None
+
+        cache.token_to_chat_id.clear()
+        cache.chat_id_to_token.clear()
+        for c in chats:
+            cid = c.safe_chat_id or str(c.chat_id or "").strip()
+            if not cid:
+                continue
+            tok = _short_token(user_id, cid)
+            cache.chat_id_to_token[cid] = tok
+            cache.token_to_chat_id[tok] = cid
+
+        if not chats:
+            logger.info("Chat list returned 0 items for user %s (HTTP 200)", user_id)
 
 
 async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = False) -> tuple[str, list[dict], int, int]:
@@ -302,40 +422,84 @@ async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = Fals
         tok = cache.chat_id_to_token.get(cid) or _short_token(user_id, cid)
         title = (c.title or "").strip() or f"Чат {cid}"
         title = _trim(title.replace("\n", " "), 42)
-        items.append({"token": tok, "title": title, "unread_count": int(c.unread_count or 0)})
+        extras = getattr(c, "model_extra", {}) or {}
+        last_message = extras.get("last_message") or getattr(c, "last_message", None)
+        if isinstance(last_message, dict):
+            last_snippet = _trim(_extract_text(last_message) or _extract_text(last_message.get("message") or {}) or "", 60)
+            if not last_snippet:
+                attach_preview = _extract_attachments(last_message)
+                last_snippet = attach_preview[0] if attach_preview else ""
+            last_time = _fmt_time(last_message.get("created_at") or last_message.get("time") or last_message.get("timestamp"))
+        else:
+            last_snippet = _trim(str(getattr(c, "last_message_text", "") or extras.get("last_message_text") or ""), 60)
+            last_time = _fmt_time(getattr(c, "last_message_time", None) or extras.get("last_message_time"))
+
+        badge = f" ({int(c.unread_count or 0)} непроч.)" if int(c.unread_count or 0) > 0 else ""
+        subtitle_parts = [p for p in (last_snippet, last_time) if p]
+        subtitle = " | ".join(subtitle_parts)
+        caption = title
+        if subtitle:
+            caption = _trim(f"{title}\n{subtitle}{badge}", 64)
+        elif badge:
+            caption = _trim(f"{title}{badge}", 64)
+
+        items.append({"token": tok, "title": caption or title, "unread_count": int(c.unread_count or 0)})
 
     stamp = cache.fetched_at.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC") if cache.fetched_at else "—"
-    text = (
-        f"<b>Чаты</b>\n"
-        f"Обновлено: <code>{stamp}</code>\n"
-        f"Всего: <b>{total}</b> | Страница: <b>{safe_page + 1}/{total_pages}</b>\n\n"
-        f"Выберите чат:"
-    )
+    if total == 0:
+        text = (
+            "<b>Чаты</b>\n"
+            f"Обновлено: <code>{stamp}</code>\n"
+            "Чаты пустые или нет доступа к методам чатов этим ключом/тарифом.\n"
+            "Проверьте права OZON_CLIENT_ID / OZON_API_KEY и подписку Premium Plus."
+        )
+    else:
+        text = (
+            f"<b>Чаты</b>\n"
+            f"Обновлено: <code>{stamp}</code>\n"
+            f"Всего: <b>{total}</b> | Страница: <b>{safe_page + 1}/{total_pages}</b>\n\n"
+            f"Выберите чат:"
+        )
     return text, items, safe_page, total_pages
 
 
 async def refresh_chat_thread(*, user_id: int, chat_id: str, force: bool = False, limit: int = DEFAULT_THREAD_LIMIT) -> ThreadView:
     cid = str(chat_id).strip()
     t = _tc(user_id, cid)
+    lock = _lock_for_thread(user_id, cid)
 
-    if force:
-        t.fetched_at = None
+    async with lock:
+        if force:
+            t.fetched_at = None
 
-    # we maintain and clamp limit
-    if limit:
-        t.limit = max(10, min(int(limit), MAX_THREAD_LIMIT))
-    else:
-        t.limit = max(10, min(int(t.limit or DEFAULT_THREAD_LIMIT), MAX_THREAD_LIMIT))
+        # we maintain and clamp limit
+        if limit:
+            t.limit = max(10, min(int(limit), MAX_THREAD_LIMIT))
+        else:
+            t.limit = max(10, min(int(t.limit or DEFAULT_THREAD_LIMIT), MAX_THREAD_LIMIT))
 
-    if not force and t.raw_messages and is_cache_fresh(t.fetched_at, THREAD_TTL_SECONDS):
-        return ThreadView(chat_id=cid, raw_messages=t.raw_messages, fetched_at=t.fetched_at, limit=t.limit, last_message_id=t.last_message_id)
+        if not force and t.raw_messages and is_cache_fresh(t.fetched_at, THREAD_TTL_SECONDS):
+            return ThreadView(
+                chat_id=cid,
+                raw_messages=t.raw_messages,
+                fetched_at=t.fetched_at,
+                limit=t.limit,
+                last_message_id=t.last_message_id,
+            )
 
-    raw_messages = await ozon_chat_history(cid, limit=t.limit)
-    t.raw_messages = raw_messages or []
-    t.last_message_id = _extract_last_message_id(t.raw_messages)
-    t.fetched_at = _now_utc()
+        raw_messages = await ozon_chat_history(cid, limit=t.limit)
+        t.raw_messages = raw_messages or []
+        t.last_message_id = _extract_last_message_id(t.raw_messages)
+        t.fetched_at = _now_utc()
+        t.error = None
 
-    return ThreadView(chat_id=cid, raw_messages=t.raw_messages, fetched_at=t.fetched_at, limit=t.limit, last_message_id=t.last_message_id)
+        return ThreadView(
+            chat_id=cid,
+            raw_messages=t.raw_messages,
+            fetched_at=t.fetched_at,
+            limit=t.limit,
+            last_message_id=t.last_message_id,
+        )
 
 
 async def load_older_messages(*, user_id: int, chat_id: str, pages: int = 1, limit: int = 30) -> ThreadView:
@@ -367,12 +531,11 @@ def _bubble_text(msg: NormalizedMessage) -> str:
     tm = _fmt_time(msg.created_at)
     txt = _escape(msg.text)
 
-    # минималистично, чтобы было похоже на “пузырь”
-    if msg.role == "buyer":
-        return f"{txt}\n<i>{tm}</i>" if tm else txt
-    if msg.role == "seller":
-        return f"<b>Вы:</b> {txt}\n<i>{tm}</i>" if tm else f"<b>Вы:</b> {txt}"
-    return f"<i>{txt}</i>"
+    label = "Покупатель" if msg.role == "buyer" else ("Вы" if msg.role == "seller" else "Сервис")
+    prefix = f"<b>{label}:</b> "
+    if tm:
+        return f"{prefix}{txt}\n<i>{tm}</i>"
+    return prefix + txt
 
 
 async def get_chat_bubbles_for_ui(
@@ -385,7 +548,9 @@ async def get_chat_bubbles_for_ui(
     max_messages: int = 18,
 ) -> list[str]:
     th = await refresh_chat_thread(user_id=user_id, chat_id=chat_id, force=force_refresh, limit=DEFAULT_THREAD_LIMIT)
-    norm = normalize_thread_messages(th.raw_messages, customer_only=customer_only, include_seller=include_seller)
+    norm = normalize_thread_messages(
+        th.raw_messages, customer_only=customer_only, include_seller=include_seller
+    )
 
     # показываем последние max_messages
     tail = norm[-max(1, int(max_messages)) :]
@@ -401,7 +566,9 @@ __all__ = [
     "refresh_chat_thread",
     "load_older_messages",
     "normalize_thread_messages",
+    "last_buyer_message_text",
     "get_chat_bubbles_for_ui",
     "NormalizedMessage",
     "ThreadView",
+    "friendly_chat_error",
 ]

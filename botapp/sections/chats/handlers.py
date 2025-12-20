@@ -9,12 +9,15 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
+from botapp.ai_memory import ApprovedAnswer, get_approved_memory_store
 from botapp.api.ai_client import generate_chat_reply
 from botapp.sections.chats.logic import (
     PremiumPlusRequired,
+    friendly_chat_error,
     get_chat_bubbles_for_ui,
     get_chats_table,
     load_older_messages,
+    last_buyer_message_text,
     normalize_thread_messages,
     refresh_chat_thread,
     resolve_chat_id,
@@ -110,6 +113,7 @@ async def _clear_other_sections(bot, user_id: int) -> None:
 
 
 async def _show_chats_list(user_id: int, page: int, callback: CallbackQuery | None = None, message: Message | None = None, force_refresh: bool = False) -> None:
+    items: list[dict] = []
     try:
         text, items, safe_page, total_pages = await get_chats_table(user_id=user_id, page=page, force_refresh=force_refresh)
         markup = chats_list_keyboard(page=safe_page, total_pages=total_pages, items=items)
@@ -121,11 +125,11 @@ async def _show_chats_list(user_id: int, page: int, callback: CallbackQuery | No
         markup = back_home_keyboard()
     except OzonAPIError as exc:
         logger.warning("Chat list unavailable for user %s: %s", user_id, exc)
-        text = (
-            "Чаты недоступны для текущего аккаунта/тарифа Seller API.\n"
-            "Попробуйте позже или обратитесь в поддержку Ozon."
-        )
+        text = friendly_chat_error(exc)
         markup = back_home_keyboard()
+
+    if not items:
+        text += "\n\nЧаты пустые или нет доступа к методам чатов этим ключом/тарифом. Проверьте права/подписку."
 
     sent = await send_section_message(
         SECTION_CHATS_LIST,
@@ -163,14 +167,25 @@ async def _show_chat_thread(user_id: int, token: str, callback: CallbackQuery | 
         user_id=user_id,
     )
 
-    bubbles = await get_chat_bubbles_for_ui(
-        user_id=user_id,
-        chat_id=ozon_chat_id,
-        force_refresh=force_refresh,
-        customer_only=True,
-        include_seller=not show_only_buyer,
-        max_messages=18,
-    )
+    try:
+        bubbles = await get_chat_bubbles_for_ui(
+            user_id=user_id,
+            chat_id=ozon_chat_id,
+            force_refresh=force_refresh,
+            customer_only=False,
+            include_seller=True,
+            max_messages=30,
+        )
+    except OzonAPIError as exc:
+        await send_ephemeral_message(callback or message, text=friendly_chat_error(exc))
+        return
+    except Exception:
+        logger.exception("Failed to load chat thread")
+        await send_ephemeral_message(
+            callback or message, text="⚠️ Чат временно недоступен. Попробуйте обновить позже."
+        )
+        return
+
     if not bubbles:
         bubbles = ["<b>Пока нет текстовых сообщений.</b>"]
 
@@ -320,12 +335,34 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         try:
             await chat_send_message(ozon_chat_id, draft)
         except OzonAPIError as exc:
-            await send_ephemeral_message(callback, text=f"⚠️ Ozon отклонил отправку: {exc}")
+            hint = (
+                " Обновите чат или дождитесь сообщения от покупателя, если нельзя писать первым."
+            )
+            await send_ephemeral_message(
+                callback,
+                text=f"⚠️ Ozon отклонил отправку: {exc}.{hint}",
+            )
             return
         except Exception:
             logger.exception("chat_send_message failed")
             await send_ephemeral_message(callback, text="⚠️ Не удалось отправить сообщение. Попробуйте позже.")
             return
+
+        try:
+            buyer_text = last_buyer_message_text(user_id, ozon_chat_id) or ""
+            rec = ApprovedAnswer.now_iso(
+                kind="chat",
+                ozon_entity_id=str(ozon_chat_id),
+                input_text=buyer_text,
+                answer_text=draft,
+                product_id=None,
+                product_name=None,
+                rating=None,
+                meta={"answered_via": "ai"},
+            )
+            get_approved_memory_store().add_approved_answer(rec)
+        except Exception:
+            logger.exception("Failed to persist chat reply to memory")
 
         await send_ephemeral_message(callback, text="✅ Сообщение отправлено в чат Ozon.")
         await _show_chat_thread(user_id=user_id, token=token, callback=callback, force_refresh=True, show_only_buyer=True)

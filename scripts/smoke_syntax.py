@@ -5,6 +5,7 @@ Runs compileall for the repository and tabnanny for the reviews module.
 """
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import sys
 from pathlib import Path
@@ -72,6 +73,48 @@ def _smoke_tables() -> None:
     )
 
 
+def _smoke_review_helpers() -> None:
+    from botapp.sections.reviews.handlers import _review_text_for_ai
+    from botapp.sections.reviews.logic import ReviewCard
+
+    card = ReviewCard(
+        id="r-empty",
+        rating=4,
+        text="",
+        product_name="Sample",
+        offer_id=None,
+        product_id="p1",
+        created_at=None,
+    )
+
+    txt, is_empty = _review_text_for_ai(card)
+    assert is_empty is True
+    assert "без текста" in txt
+    assert card.has_answer is False
+
+
+def _smoke_review_comment_create() -> None:
+    from botapp.ozon_client import OzonClient
+
+    class _Dummy(OzonClient):
+        def __post_init__(self) -> None:  # type: ignore[override]
+            self.calls: list[tuple[str, dict]] = []
+
+        async def post(self, path, json):  # type: ignore[override]
+            self.calls.append((path, json))
+            return {"result": {"ok": True}}
+
+    async def _run() -> None:
+        client = _Dummy(client_id="id", api_key="key")
+        res = await client.review_comment_create("rid", "  hello  ")
+        assert res == {"ok": True}
+        assert client.calls and client.calls[0][0] == "/v1/review/comment/create"
+        assert client.calls[0][1]["review_id"] == "rid"
+        assert client.calls[0][1]["text"] == "hello"
+
+    asyncio.run(_run())
+
+
 def _smoke_chat_payloads() -> None:
     """Verify chat payload helpers safely handle unexpected shapes."""
 
@@ -92,6 +135,8 @@ def main() -> None:
     _smoke_imports()
     _smoke_tables()
     _smoke_chat_payloads()
+    _smoke_review_helpers()
+    _smoke_review_comment_create()
 
 
 if __name__ == "__main__":
