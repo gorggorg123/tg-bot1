@@ -40,6 +40,9 @@ INITIAL_QUESTIONS_TARGET = QUESTIONS_PAGE_SIZE * 3
 CACHE_TTL_SECONDS = 120
 SESSION_TTL = timedelta(seconds=CACHE_TTL_SECONDS)
 
+# Кеш ответа по вопросу (question_id -> answer payload)
+ANSWER_CACHE_TTL = timedelta(minutes=30)
+
 
 # ---------------------------------------------------------------------------
 # Модель сессии вопросов на одного Telegram-пользователя
@@ -73,6 +76,7 @@ class QuestionsSession:
 # user_id -> QuestionsSession
 _sessions: Dict[int, QuestionsSession] = {}
 _question_tokens = TokenStore(ttl_seconds=CACHE_TTL_SECONDS)
+_answer_text_cache: Dict[str, tuple[Dict[str, Optional[str]], datetime]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +342,18 @@ async def refresh_questions(user_id: int, category: str = "all", *, force: bool 
     session.loaded_at = datetime.utcnow()
     _question_tokens.clear(user_id)
 
+    for q in questions:
+        existing_answer = safe_strip(getattr(q, "answer_text", None))
+        if existing_answer:
+            payload = {
+                "text": q.answer_text,
+                "answer_id": getattr(q, "answer_id", None),
+                "answer_created_at": getattr(q, "answer_created_at", None),
+                "answers_count": getattr(q, "answers_count", None),
+            }
+            _set_answer_cache(q.id, payload)
+            session.answer_cache[q.id] = payload
+
     dates_msk = []
     for q in questions:
         created = _parse_date(getattr(q, "created_at", None))
@@ -374,29 +390,80 @@ def _get_cached_questions(user_id: int, category: str) -> List[Question]:
     return session.all
 
 
+def _get_answer_cache(question_id: str) -> Optional[Dict[str, Optional[str]]]:
+    payload = _answer_text_cache.get(question_id)
+    if not payload:
+        return None
+
+    data, created_at = payload
+    if datetime.utcnow() - created_at > ANSWER_CACHE_TTL:
+        _answer_text_cache.pop(question_id, None)
+        return None
+    return data
+
+
+def _set_answer_cache(question_id: str, data: Dict[str, Optional[str]]) -> None:
+    _answer_text_cache[question_id] = (data, datetime.utcnow())
+
+
+def invalidate_answer_cache(question_id: str, *, user_id: Optional[int] = None) -> None:
+    _answer_text_cache.pop(question_id, None)
+    if user_id is not None:
+        session = _sessions.get(user_id)
+        if session:
+            session.answer_cache.pop(question_id, None)
+
+
 async def ensure_question_answer_text(question: Question, user_id: Optional[int] = None) -> None:
     """Догружает текст ответа для вопроса, если он отмечен как отвеченный."""
 
     if not getattr(question, "has_answer", False):
         return
 
-    if safe_strip(getattr(question, "answer_text", None)):
+    session = _sessions.get(user_id) if user_id is not None else None
+    existing_answer = safe_strip(getattr(question, "answer_text", None))
+    if existing_answer:
+        payload = {
+            "text": question.answer_text,
+            "answer_id": question.answer_id,
+            "answer_created_at": getattr(question, "answer_created_at", None),
+            "answers_count": question.answers_count,
+        }
+        _set_answer_cache(question.id, payload)
+        if session:
+            session.answer_cache[question.id] = payload
         return
 
-    session = _sessions.get(user_id) if user_id is not None else None
-    cached = None
-    if session:
-        cached = session.answer_cache.get(question.id)
+    cached = session.answer_cache.get(question.id) if session else None
+    if not cached:
+        cached = _get_answer_cache(question.id)
+
     if cached:
         question.answer_text = cached.get("text") or question.answer_text
         question.answer_id = cached.get("answer_id") or question.answer_id
         question.has_answer = bool(question.answer_text)
         question.answers_count = question.answers_count or cached.get("answers_count")
         question.answer_created_at = cached.get("answer_created_at") or getattr(question, "answer_created_at", None)
+        if session:
+            session.answer_cache[question.id] = cached
         return
 
+    sku = None
     try:
-        answers = await get_question_answers(question.id, limit=1)
+        sku = int(question.sku) if getattr(question, "sku", None) is not None else None
+    except Exception:
+        sku = None
+
+    if sku is None:
+        pid = safe_strip(getattr(question, "product_id", None))
+        if pid and pid.isdigit():
+            try:
+                sku = int(pid)
+            except Exception:
+                sku = None
+
+    try:
+        answers = await get_question_answers(question.id, limit=1, sku=sku)
     except Exception as exc:  # pragma: no cover - сеть/формат
         logger.warning("Failed to fetch answer text for %s: %s", question.id, exc)
         return
@@ -409,14 +476,18 @@ async def ensure_question_answer_text(question: Question, user_id: Optional[int]
     question.answer_id = first.id or question.answer_id
     question.has_answer = bool(question.answer_text)
     question.answers_count = question.answers_count or len(answers)
+    question.answer_created_at = first.created_at or getattr(question, "answer_created_at", None)
+
+    payload = {
+        "text": question.answer_text,
+        "answer_id": question.answer_id,
+        "answer_created_at": question.answer_created_at,
+        "answers_count": question.answers_count,
+    }
+    _set_answer_cache(question.id, payload)
 
     if session:
-        session.answer_cache[question.id] = {
-            "text": question.answer_text,
-            "answer_id": question.answer_id,
-            "answer_created_at": getattr(question, "answer_created_at", None),
-            "answers_count": question.answers_count,
-        }
+        session.answer_cache[question.id] = payload
 
 
 # ---------------------------------------------------------------------------
@@ -517,14 +588,20 @@ def format_question_card_text(
     answer_dt_raw = safe_strip(getattr(question, "answer_created_at", None))
     answer_dt = _fmt_dt_msk(_parse_date(answer_dt_raw)) if answer_dt_raw else None
     has_answer = bool(getattr(question, "has_answer", False)) or bool(published_answer)
+    badge, status_label = _status_badge_question(question)
+    raw_status = safe_strip(getattr(question, "status", None))
 
     lines: list[str] = []
-    badge = "✅" if has_answer else "🆕"
-    lines.append(f"❓ Вопрос  •  {badge}")
+    lines.append(f"📝 Вопрос • {badge}")
     lines.append(f"📅 {created_part}{age_part}")
     lines.append(f"🛒 Товар: {product}")
     if qid:
         lines.append(f"ID: {qid}")
+
+    status_parts = [status_label]
+    if raw_status and raw_status.upper() != status_label.upper():
+        status_parts.append(f"({raw_status})")
+    lines.append(f"Статус: {' '.join(status_parts)}")
 
     lines.append("")
     lines.append("Текст вопроса:")
@@ -679,6 +756,7 @@ __all__ = [
     "resolve_question_id",
     "format_question_card_text",
     "ensure_question_answer_text",
+    "invalidate_answer_cache",
     "register_question_token",
     "resolve_question_token",
 ]

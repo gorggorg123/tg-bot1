@@ -122,7 +122,7 @@ async def _show_review_card(
     saved = get_review_reply(card.id) or {}
     draft = (saved.get("draft") or "").strip() or None
 
-    can_send = bool(has_write_credentials() and draft and not (card.has_answer or (card.seller_comment or "").strip()))
+    can_send = bool(has_write_credentials() and draft and not (card.answered or (card.answer_text or "").strip()))
     period_title = "Отзывы"
     view, _ = await get_review_and_card(user_id, category, index=0, review_id=card.id)
     if view and view.period:

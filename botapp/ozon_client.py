@@ -5,9 +5,11 @@ import asyncio
 import logging
 import os
 import random
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from time import monotonic
 from urllib.parse import urlparse, unquote
 
 import httpx
@@ -37,6 +39,32 @@ _analytics_forbidden: bool = False
 _analytics_forbidden_logged: bool = False
 _stock_not_found_warned: set[str] = set()
 _product_list_warned: bool = False
+
+
+class _SimpleRateLimiter:
+    def __init__(self, *, rate: int, per_seconds: float):
+        self.rate = max(1, rate)
+        self.per_seconds = max(per_seconds, 0.001)
+        self._calls: deque[float] = deque()
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = monotonic()
+            window_start = now - self.per_seconds
+            while self._calls and self._calls[0] < window_start:
+                self._calls.popleft()
+
+            if len(self._calls) < self.rate:
+                self._calls.append(now)
+                return
+
+            sleep_for = self._calls[0] + self.per_seconds - now
+            await asyncio.sleep(max(sleep_for, 0))
+            self._calls.append(monotonic())
+
+
+_question_answer_rate_limiter = _SimpleRateLimiter(rate=50, per_seconds=1.0)
 
 
 class QuestionItem(BaseModel):
@@ -363,6 +391,7 @@ class OzonClient:
             raise RuntimeError("HTTP client did not return a response")
 
         status = r.status_code
+        request_id = r.headers.get("X-Request-Id") or r.headers.get("X-Ozon-Request-Id")
         try:
             data = r.json()
         except Exception:
@@ -371,12 +400,16 @@ class OzonClient:
             except Exception:
                 raw = b""
             logger.error(
-                "Ozon %s -> HTTP %s JSON decode failed: %s", url, status, raw[:500]
+                "Ozon %s -> HTTP %s (request_id=%s) JSON decode failed: %s",
+                url,
+                status,
+                request_id or "-",
+                raw[:500],
             )
             return status, {"raw": raw.decode(errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)}
 
         if status >= 400:
-            logger.warning("Ozon %s -> HTTP %s: %s", url, status, data)
+            logger.warning("Ozon %s -> HTTP %s (request_id=%s): %s", url, status, request_id or "-", data)
 
         return status, data if isinstance(data, dict) else None
 
@@ -624,23 +657,20 @@ class OzonClient:
     async def review_list(
         self,
         *,
-        date_start: str | None = None,
-        date_end: str | None = None,
         limit: int = 100,
-        page: int | None = None,
         last_id: str | None = None,
+        sort_dir: str = "DESC",
+        status: str = "ALL",
     ) -> dict | None:
         """Обёртка над /v1/review/list для новых бета-методов отзывов."""
 
-        body: Dict[str, Any] = {"limit": max(1, min(limit, 100))}
-        if page is not None:
-            body["page"] = max(1, page)
+        body: Dict[str, Any] = {
+            "limit": max(1, min(limit, 100)),
+            "sort_dir": sort_dir or "DESC",
+            "status": status or "ALL",
+        }
         if last_id:
             body["last_id"] = last_id
-        if date_start:
-            body["date_start"] = date_start
-        if date_end:
-            body["date_end"] = date_end
 
         data = await self.post("/v1/review/list", body)
         if not isinstance(data, dict):
@@ -725,6 +755,8 @@ class OzonClient:
         sku_clean = _clean_sku(sku)
         if sku_clean is not None:
             body["sku"] = sku_clean
+
+        await _question_answer_rate_limiter.wait()
         status_code, payload = await self._post_with_status(
             "/v1/question/answer/list", body
         )
@@ -2198,37 +2230,10 @@ async def get_questions_list(
         raw_items = arr  # type: ignore[assignment]
 
     result: list[Question] = []
-    missing_answers: list[Question] = []
     for raw in raw_items:
         parsed = _parse_question_item(raw)
         if parsed:
             result.append(parsed)
-            if parsed.has_answer and not parsed.answer_text:
-                missing_answers.append(parsed)
-
-    # Если Ozon не вернул текст ответа в списке, пробуем подтянуть через answer/list
-    if missing_answers:
-        for item in missing_answers:
-            sku_clean = _clean_sku(getattr(item, "sku", None))
-            if sku_clean is None:
-                logger.warning(
-                    "Skip fetching answers for %s: missing/invalid SKU", item.id
-                )
-                continue
-            try:
-                answers = await client.question_answer_list(
-                    item.id, limit=1, sku=sku_clean
-                )
-            except Exception as exc:  # pragma: no cover - сеть/формат
-                logger.warning("Failed to fetch answers for %s: %s", item.id, exc)
-                continue
-            if not answers:
-                continue
-            first = answers[0]
-            item.answer_text = first.text or item.answer_text
-            item.answer_id = first.id or item.answer_id
-            item.has_answer = bool(item.answer_text)
-            item.answers_count = item.answers_count or len(answers)
     return result
 
 
@@ -2288,11 +2293,11 @@ async def list_question_answers(
 
 
 async def get_question_answers(
-    question_id: str, *, limit: int = 20
+    question_id: str, *, limit: int = 20, sku: int | None = None
 ) -> list[QuestionAnswer]:
     """Совместимый алиас для получения ответов на вопрос."""
 
-    return await list_question_answers(question_id, limit=limit)
+    return await list_question_answers(question_id, limit=limit, sku=sku)
 
 
 async def delete_question_answer(

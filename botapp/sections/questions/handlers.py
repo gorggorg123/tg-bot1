@@ -29,6 +29,7 @@ from botapp.sections.questions.logic import (
     find_question,
     format_question_card_text,
     get_question_by_index,
+    invalidate_answer_cache,
     get_questions_pretty_period,
     get_questions_table,
     refresh_questions,
@@ -348,6 +349,8 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
         # update local flag to show as answered
         q.has_answer = True
         q.answer_text = draft
+
+        invalidate_answer_cache(q.id, user_id=user_id)
 
         await send_ephemeral_message(callback, text="✅ Ответ отправлен в Ozon.", ttl=4)
         await _show_question_card(user_id=user_id, category=category, page=page, token=token, callback=callback, force_refresh=True)
