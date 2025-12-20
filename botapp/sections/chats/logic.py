@@ -1,6 +1,7 @@
 # botapp/sections/chats/logic.py
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
@@ -21,9 +22,11 @@ logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 10
 CACHE_TTL_SECONDS = 30
-THREAD_TTL_SECONDS = 15
+THREAD_TTL_SECONDS = 10
 
 _chat_tokens = TokenStore(ttl_seconds=CACHE_TTL_SECONDS)
+_chat_list_locks: dict[int, asyncio.Lock] = {}
+_thread_locks: dict[tuple[int, str], asyncio.Lock] = {}
 
 DEFAULT_THREAD_LIMIT = 30
 MAX_THREAD_LIMIT = 180
@@ -56,6 +59,21 @@ def _is_premium_plus_error(exc: Exception) -> bool:
 
 def _short_token(user_id: int, chat_id: str) -> str:
     return _chat_tokens.generate(user_id, chat_id, key=chat_id)
+
+
+def friendly_chat_error(exc: Exception) -> str:
+    text = str(exc).strip() or "ошибка Ozon API"
+    lower = text.lower()
+    if "429" in lower or "too many" in lower or "rate" in lower:
+        return "Слишком много запросов. Подождите немного и попробуйте обновить чат."
+    if "403" in lower or "forbidden" in lower:
+        return (
+            "Чаты временно недоступны для этого аккаунта/покупателя. "
+            "Обновите чат позже или дождитесь ответа покупателя."
+        )
+    if _is_premium_plus_error(exc):
+        return "Чаты в Seller API доступны только с подпиской Premium Plus."
+    return f"Чат временно недоступен: {text}"
 
 
 def _extract_last_message_id(raw_messages: list[dict]) -> int | None:
@@ -103,6 +121,7 @@ class ThreadCache:
     limit: int = DEFAULT_THREAD_LIMIT
     raw_messages: list[dict] = field(default_factory=list)
     last_message_id: int | None = None
+    error: str | None = None
 
 
 @dataclass(slots=True)
@@ -145,6 +164,23 @@ def _tc(user_id: int, chat_id: str) -> ThreadCache:
         t = ThreadCache()
         _USER_THREADS[key] = t
     return t
+
+
+def _lock_for_chat_list(user_id: int) -> asyncio.Lock:
+    lock = _chat_list_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _chat_list_locks[user_id] = lock
+    return lock
+
+
+def _lock_for_thread(user_id: int, chat_id: str) -> asyncio.Lock:
+    key = (int(user_id), str(chat_id))
+    lock = _thread_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _thread_locks[key] = lock
+    return lock
 
 
 def resolve_chat_id(user_id: int, token: str | None) -> str | None:
@@ -240,42 +276,60 @@ def normalize_thread_messages(raw_messages: list[dict], *, customer_only: bool =
     return out
 
 
+def last_buyer_message_text(user_id: int, chat_id: str) -> str | None:
+    cid = str(chat_id).strip()
+    t = _tc(user_id, cid)
+    raw_messages = t.raw_messages or []
+    if not raw_messages:
+        return None
+
+    norm = normalize_thread_messages(raw_messages, customer_only=True, include_seller=False)
+    for msg in reversed(norm):
+        if msg.role == "buyer" and (msg.text or "").strip():
+            return msg.text.strip()
+    return None
+
+
 async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
     cache = _cc(user_id)
-    if not force and cache.chats and is_cache_fresh(cache.fetched_at, CACHE_TTL_SECONDS):
-        return
+    lock = _lock_for_chat_list(user_id)
 
-    try:
-        resp = await ozon_chat_list(limit=200, offset=0)
-    except OzonAPIError as exc:
-        if _is_premium_plus_error(exc):
-            cache.error = "premium_plus_required"
-            cache.chats = []
-            cache.fetched_at = _now_utc()
-            cache.token_to_chat_id.clear()
-            cache.chat_id_to_token.clear()
+    async with lock:
+        if not force and cache.chats and is_cache_fresh(cache.fetched_at, CACHE_TTL_SECONDS):
             return
-        raise
 
-    chats = resp.chats or list(resp.iter_items())
+        try:
+            resp = await ozon_chat_list(limit=200, offset=0)
+        except OzonAPIError as exc:
+            if _is_premium_plus_error(exc):
+                cache.error = "premium_plus_required"
+                cache.chats = []
+                cache.fetched_at = _now_utc()
+                cache.token_to_chat_id.clear()
+                cache.chat_id_to_token.clear()
+                return
+            cache.error = str(exc)
+            raise
 
-    # simple ordering: unread first, then by last_message_id desc
-    chats.sort(key=lambda c: (-(int(c.unread_count or 0)), -(int(c.last_message_id or 0))))
+        chats = resp.chats or list(resp.iter_items())
 
-    _chat_tokens.clear(user_id)
-    cache.chats = chats
-    cache.fetched_at = _now_utc()
-    cache.error = None
+        # simple ordering: unread first, then by last_message_id desc
+        chats.sort(key=lambda c: (-(int(c.unread_count or 0)), -(int(c.last_message_id or 0))))
 
-    cache.token_to_chat_id.clear()
-    cache.chat_id_to_token.clear()
-    for c in chats:
-        cid = c.safe_chat_id or str(c.chat_id or "").strip()
-        if not cid:
-            continue
-        tok = _short_token(user_id, cid)
-        cache.chat_id_to_token[cid] = tok
-        cache.token_to_chat_id[tok] = cid
+        _chat_tokens.clear(user_id)
+        cache.chats = chats
+        cache.fetched_at = _now_utc()
+        cache.error = None
+
+        cache.token_to_chat_id.clear()
+        cache.chat_id_to_token.clear()
+        for c in chats:
+            cid = c.safe_chat_id or str(c.chat_id or "").strip()
+            if not cid:
+                continue
+            tok = _short_token(user_id, cid)
+            cache.chat_id_to_token[cid] = tok
+            cache.token_to_chat_id[tok] = cid
 
 
 async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = False) -> tuple[str, list[dict], int, int]:
@@ -317,25 +371,40 @@ async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = Fals
 async def refresh_chat_thread(*, user_id: int, chat_id: str, force: bool = False, limit: int = DEFAULT_THREAD_LIMIT) -> ThreadView:
     cid = str(chat_id).strip()
     t = _tc(user_id, cid)
+    lock = _lock_for_thread(user_id, cid)
 
-    if force:
-        t.fetched_at = None
+    async with lock:
+        if force:
+            t.fetched_at = None
 
-    # we maintain and clamp limit
-    if limit:
-        t.limit = max(10, min(int(limit), MAX_THREAD_LIMIT))
-    else:
-        t.limit = max(10, min(int(t.limit or DEFAULT_THREAD_LIMIT), MAX_THREAD_LIMIT))
+        # we maintain and clamp limit
+        if limit:
+            t.limit = max(10, min(int(limit), MAX_THREAD_LIMIT))
+        else:
+            t.limit = max(10, min(int(t.limit or DEFAULT_THREAD_LIMIT), MAX_THREAD_LIMIT))
 
-    if not force and t.raw_messages and is_cache_fresh(t.fetched_at, THREAD_TTL_SECONDS):
-        return ThreadView(chat_id=cid, raw_messages=t.raw_messages, fetched_at=t.fetched_at, limit=t.limit, last_message_id=t.last_message_id)
+        if not force and t.raw_messages and is_cache_fresh(t.fetched_at, THREAD_TTL_SECONDS):
+            return ThreadView(
+                chat_id=cid,
+                raw_messages=t.raw_messages,
+                fetched_at=t.fetched_at,
+                limit=t.limit,
+                last_message_id=t.last_message_id,
+            )
 
-    raw_messages = await ozon_chat_history(cid, limit=t.limit)
-    t.raw_messages = raw_messages or []
-    t.last_message_id = _extract_last_message_id(t.raw_messages)
-    t.fetched_at = _now_utc()
+        raw_messages = await ozon_chat_history(cid, limit=t.limit)
+        t.raw_messages = raw_messages or []
+        t.last_message_id = _extract_last_message_id(t.raw_messages)
+        t.fetched_at = _now_utc()
+        t.error = None
 
-    return ThreadView(chat_id=cid, raw_messages=t.raw_messages, fetched_at=t.fetched_at, limit=t.limit, last_message_id=t.last_message_id)
+        return ThreadView(
+            chat_id=cid,
+            raw_messages=t.raw_messages,
+            fetched_at=t.fetched_at,
+            limit=t.limit,
+            last_message_id=t.last_message_id,
+        )
 
 
 async def load_older_messages(*, user_id: int, chat_id: str, pages: int = 1, limit: int = 30) -> ThreadView:
@@ -401,7 +470,9 @@ __all__ = [
     "refresh_chat_thread",
     "load_older_messages",
     "normalize_thread_messages",
+    "last_buyer_message_text",
     "get_chat_bubbles_for_ui",
     "NormalizedMessage",
     "ThreadView",
+    "friendly_chat_error",
 ]

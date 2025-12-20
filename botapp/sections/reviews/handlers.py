@@ -9,6 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
+from botapp.ai_memory import MemoryRecord, get_memory_store
 from botapp.api.ai_client import generate_review_reply
 from botapp.keyboards import MenuCallbackData
 from botapp.sections.reviews.keyboards import (
@@ -122,7 +123,7 @@ async def _show_review_card(
     saved = get_review_reply(card.id) or {}
     draft = (saved.get("draft") or "").strip() or None
 
-    can_send = bool(has_write_credentials() and draft and not (card.has_answer or (card.seller_comment or "").strip()))
+    can_send = bool(has_write_credentials() and draft and not (card.answered or (card.answer_text or "").strip()))
     period_title = "Отзывы"
     view, _ = await get_review_and_card(user_id, category, index=0, review_id=card.id)
     if view and view.period:
@@ -230,6 +231,7 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             draft = await generate_review_reply(
                 review_text=card.text or "",
                 product_name=card.product_name,
+                sku=str(card.product_id or card.offer_id or "") or None,
                 rating=card.rating,
                 previous_answer=previous,
                 user_prompt=None,
@@ -348,6 +350,7 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             await send_ephemeral_message(callback, text="⚠️ Не удалось отправить ответ. Попробуй позже.")
             return
 
+        draft_source = (saved.get("draft_source") or "manual")
         upsert_review_reply(
             review_id=card.id,
             created_at=_to_iso(card.created_at),
@@ -355,13 +358,30 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             rating=card.rating,
             review_text=card.text,
             draft=draft,
-            draft_source=(saved.get("draft_source") or "manual"),
+            draft_source=draft_source,
             sent_to_ozon=True,
             sent_at=_now_iso(),
             meta={"sent": True},
         )
 
         mark_review_answered(card.id, user_id, text=draft)
+
+        try:
+            rec = MemoryRecord.now_iso(
+                kind="review",
+                entity_id=str(card.id),
+                input_text=card.text or "",
+                output_text=draft,
+                sku=str(card.product_id or card.offer_id or "") or None,
+                product_title=card.product_name,
+                meta={
+                    "rating": card.rating,
+                    "answered_via": "ai" if draft_source == "ai" else "manual",
+                },
+            )
+            get_memory_store().add_record(rec)
+        except Exception:
+            logger.exception("Failed to persist review reply to memory")
 
         await send_ephemeral_message(callback, text="✅ Ответ отправлен в Ozon.", ttl=4)
         await _show_review_card(user_id=user_id, category=category, page=page, token=token, callback=callback)
@@ -412,6 +432,7 @@ async def review_reprompt_text(message: Message, state: FSMContext) -> None:
         draft = await generate_review_reply(
             review_text=card.text or "",
             product_name=card.product_name,
+            sku=str(card.product_id or card.offer_id or "") or None,
             rating=card.rating,
             previous_answer=previous,
             user_prompt=wish,

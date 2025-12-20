@@ -9,12 +9,15 @@ from pathlib import Path
 
 import httpx
 
+from botapp.ai_memory import fetch_examples, format_examples_block
+
 logger = logging.getLogger(__name__)
 
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 OPENAI_BASE_URL_ENV = "OPENAI_BASE_URL"
 OPENAI_MODEL_ENV = "OPENAI_MODEL"
 OPENAI_TIMEOUT_S_ENV = "OPENAI_TIMEOUT_S"
+ITOM_QNA_DIGEST_PATH_ENV = "ITOM_QNA_DIGEST_PATH"
 
 DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_TIMEOUT_S = 35.0
@@ -26,6 +29,9 @@ DEFAULT_ULYANOVA_PATHS = (
     "ulyanova.txt",
     "ulyanova.md",
 )
+
+
+_style_cache: dict[str, str | float | Path | None] = {"path": None, "mtime": None, "text": None}
 
 
 class AIClientError(RuntimeError):
@@ -55,6 +61,42 @@ def _load_ulyanova_text() -> str:
     return ""
 
 
+def _style_guide_path() -> Path:
+    env_path = _get_env(ITOM_QNA_DIGEST_PATH_ENV)
+    if env_path:
+        try:
+            return Path(env_path).expanduser().resolve()
+        except Exception:
+            pass
+    base = Path(__file__).resolve().parents[1]
+    return (base / "data" / "itom_qna_digest.txt").resolve()
+
+
+def _load_style_guide() -> str:
+    global _style_cache
+    path = _style_guide_path()
+
+    try:
+        mtime = path.stat().st_mtime
+    except Exception:
+        return ""
+
+    cached_path = _style_cache.get("path")
+    cached_mtime = _style_cache.get("mtime")
+    if cached_path == path and cached_mtime == mtime:
+        cached_text = _style_cache.get("text")
+        return cached_text or ""
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+    _style_cache = {"path": path, "mtime": mtime, "text": text}
+    logger.info("ITOM style guide loaded: %d chars from %s", len(text), path)
+    return text
+
+
 def _normalize(s: str) -> str:
     return (s or "").strip()
 
@@ -64,6 +106,23 @@ def _clamp_text(s: str, n: int) -> str:
     if len(s) <= n:
         return s
     return s[: max(0, n - 1)].rstrip() + "…"
+
+
+def _maybe_add_soft_emoji(reply: str, rating: int | None) -> str:
+    if not reply:
+        return reply
+    try:
+        r = int(rating) if rating is not None else None
+    except Exception:
+        r = None
+    if r is None or r < 4:
+        return reply
+
+    friendly_emojis = ["😊", "🙂", "❤️"]
+    if any(e in reply for e in friendly_emojis):
+        return reply
+
+    return reply.rstrip() + " " + friendly_emojis[0]
 
 
 @dataclass
@@ -144,10 +203,23 @@ def _base_rules() -> str:
     return ""
 
 
+def _style_guide_block() -> str:
+    style = _load_style_guide()
+    if not style:
+        return ""
+    return "Справочник стиля и шаблонов ITOM:\n" + style
+
+
+def _examples_block(kind: str, *, input_text: str, sku: str | None = None, limit: int = 6) -> str:
+    examples = fetch_examples(kind=kind, input_text=input_text, sku=sku, limit=limit)
+    return format_examples_block(examples)
+
+
 async def generate_review_reply(
     *,
     review_text: str,
     product_name: str | None = None,
+    sku: str | None = None,
     rating: int | None = None,
     previous_answer: str | None = None,
     user_prompt: str | None = None,
@@ -155,11 +227,16 @@ async def generate_review_reply(
     sys = (
         "Ты — помощник продавца на маркетплейсе Ozon. "
         "Пиши ответы на отзывы по-русски, вежливо, без воды, без обещаний того, что нельзя гарантировать. "
-        "Не упоминай внутренние процессы Ozon. "
-        "Если отзыв негативный — сначала сочувствие, затем короткое решение/инструкция, затем приглашение уточнить детали."
+        "Не упоминай внутренние процессы Ozon и не выдумывай факты или сроки доставки. "
+        "Если отзыв негативный — сначала сочувствие, затем короткое решение/инструкция, затем приглашение уточнить детали. "
+        "Если вопрос про доставку — напомни, что доставку организует Ozon, без конкретных дат."
         "\n\n"
         + _base_rules()
     )
+
+    style_block = _style_guide_block()
+    if style_block:
+        sys = sys + "\n\n" + style_block
 
     user = []
     if product_name:
@@ -177,18 +254,24 @@ async def generate_review_reply(
         user.append("\nПожелания к ответу (пересборка):")
         user.append(user_prompt)
 
+    examples_block = _examples_block("review", input_text=review_text, sku=sku)
+    if examples_block:
+        sys = sys + "\n\n" + examples_block
+
     user.append(
         "\nСгенерируй один готовый ответ (без списков кнопок и без служебных комментариев). "
         "Максимум 500 символов, если можно — короче."
     )
 
-    return await _chat_completion(system=sys, user="\n".join(user), temperature=0.5, max_tokens=260)
+    reply = await _chat_completion(system=sys, user="\n".join(user), temperature=0.5, max_tokens=260)
+    return _maybe_add_soft_emoji(reply, rating)
 
 
 async def generate_answer_for_question(
     question_text: str,
     *,
     product_name: str | None = None,
+    sku: str | None = None,
     existing_answer: str | None = None,
     user_prompt: str | None = None,
 ) -> str:
@@ -196,10 +279,15 @@ async def generate_answer_for_question(
         "Ты — помощник продавца на Ozon. "
         "Отвечай строго по делу, без лишних оправданий. "
         "Не обещай сроки доставки (это зона Ozon), не предлагай перейти в мессенджеры. "
-        "Если данных недостаточно — задай 1 уточняющий вопрос в конце."
+        "Если данных недостаточно — задай 1 уточняющий вопрос в конце. "
+        "Не выдумывай детали товара и не обещай невозможное."
         "\n\n"
         + _base_rules()
     )
+
+    style_block = _style_guide_block()
+    if style_block:
+        sys = sys + "\n\n" + style_block
 
     user = []
     if product_name:
@@ -215,6 +303,10 @@ async def generate_answer_for_question(
         user.append("\nПожелания к ответу:")
         user.append(user_prompt)
 
+    examples_block = _examples_block("question", input_text=question_text, sku=sku)
+    if examples_block:
+        sys = sys + "\n\n" + examples_block
+
     user.append(
         "\nСгенерируй один готовый ответ. "
         "Максимум 450 символов, тон — профессиональный и доброжелательный."
@@ -229,10 +321,14 @@ async def generate_chat_reply(*, messages_text: str, user_prompt: str | None = N
         "Отвечай только как продавец. "
         "Не повторяй историю полностью; дай один короткий ответ по последнему сообщению покупателя. "
         "Если нужно — уточни детали одним вопросом. "
-        "Не упоминай, что ты ИИ."
+        "Не упоминай, что ты ИИ. Не обещай сроки доставки и не выдумывай детали заказа."
         "\n\n"
         + _base_rules()
     )
+
+    style_block = _style_guide_block()
+    if style_block:
+        sys = sys + "\n\n" + style_block
 
     user = []
     if user_prompt:
@@ -242,6 +338,10 @@ async def generate_chat_reply(*, messages_text: str, user_prompt: str | None = N
 
     user.append("Переписка (контекст):")
     user.append(_clamp_text(messages_text or "", 7000))
+
+    examples_block = _examples_block("chat", input_text=messages_text, sku=None, limit=4)
+    if examples_block:
+        sys = sys + "\n\n" + examples_block
     user.append(
         "\nСформируй ОДИН ответ продавца на последнее сообщение BUYER. "
         "Не добавляй метки BUYER/SELLER в ответ."
