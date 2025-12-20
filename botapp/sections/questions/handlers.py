@@ -10,7 +10,12 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 from botapp.api.ai_client import generate_answer_for_question
-from botapp.keyboards import MenuCallbackData, QuestionsCallbackData, question_card_keyboard, questions_list_keyboard
+from botapp.keyboards import MenuCallbackData
+from botapp.sections.questions.keyboards import (
+    QuestionsCallbackData,
+    question_card_keyboard,
+    questions_list_keyboard,
+)
 from botapp.utils.message_gc import (
     SECTION_QUESTION_CARD,
     SECTION_QUESTION_PROMPT,
@@ -134,13 +139,13 @@ async def _show_question_card(
 @router.message(F.text == "/questions")
 async def cmd_questions(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await _show_questions_list(user_id=message.from_user.id, category="unanswered", page=0, message=message, force_refresh=True)
+    await _show_questions_list(user_id=message.from_user.id, category="unanswered", page=0, message=message, force_refresh=False)
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "questions"))
 async def menu_questions(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await _show_questions_list(user_id=callback.from_user.id, category="unanswered", page=0, callback=callback, force_refresh=True)
+    await _show_questions_list(user_id=callback.from_user.id, category="unanswered", page=0, callback=callback, force_refresh=False)
 
 
 @router.callback_query(QuestionsCallbackData.filter())

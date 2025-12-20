@@ -10,7 +10,12 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 from botapp.api.ai_client import generate_review_reply
-from botapp.keyboards import MenuCallbackData, ReviewsCallbackData, review_card_keyboard, reviews_list_keyboard
+from botapp.keyboards import MenuCallbackData
+from botapp.sections.reviews.keyboards import (
+    ReviewsCallbackData,
+    review_card_keyboard,
+    reviews_list_keyboard,
+)
 from botapp.utils.message_gc import (
     SECTION_REVIEW_CARD,
     SECTION_REVIEW_PROMPT,
@@ -89,7 +94,6 @@ async def _show_review_card(
     token: str,
     callback: CallbackQuery | None = None,
     message: Message | None = None,
-    force_refresh: bool = False,
 ) -> None:
     rid = resolve_review_id(user_id, token) or token
     if not rid:
@@ -97,7 +101,7 @@ async def _show_review_card(
         return
 
     card = find_review(user_id, rid)
-    if card is None or force_refresh:
+    if card is None:
         await refresh_reviews_from_api(user_id)
         card = find_review(user_id, rid)
 
@@ -190,7 +194,13 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     if action in ("open", "open_card"):
-        await _show_review_card(user_id=user_id, category=category, page=page, token=token, callback=callback, force_refresh=True)
+        await _show_review_card(
+            user_id=user_id,
+            category=category,
+            page=page,
+            token=token,
+            callback=callback,
+        )
         return
 
     if action in ("ai", "card_ai"):
@@ -243,7 +253,7 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         )
 
         await send_ephemeral_message(callback, text="✅ Черновик создан. Открой карточку — он появится там.", ttl=3)
-        await _show_review_card(user_id=user_id, category=category, page=page, token=token, callback=callback, force_refresh=False)
+        await _show_review_card(user_id=user_id, category=category, page=page, token=token, callback=callback)
         return
 
     if action in ("reprompt", "card_reprompt"):
@@ -299,7 +309,7 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         )
 
         await send_ephemeral_message(callback, text="✅ Черновик удалён.", ttl=3)
-        await _show_review_card(user_id=user_id, category=category, page=page, token=encode_review_id(user_id, card.id), callback=callback, force_refresh=False)
+        await _show_review_card(user_id=user_id, category=category, page=page, token=encode_review_id(user_id, card.id), callback=callback)
         return
 
     if action == "send":
@@ -350,7 +360,7 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         mark_review_answered(card.id, user_id, text=draft)
 
         await send_ephemeral_message(callback, text="✅ Ответ отправлен в Ozon.", ttl=4)
-        await _show_review_card(user_id=user_id, category=category, page=page, token=token, callback=callback, force_refresh=True)
+        await _show_review_card(user_id=user_id, category=category, page=page, token=token, callback=callback)
         return
 
     await send_ephemeral_message(callback, text=f"⚠️ Неизвестное действие: {action}")
@@ -425,7 +435,7 @@ async def review_reprompt_text(message: Message, state: FSMContext) -> None:
     )
 
     await send_ephemeral_message(message, text="✅ Пересобрал. Открой карточку — черновик обновлён.", ttl=4)
-    await _show_review_card(user_id=user_id, category=category, page=page, token=token, message=message, force_refresh=False)
+    await _show_review_card(user_id=user_id, category=category, page=page, token=token, message=message)
 
 
 @router.message(ReviewStates.manual)
@@ -463,4 +473,4 @@ async def review_manual_text(message: Message, state: FSMContext) -> None:
     )
 
     await send_ephemeral_message(message, text="✅ Сохранил черновик.", ttl=3)
-    await _show_review_card(user_id=user_id, category=category, page=page, token=token, message=message, force_refresh=False)
+    await _show_review_card(user_id=user_id, category=category, page=page, token=token, message=message)

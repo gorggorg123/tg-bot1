@@ -1446,25 +1446,23 @@ async def chat_list(
     include_service: bool = False,
     refresh: bool | None = None,  # backward-compatible no-op
 ) -> ChatListResponse:
-    """List chats (v2).
+    """List chats via the current v3 endpoint.
 
-    Important: Ozon's /v2/chat/list требует непустой filter. Пустой объект часто даёт 400.
-    Возвращаем список уплощённых словарей (chat + unread метаданные), чтобы остальной код
-    (botapp/chats.py) не зависел от точной схемы ответа.
+    Новая версия API не принимает refresh и больше не поддерживает /v2/chat/list.
+    Сохраняем мягкий парсинг для разных форматов ответа (chats/items/result).
     """
     client = get_client()
 
     safe_limit = max(1, min(int(limit or 0), 500))
     offset_cur = max(0, int(offset or 0))
 
-    # Ozon ожидает filter-объект; минимально безопасно передавать chat_status + unread_only.
     safe_status = (chat_status or "ALL").upper()
     body_filter: dict[str, object] = {
         "chat_status": safe_status,
         "unread_only": bool(unread_only),
     }
 
-    collected: list[dict] = []
+    collected: list[ChatListItem] = []
     max_pages = 50  # защита от бесконечного цикла при странных пагинациях
     for _ in range(max_pages):
         if len(collected) >= safe_limit:
@@ -1477,66 +1475,47 @@ async def chat_list(
             "filter": body_filter,
         }
 
-        status_code, data = await client._post_with_status("/v2/chat/list", body)
+        status_code, data = await client._post_with_status("/v3/chat/list", body)
         if status_code >= 400:
-            raise OzonAPIError(f"Ozon API error {status_code} on /v2/chat/list: {data}")
+            raise OzonAPIError(f"Ozon API error {status_code} on /v3/chat/list: {data}")
 
-        root = None
-        if isinstance(data, dict):
-            root = data.get("result") if isinstance(data.get("result"), dict) else data
-        if not isinstance(root, dict):
+        payload = data.get("result") if isinstance(data, dict) else data
+        parsed_items: list[ChatListItem] = []
+        try:
+            parsed = ChatListResponse.model_validate(payload)
+            parsed_items = list(parsed.iter_items())
+        except ValidationError as exc:
+            logger.warning("Failed to parse chat list payload: %s", exc)
+            if isinstance(payload, dict):
+                maybe_items = payload.get("chats") or payload.get("items")
+                if isinstance(maybe_items, list):
+                    for raw in maybe_items:
+                        if isinstance(raw, dict):
+                            if isinstance(raw.get("chat"), dict):
+                                merged = _merge_nested_block(raw, "chat")
+                            else:
+                                merged = raw
+                            try:
+                                parsed_items.append(ChatListItem.model_validate(merged))
+                            except ValidationError:
+                                continue
+
+        if not parsed_items:
             break
 
-        raw_items = root.get("chats") if isinstance(root.get("chats"), list) else []
-        if not raw_items:
-            break
-
-        for item in raw_items:
-            if not isinstance(item, dict):
-                continue
-
-            # Ответ обычно имеет форму: { "chat": {...}, "unread_count": n, ... }
-            chat_block = item.get("chat") if isinstance(item.get("chat"), dict) else {}
-            flat = dict(chat_block)
-
-            # метаданные
-            for k in (
-                "unread_count",
-                "first_unread_message_id",
-                "last_message_id",
-                "total_unread_count",
-            ):
-                if k in item and item.get(k) not in (None, ""):
-                    flat[k] = item.get(k)
-
-            # Встречаются разные кейсы ключей (camelCase) — дублируем мягко.
-            if "unreadCount" in item and "unread_count" not in flat:
-                flat["unread_count"] = item.get("unreadCount")
-            if "lastMessageId" in item and "last_message_id" not in flat:
-                flat["last_message_id"] = item.get("lastMessageId")
-
-            # Фильтр служебных чатов
+        for item in parsed_items:
             if not include_service:
-                ctype = str(flat.get("chat_type") or flat.get("chatType") or "").lower()
+                ctype = str(item.chat_type or "").lower()
                 if ctype and ctype not in ("buyer_seller", "buyer-seller", "buyer_seller_chat"):
                     continue
+            collected.append(item)
 
-            collected.append(flat)
-
-        # Пагинация: если пришло меньше page_limit — дальше обычно пусто.
-        if len(raw_items) < page_limit:
+        if len(parsed_items) < page_limit:
             break
 
-        offset_cur += len(raw_items)
+        offset_cur += len(parsed_items)
 
-    normalized: list[ChatListItem] = []
-    for item in collected:
-        try:
-            normalized.append(ChatListItem.model_validate(item))
-        except ValidationError:
-            normalized.append(ChatListItem.model_validate({"chat_id": str(item.get("chat_id") or item.get("id") or "")}))
-
-    return ChatListResponse(chats=normalized)
+    return ChatListResponse(chats=collected)
 
 
 async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:

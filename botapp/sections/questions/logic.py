@@ -11,10 +11,9 @@ from __future__ import annotations
 
 import logging
 import re
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 from botapp.api.ozon_client import (
     Question,
@@ -23,7 +22,8 @@ from botapp.api.ozon_client import (
     get_question_answers,
     get_questions_list,
 )
-from botapp.ui.listing import format_period_header, slice_page
+from botapp.sections._base import is_cache_fresh
+from botapp.ui import TokenStore, format_period_header, slice_page
 from botapp.utils.text_utils import safe_strip, safe_str
 
 logger = logging.getLogger(__name__)
@@ -36,7 +36,8 @@ MSK_TZ = timezone(MSK_SHIFT)
 QUESTIONS_PAGE_SIZE = 10
 
 # Время жизни кеша списка вопросов
-SESSION_TTL = timedelta(minutes=2)
+CACHE_TTL_SECONDS = 120
+SESSION_TTL = timedelta(seconds=CACHE_TTL_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -64,15 +65,13 @@ class QuestionsSession:
     # Время загрузки кеша
     loaded_at: datetime = field(default_factory=datetime.utcnow)
 
-    # Токены -> (category, index) для компактных callback_data
-    tokens: Dict[str, Tuple[str, int]] = field(default_factory=dict)
-
     # Кеш текстов ответов по question.id, живёт вместе с сессией
     answer_cache: Dict[str, Dict[str, Optional[str]]] = field(default_factory=dict)
 
 
 # user_id -> QuestionsSession
 _sessions: Dict[int, QuestionsSession] = {}
+_question_tokens = TokenStore(ttl_seconds=CACHE_TTL_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +318,7 @@ async def refresh_questions(user_id: int, category: str = "all", *, force: bool 
     session.unanswered = _filter_by_category(questions, "unanswered")
     session.answered = _filter_by_category(questions, "answered")
     session.loaded_at = datetime.utcnow()
-    session.tokens.clear()
+    _question_tokens.clear(user_id)
 
     dates_msk = []
     for q in questions:
@@ -346,7 +345,7 @@ def _get_session(user_id: int) -> QuestionsSession:
 def _get_cached_questions(user_id: int, category: str) -> List[Question]:
     """Возвращаем кешированный список вопросов, если TTL не истёк."""
     session = _get_session(user_id)
-    if datetime.utcnow() - session.loaded_at > SESSION_TTL:
+    if not is_cache_fresh(session.loaded_at, CACHE_TTL_SECONDS):
         return []
 
     cat = (category or "all").lower()
@@ -606,8 +605,11 @@ def build_questions_table(
     for i, q in enumerate(slice_items, start=1 + safe_page * page_size):
         created_at = _parse_date(getattr(q, "created_at", None))
         date_part = _fmt_dt_msk(created_at) or "—"
-        status_text = safe_strip(getattr(q, "status", None)) or ""
-        status_label = status_text.upper() if status_text else "—"
+        raw_status_text = safe_strip(getattr(q, "status", None)) or ""
+        status_upper = raw_status_text.upper()
+        status_label = {"PROCESSED": "Опубликован"}.get(
+            status_upper, raw_status_text
+        )
 
         product = _pick_short_product_label_question(q)
 
@@ -618,7 +620,11 @@ def build_questions_table(
 
         qid = safe_strip(getattr(q, "id", None))
         if qid:
-            label = f"{i}) {badge} {date_part} · {status_label} · {product}"
+            parts = [f"{i}) {badge}", date_part]
+            if status_label:
+                parts.append(status_label)
+            parts.append(product)
+            label = " · ".join(parts)
             items.append((label, qid, i - 1))
 
     text = header or " "
@@ -637,20 +643,17 @@ def get_questions_pretty_period(user_id: int) -> str:
 
 
 def register_question_token(user_id: int, category: str, index: int) -> str:
-    """Регистрируем короткий токен для ссылок на вопрос из callback_data.
+    """Регистрируем короткий токен для ссылок на вопрос из callback_data."""
 
-    Сохраняем в сессии отображение token -> (category, index).
-    """
-    session = _get_session(user_id)
-    token = uuid.uuid4().hex[:8]
-    session.tokens[token] = (category, index)
-    return token
+    question = get_question_by_index(user_id, category, index)
+    key = getattr(question, "id", None) if question else None
+    return _question_tokens.generate(user_id, (category, index), key=key)
 
 
 def resolve_question_token(user_id: int, token: str) -> Optional[Question]:
     """Восстанавливаем объект Question по токену, если он ещё в кеше."""
-    session = _get_session(user_id)
-    category_index = session.tokens.get(token)
+
+    category_index = _question_tokens.resolve(user_id, token)
     if not category_index:
         return None
     category, index = category_index
