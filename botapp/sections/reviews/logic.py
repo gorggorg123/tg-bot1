@@ -1,9 +1,11 @@
 # botapp/sections/reviews/logic.py
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from botapp.api.ai_client import AIClientError, generate_review_reply
@@ -23,9 +25,15 @@ TELEGRAM_SOFT_LIMIT = 4000
 REVIEWS_PAGE_SIZE = 10
 CACHE_TTL_SECONDS = 120
 SESSION_TTL = timedelta(seconds=CACHE_TTL_SECONDS)
+SKU_TITLE_CACHE_TTL = timedelta(hours=12)
+SKU_TITLE_CACHE_PATH = Path(__file__).resolve().parents[3] / "data" / "sku_title_cache.json"
+SKU_TITLE_CACHE_KEY = "titles"
 
 _sessions: dict[int, "ReviewSession"] = {}
 _review_tokens = TokenStore(ttl_seconds=CACHE_TTL_SECONDS)
+_sku_title_cache: dict[str, str] = {}
+_sku_title_cache_loaded = False
+_sku_title_cache_expire_at: datetime | None = None
 
 _normalize_debug_logged = 0
 
@@ -202,6 +210,83 @@ def _msk_range_last_days(days: int = DEFAULT_RECENT_DAYS) -> Tuple[datetime, dat
     end_msk = now_msk
     pretty = f"{start_msk:%d.%m.%Y} 00:00 — {end_msk:%d.%m.%Y %H:%M} (МСК)"
     return start_msk, end_msk, pretty
+
+
+def _load_sku_title_cache() -> None:
+    """Загрузить persistent-кэш sku->title с диска (если ещё не загружен)."""
+
+    global _sku_title_cache_loaded, _sku_title_cache, _sku_title_cache_expire_at
+
+    if _sku_title_cache_loaded:
+        if _sku_title_cache_expire_at and datetime.utcnow() > _sku_title_cache_expire_at:
+            _sku_title_cache = {}
+            _sku_title_cache_expire_at = None
+        return
+
+    _sku_title_cache_loaded = True
+
+    if not SKU_TITLE_CACHE_PATH.exists():
+        return
+
+    try:
+        with SKU_TITLE_CACHE_PATH.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.debug("Failed to load SKU title cache: %s", exc)
+        return
+
+    expires_at_raw = payload.get("expires_at")
+    cache_data = payload.get(SKU_TITLE_CACHE_KEY) if isinstance(payload, dict) else None
+    try:
+        if expires_at_raw:
+            _sku_title_cache_expire_at = datetime.fromisoformat(str(expires_at_raw))
+    except Exception:
+        _sku_title_cache_expire_at = None
+
+    if _sku_title_cache_expire_at and datetime.utcnow() > _sku_title_cache_expire_at:
+        return
+
+    if not isinstance(cache_data, dict):
+        return
+
+    try:
+        _sku_title_cache = {str(k): safe_strip(v) for k, v in cache_data.items() if safe_strip(v)}
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Invalid SKU title cache contents: %s", exc)
+        _sku_title_cache = {}
+
+
+def _persist_sku_title_cache() -> None:
+    """Сохранить persistent-кэш sku->title на диск."""
+
+    global _sku_title_cache_expire_at
+
+    _sku_title_cache_expire_at = datetime.utcnow() + SKU_TITLE_CACHE_TTL
+    try:
+        SKU_TITLE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with SKU_TITLE_CACHE_PATH.open("w", encoding="utf-8") as f:
+            json.dump(
+                {"expires_at": _sku_title_cache_expire_at.isoformat(), SKU_TITLE_CACHE_KEY: _sku_title_cache},
+                f,
+                ensure_ascii=False,
+            )
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.debug("Failed to persist SKU title cache: %s", exc)
+
+
+def _get_sku_title_from_cache(key: str | None) -> str | None:
+    if not key:
+        return None
+    _load_sku_title_cache()
+    return _sku_title_cache.get(str(key))
+
+
+def _save_sku_title_to_cache(key: str | int | None, title: str | None) -> None:
+    if not key or not safe_strip(title):
+        return
+    _load_sku_title_cache()
+    _sku_title_cache[str(key)] = safe_strip(title)  # type: ignore[index]
+    _persist_sku_title_cache()
 
 
 def _has_answer_payload(review: ReviewCard) -> bool:
@@ -646,7 +731,7 @@ def _pick_product_label(card: ReviewCard) -> str:
     if product:
         return product
     if article_label and article_value:
-        title = "Артикул" if article_label == "SKU" else article_label
+        title = "SKU" if article_label == "SKU" else article_label
         return f"{title}: {article_value}"
     if card.product_id:
         return f"ID: {card.product_id}"
@@ -664,7 +749,7 @@ def _pick_short_product_label(card: ReviewCard) -> str:
     if name:
         return name[:47] + "…" if len(name) > 50 else name
     if article_label and article_value:
-        title = "Артикул" if article_label == "SKU" else article_label
+        title = "SKU" if article_label == "SKU" else article_label
         return f"{title}: {article_value}"
     if card.product_id:
         return f"ID: {card.product_id}"
@@ -792,6 +877,11 @@ async def _resolve_product_names(
         if not key:
             unresolved.append(c)
             continue
+        cached_sku_title = _get_sku_title_from_cache(key)
+        if cached_sku_title:
+            c.product_name = cached_sku_title
+            cache[key] = cached_sku_title
+            continue
         if key in cache:
             name = cache.get(key)
             if name:
@@ -824,6 +914,7 @@ async def _resolve_product_names(
             if name:
                 c.product_name = name
                 cache[key] = name
+                _save_sku_title_to_cache(key, name)
 
     unresolved = [c for c in cards if not safe_strip(c.product_name)]
     if not unresolved:
@@ -922,6 +1013,7 @@ async def _resolve_product_names(
                 if sku_int in title_by_sku:
                     c.product_name = title_by_sku[sku_int]
                     cache[pid] = c.product_name
+                    _save_sku_title_to_cache(pid, c.product_name)
                     continue
             except Exception:
                 pass
@@ -949,6 +1041,7 @@ async def _resolve_product_names(
             for c in cards:
                 if not c.product_name and (safe_strip(c.product_id) == product_id or safe_strip(c.offer_id) == product_id):
                     c.product_name = name
+                    _save_sku_title_to_cache(product_id, name)
 
 
 async def fetch_recent_reviews(
@@ -959,63 +1052,34 @@ async def fetch_recent_reviews(
     max_reviews: int = MAX_REVIEWS_LOAD,
     product_cache: Dict[str, str | None] | None = None,
     target_filtered: int = REVIEWS_PAGE_SIZE * 3,
-    stale_pages_threshold: int = 3,
-    stale_recency_days: int = 3,
-    fallback_limit: int = 400,
+    fallback_limit: int = 10,
 ) -> Tuple[List[ReviewCard], str]:
-    """Загрузить свежие отзывы порционно, останавливаясь как только хватает данных.
-
-    Загружаем страницы с самыми новыми отзывами, пока не собрали достаточный пул
-    отфильтрованных карточек для первых экранов и не вышли за рамки периода.
-    """
+    """Загрузить свежие отзывы порционно, останавливаясь как только хватает данных."""
 
     client = client or get_client()
     product_cache = product_cache if product_cache is not None else {}
     since_msk, to_msk, pretty = _msk_range_last_days(days)
-    # Берём чуть шире окно для запроса, чтобы не потерять отзывы на границах
-    fetch_since_msk = since_msk - timedelta(days=2)
-    fetch_from_utc = _to_utc(fetch_since_msk)
-    fetch_to_utc = _to_utc(to_msk)
-    analytics_from = _iso_date(fetch_from_utc or fetch_since_msk)
-    analytics_to = _iso_date(fetch_to_utc or to_msk)
+    analytics_from = _iso_date((since_msk - timedelta(days=2)).astimezone(timezone.utc))
+    analytics_to = _iso_date(_to_utc(to_msk) or to_msk)
 
-    raw: list[Dict[str, Any]] = []
-    filtered_cards: list[ReviewCard] = []
+    raw_cards: list[ReviewCard] = []
+    filtered_preview: list[ReviewCard] = []
     last_id: str | None = None
     target_count = max(target_filtered, REVIEWS_PAGE_SIZE)
     filter_from_date = since_msk.date()
     filter_to_date = to_msk.date()
-    stale_cutoff = _msk_now() - timedelta(days=stale_recency_days)
     pages_fetched = 0
-    max_pages = 6
-    freshest_seen: datetime | None = None
-    early_stop_threshold = timedelta(days=1)
-
-    def _should_stop() -> bool:
-        if len(filtered_cards) >= target_count:
-            oldest = min(
-                (_to_msk(c.created_at) for c in filtered_cards if c.created_at),
-                default=None,
-            )
-            if oldest and oldest.date() <= filter_from_date:
-                return True
-        if len(filtered_cards) >= REVIEWS_PAGE_SIZE * 3:
-            oldest = min(
-                (_to_msk(c.created_at) for c in filtered_cards if c.created_at),
-                default=None,
-            )
-            if oldest and oldest.date() <= (filter_from_date - early_stop_threshold):
-                return True
-        return False
+    max_pages = 10
+    first_page_logged = False
 
     try:
-        while len(raw) < max_reviews and pages_fetched < max_pages:
+        while len(raw_cards) < max_reviews and pages_fetched < max_pages:
             pages_fetched += 1
             res = await client.review_list(
-                date_start=_iso_no_ms(fetch_from_utc or fetch_since_msk),
-                date_end=_iso_no_ms(fetch_to_utc or to_msk),
                 limit=limit_per_page,
                 last_id=last_id,
+                sort_dir="DESC",
+                status="ALL",
             )
             if not isinstance(res, dict):
                 break
@@ -1025,15 +1089,15 @@ async def fetch_recent_reviews(
 
             if isinstance(items, list):
                 new_raw = [x for x in items if isinstance(x, dict)]
-                raw.extend(new_raw)
                 chunk_cards = [_normalize_review(r) for r in new_raw]
+                raw_cards.extend(chunk_cards)
                 chunk_filtered, _ = _filter_reviews_and_stats(
                     chunk_cards,
                     period_from_msk=filter_from_date,
                     period_to_msk=filter_to_date,
                     answer_filter="all",
                 )
-                filtered_cards.extend(chunk_filtered)
+                filtered_preview.extend(chunk_filtered)
                 chunk_dates = [
                     dt
                     for dt in (
@@ -1043,17 +1107,30 @@ async def fetch_recent_reviews(
                     )
                     if dt is not None
                 ]
+                if not first_page_logged:
+                    sorted_chunk_dates = sorted(chunk_dates, reverse=True)
+                    first_dt = sorted_chunk_dates[0] if sorted_chunk_dates else None
+                    last_dt = sorted_chunk_dates[-1] if sorted_chunk_dates else None
+                    logger.info(
+                        "Reviews first page: count=%s first_published_at=%s last_published_at=%s has_next=%s last_id=%s",
+                        len(chunk_cards),
+                        _fmt_dt_msk(first_dt),
+                        _fmt_dt_msk(last_dt),
+                        has_next,
+                        next_last_id,
+                    )
+                    first_page_logged = True
                 if chunk_dates:
-                    newest_chunk = max(chunk_dates)
-                    if freshest_seen is None or newest_chunk > freshest_seen:
-                        freshest_seen = newest_chunk
+                    oldest_chunk = min(chunk_dates)
+                    if oldest_chunk.date() < filter_from_date:
+                        break
             else:
                 break
 
-            if _should_stop():
+            if len(filtered_preview) >= target_count:
                 break
 
-            if len(raw) >= max_reviews:
+            if len(raw_cards) >= max_reviews:
                 break
 
             if has_next and next_last_id:
@@ -1068,62 +1145,9 @@ async def fetch_recent_reviews(
                 continue
             break
 
-        fallback_needed = (
-            pages_fetched >= stale_pages_threshold
-            and (freshest_seen is None or freshest_seen < stale_cutoff)
-        )
-
-        if fallback_needed:
-            logger.warning(
-                "Review pagination looks stale (freshest=%s, cutoff=%s, pages=%s). Running fallback fetch without date bounds.",
-                freshest_seen,
-                stale_cutoff,
-                pages_fetched,
-            )
-            raw_fallback: list[Dict[str, Any]] = []
-            last_id_fallback: str | None = None
-            fallback_pages = 0
-            while len(raw_fallback) < fallback_limit and fallback_pages < max_pages:
-                fallback_pages += 1
-                res_fb = await client.review_list(limit=limit_per_page, last_id=last_id_fallback)
-                if not isinstance(res_fb, dict):
-                    break
-                fb_items = res_fb.get("reviews") or res_fb.get("feedbacks") or res_fb.get("items") or []
-                fb_has_next = bool(res_fb.get("has_next") or res_fb.get("hasNext"))
-                fb_next_last_id = res_fb.get("last_id") or res_fb.get("lastId")
-
-                if not isinstance(fb_items, list):
-                    break
-
-                fb_new = [x for x in fb_items if isinstance(x, dict)]
-                raw_fallback.extend(fb_new)
-                if len(raw_fallback) >= fallback_limit:
-                    break
-
-                if fb_has_next and fb_next_last_id:
-                    last_id_fallback = str(fb_next_last_id)
-                    continue
-                if fb_has_next:
-                    continue
-                break
-
-            if raw_fallback:
-                raw = raw_fallback
-                normalized = [_normalize_review(r) for r in raw_fallback]
-                filtered_cards, _ = _filter_reviews_and_stats(
-                    normalized,
-                    period_from_msk=filter_from_date,
-                    period_to_msk=filter_to_date,
-                    answer_filter="all",
-                )
-
-        if raw:
-            # DEBUG: один пример для сверки схемы ReviewAPI, чтобы не спамить логи
-            logger.debug("Sample review payload: %r", raw[0])
-
-        total_candidates = len(filtered_cards)
+        total_candidates = len(raw_cards)
         filtered_cards, stats = _filter_reviews_and_stats(
-            filtered_cards,
+            raw_cards,
             period_from_msk=filter_from_date,
             period_to_msk=filter_to_date,
             answer_filter="all",
@@ -1143,7 +1167,7 @@ async def fetch_recent_reviews(
         unanswered_count = len(filter_reviews(filtered_cards, answer_filter="unanswered"))
         answered_count = len(filter_reviews(filtered_cards, answer_filter="answered"))
 
-        raw_dates_utc = [dt for dt in (_to_utc(c.created_at) for c in filtered_cards) if dt]
+        raw_dates_utc = [dt for dt in (_to_utc(c.created_at) for c in raw_cards) if dt]
         raw_dates_msk = [dt.astimezone(MSK_TZ) for dt in raw_dates_utc]
         filtered_dates_msk = [dt for dt in (_to_msk(c.created_at) for c in filtered_cards) if dt]
 
@@ -1153,9 +1177,9 @@ async def fetch_recent_reviews(
 
         logger.info(
             "Reviews fetched from API: %s items (UTC range: %s — %s) | filter_msk_dates=%s..%s",
-            len(raw),
-            (fetch_from_utc or fetch_since_msk).isoformat(),
-            (fetch_to_utc or to_msk).isoformat(),
+            len(raw_cards),
+            _to_utc(since_msk).isoformat(),
+            _to_utc(to_msk).isoformat(),
             filter_from_date,
             filter_to_date,
         )
@@ -1174,6 +1198,29 @@ async def fetch_recent_reviews(
                 since_msk,
                 to_msk,
                 _range_summary_msk(raw_dates_msk),
+            )
+
+        if not filtered_cards and raw_cards:
+            logger.info(
+                "No reviews left after date filter: period=%s..%s | raw_span=%s",
+                filter_from_date,
+                filter_to_date,
+                _range_summary_msk(raw_dates_msk),
+            )
+            filtered_cards = sorted(
+                raw_cards,
+                key=lambda c: _to_msk(c.created_at) or datetime.min.replace(tzinfo=MSK_TZ),
+                reverse=True,
+            )[: fallback_limit]
+            await _resolve_product_names(
+                filtered_cards,
+                client,
+                product_cache,
+                analytics_from=analytics_from,
+                analytics_to=analytics_to,
+            )
+            pretty = (
+                f"{pretty} — за период нет отзывов. Показываю последние {len(filtered_cards)}"
             )
 
         debug_dates = False
