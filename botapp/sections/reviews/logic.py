@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Tuple
 
 from botapp.api.ai_client import AIClientError, generate_review_reply
 from botapp.api.ozon_client import OzonClient, _product_name_cache, get_client
-from botapp.ui.listing import format_period_header, slice_page
+from botapp.sections._base import is_cache_fresh
+from botapp.ui import TokenStore, build_list_header, slice_page
 from botapp.utils.text_utils import safe_strip, safe_str
 
 logger = logging.getLogger(__name__)
@@ -20,12 +21,11 @@ MSK_SHIFT = timedelta(hours=3)
 MSK_TZ = timezone(MSK_SHIFT)
 TELEGRAM_SOFT_LIMIT = 4000
 REVIEWS_PAGE_SIZE = 10
-SESSION_TTL = timedelta(minutes=2)
+CACHE_TTL_SECONDS = 120
+SESSION_TTL = timedelta(seconds=CACHE_TTL_SECONDS)
 
 _sessions: dict[int, "ReviewSession"] = {}
-# NEW: Короткие токены для review_id, чтобы callback_data помещалась в лимит Telegram
-_review_id_to_token: dict[int, dict[str, str]] = {}
-_token_to_review_id: dict[int, dict[str, str]] = {}
+_review_tokens = TokenStore(ttl_seconds=CACHE_TTL_SECONDS)
 
 _normalize_debug_logged = 0
 
@@ -245,19 +245,7 @@ def is_answered(review: ReviewCard, user_id: int | None = None) -> bool:  # noqa
 def _reset_review_tokens(user_id: int) -> None:
     """Очистить токены отзывов для пользователя (при обновлении списка)."""
 
-    _review_id_to_token[user_id] = {}
-    _token_to_review_id[user_id] = {}
-
-
-def _base36(num: int) -> str:
-    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
-    if num == 0:
-        return "0"
-    digits = []
-    while num:
-        num, rem = divmod(num, 36)
-        digits.append(alphabet[rem])
-    return "".join(reversed(digits))
+    _review_tokens.clear(user_id)
 
 
 def _get_review_token(user_id: int, review_id: str | None) -> str | None:
@@ -265,27 +253,8 @@ def _get_review_token(user_id: int, review_id: str | None) -> str | None:
 
     if not review_id:
         return None
-    bucket = _review_id_to_token.setdefault(user_id, {})
-    if review_id in bucket:
-        return bucket[review_id]
-
-    # Хэшируем и переводим в base36, ограничиваем длину, чтобы избежать переполнения
-    raw = abs(hash((user_id, review_id)))
-    token = _base36(raw)[:8]
-    if not token:
-        token = "r0"
-
-    # Разрешаем редкие коллизии, добавляя суффикс
-    used = _token_to_review_id.setdefault(user_id, {})
-    suffix = 0
-    while token in used and used[token] != review_id:
-        suffix += 1
-        token_candidate = f"{token[:6]}{_base36(suffix)[:2]}"
-        token = token_candidate[:8]
-
-    bucket[review_id] = token
-    used[token] = review_id
-    return token
+    payload = ("all", -1, review_id)
+    return _review_tokens.generate(user_id, payload, key=review_id)
 
 
 def resolve_review_id(user_id: int, review_ref: str | None) -> str | None:
@@ -293,8 +262,10 @@ def resolve_review_id(user_id: int, review_ref: str | None) -> str | None:
 
     if not review_ref:
         return None
-    mapping = _token_to_review_id.get(user_id, {})
-    return mapping.get(review_ref, review_ref)
+    payload = _review_tokens.resolve(user_id, review_ref)
+    if isinstance(payload, tuple) and len(payload) == 3:
+        return payload[2]
+    return review_ref
 
 
 def find_review(user_id: int, review_id: str | None) -> ReviewCard | None:
@@ -987,8 +958,13 @@ async def fetch_recent_reviews(
     limit_per_page: int = 100,
     max_reviews: int = MAX_REVIEWS_LOAD,
     product_cache: Dict[str, str | None] | None = None,
+    target_filtered: int = REVIEWS_PAGE_SIZE * 3,
 ) -> Tuple[List[ReviewCard], str]:
-    """Загрузить отзывы за последние *days* дней одним списком."""
+    """Загрузить свежие отзывы порционно, останавливаясь как только хватает данных.
+
+    Загружаем страницы с самыми новыми отзывами, пока не собрали достаточный пул
+    отфильтрованных карточек для первых экранов и не вышли за рамки периода.
+    """
 
     client = client or get_client()
     product_cache = product_cache if product_cache is not None else {}
@@ -999,9 +975,24 @@ async def fetch_recent_reviews(
     fetch_to_utc = _to_utc(to_msk)
     analytics_from = _iso_date(fetch_from_utc or fetch_since_msk)
     analytics_to = _iso_date(fetch_to_utc or to_msk)
+
     raw: list[Dict[str, Any]] = []
+    filtered_cards: list[ReviewCard] = []
     last_id: str | None = None
     page = 1
+    target_count = max(target_filtered, REVIEWS_PAGE_SIZE)
+    filter_from_date = since_msk.date()
+    filter_to_date = to_msk.date()
+
+    def _should_stop() -> bool:
+        if len(filtered_cards) >= target_count:
+            oldest = min(
+                (_to_msk(c.created_at) for c in filtered_cards if c.created_at),
+                default=None,
+            )
+            if oldest and oldest.date() <= filter_from_date:
+                return True
+        return False
 
     while len(raw) < max_reviews:
         res = await client.review_list(
@@ -1018,8 +1009,20 @@ async def fetch_recent_reviews(
         next_last_id = res.get("last_id") or res.get("lastId")
 
         if isinstance(items, list):
-            raw.extend([x for x in items if isinstance(x, dict)])
+            new_raw = [x for x in items if isinstance(x, dict)]
+            raw.extend(new_raw)
+            chunk_cards = [_normalize_review(r) for r in new_raw]
+            chunk_filtered, _ = _filter_reviews_and_stats(
+                chunk_cards,
+                period_from_msk=filter_from_date,
+                period_to_msk=filter_to_date,
+                answer_filter="all",
+            )
+            filtered_cards.extend(chunk_filtered)
         else:
+            break
+
+        if _should_stop():
             break
 
         if len(raw) >= max_reviews:
@@ -1033,15 +1036,13 @@ async def fetch_recent_reviews(
             page += 1
             continue
         break
+
     if raw:
         # DEBUG: один пример для сверки схемы ReviewAPI, чтобы не спамить логи
         logger.debug("Sample review payload: %r", raw[0])
-    cards = [_normalize_review(r) for r in raw if isinstance(r, dict)]
-    filter_from_date = since_msk.date()
-    filter_to_date = to_msk.date()
 
     filtered_cards, stats = _filter_reviews_and_stats(
-        cards,
+        filtered_cards,
         period_from_msk=filter_from_date,
         period_to_msk=filter_to_date,
         answer_filter="all",
@@ -1061,7 +1062,7 @@ async def fetch_recent_reviews(
     unanswered_count = len(filter_reviews(filtered_cards, answer_filter="unanswered"))
     answered_count = len(filter_reviews(filtered_cards, answer_filter="answered"))
 
-    raw_dates_utc = [dt for dt in (_to_utc(c.created_at) for c in cards) if dt]
+    raw_dates_utc = [dt for dt in (_to_utc(c.created_at) for c in filtered_cards) if dt]
     raw_dates_msk = [dt.astimezone(MSK_TZ) for dt in raw_dates_utc]
     filtered_dates_msk = [dt for dt in (_to_msk(c.created_at) for c in filtered_cards) if dt]
 
@@ -1135,7 +1136,7 @@ def build_reviews_table(
         "all": "Все",
     }.get(category, category)
 
-    header = format_period_header(
+    header = build_list_header(
         f"🗂 Отзывы: {category_label}", pretty_period, safe_page, total_pages
     )
 
@@ -1149,13 +1150,15 @@ def build_reviews_table(
 
         prod = _pick_short_product_label(card) or "—"
 
-        is_pub_answer = bool(safe_strip(card.answer_text))
-        badge = "✅" if is_pub_answer else "🆕"
+        badge = "✅" if card.answered else "🆕"
+
+        status_text = safe_strip(card.status) or ""
+        status_label = status_text.upper() if status_text else stars
 
         review_id = card.id or ""
         token = encode_review_id(user_id, review_id)
         if review_id:
-            label = f"{i}) {badge} {created} · {stars} · {prod}"
+            label = f"{i}) {badge} {created} · {status_label} · {prod}"
             items.append((label, token or review_id, i - 1))
 
     text = header or " "
@@ -1184,7 +1187,7 @@ async def _ensure_session(user_id: int, client: OzonClient | None = None) -> Rev
     session = _sessions.get(user_id)
     now = datetime.utcnow()
 
-    if session and (now - session.loaded_at) < SESSION_TTL:
+    if session and is_cache_fresh(session.loaded_at, CACHE_TTL_SECONDS):
         return session
 
     product_cache: Dict[str, str | None] = {}

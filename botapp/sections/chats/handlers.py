@@ -19,12 +19,11 @@ from botapp.sections.chats.logic import (
     refresh_chat_thread,
     resolve_chat_id,
 )
-from botapp.keyboards import (
+from botapp.keyboards import MenuCallbackData, back_home_keyboard
+from botapp.sections.chats.keyboards import (
     ChatCallbackData,
-    MenuCallbackData,
-    back_home_keyboard,
-    chat_ai_draft_keyboard,
     chat_header_keyboard,
+    chat_ai_draft_keyboard,
     chats_list_keyboard,
 )
 from botapp.utils.message_gc import (
@@ -118,6 +117,13 @@ async def _show_chats_list(user_id: int, page: int, callback: CallbackQuery | No
         text = (
             "Чаты через Seller API доступны только при подписке Premium Plus (Ozon).\n"
             "seller-edu.ozon.ru"
+        )
+        markup = back_home_keyboard()
+    except OzonAPIError as exc:
+        logger.warning("Chat list unavailable for user %s: %s", user_id, exc)
+        text = (
+            "Чаты недоступны для текущего аккаунта/тарифа Seller API.\n"
+            "Попробуйте позже или обратитесь в поддержку Ozon."
         )
         markup = back_home_keyboard()
 
