@@ -7,6 +7,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from botapp.api.ozon_client import has_write_credentials
 from botapp.keyboards import MenuCallbackData
+from botapp.ui import build_list_keyboard
 from botapp.sections.questions.logic import register_question_token
 
 
@@ -137,82 +138,29 @@ def questions_list_keyboard(
     total_pages: int,
     items: list[tuple[str, str, int]],
 ) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
+    def _build_cb(action: str, cat: str, target_page: int, token: str | None) -> str:
+        return QuestionsCallbackData(
+            action=action,
+            category=cat,
+            token=token,
+            page=target_page,
+        ).pack()
 
+    with_tokens: list[tuple[str, str, int]] = []
     for label, _unused_question_id, idx in items:
         token = register_question_token(user_id=user_id, category=category, index=idx)
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=label,
-                    callback_data=QuestionsCallbackData(
-                        action="open",
-                        category=category,
-                        token=token,
-                        page=page,
-                    ).pack(),
-                )
-            ]
-        )
+        with_tokens.append((label, token, idx))
 
-    filter_row = [
-        InlineKeyboardButton(
-            text="Все",
-            callback_data=QuestionsCallbackData(action="list", category="all", page=0).pack(),
-        ),
-        InlineKeyboardButton(
-            text="Без ответа",
-            callback_data=QuestionsCallbackData(action="list", category="unanswered", page=0).pack(),
-        ),
-        InlineKeyboardButton(
-            text="С ответом",
-            callback_data=QuestionsCallbackData(action="list", category="answered", page=0).pack(),
-        ),
-    ]
-
-    safe_total_pages = max(total_pages, 1)
-    nav_row = [
-        InlineKeyboardButton(
-            text="⏮️" if page > 0 else "◀️ Назад",
-            callback_data=QuestionsCallbackData(
-                action="page",
-                category=category,
-                page=max(page - 1, 0),
-            ).pack(),
-        ),
-        InlineKeyboardButton(
-            text=f"Стр. {page + 1}/{safe_total_pages}",
-            callback_data=QuestionsCallbackData(action="noop", category=category, page=page).pack(),
-        ),
-        InlineKeyboardButton(
-            text="Вперёд ▶️" if page + 1 < total_pages else "⏭️",
-            callback_data=QuestionsCallbackData(
-                action="page",
-                category=category,
-                page=min(page + 1, max(total_pages - 1, 0)),
-            ).pack(),
-        ),
-    ]
-
-    rows.append(filter_row)
-    rows.append(nav_row)
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="🔄 Обновить",
-                callback_data=QuestionsCallbackData(action="refresh", category=category, page=page).pack(),
-            )
-        ]
+    return build_list_keyboard(
+        items=with_tokens,
+        category=category,
+        page=page,
+        total_pages=total_pages,
+        build_callback_data=_build_cb,
+        open_action="open",
+        refresh_action="refresh",
+        menu_callback_data=MenuCallbackData(section="home", action="open").pack(),
     )
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="⬅️ В главное меню",
-                callback_data=MenuCallbackData(section="home", action="open").pack(),
-            )
-        ]
-    )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 __all__ = [

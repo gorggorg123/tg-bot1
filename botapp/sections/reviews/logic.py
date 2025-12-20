@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Tuple
 from botapp.api.ai_client import AIClientError, generate_review_reply
 from botapp.api.ozon_client import OzonClient, _product_name_cache, get_client
 from botapp.sections._base import is_cache_fresh
-from botapp.ui import TokenStore, format_period_header, slice_page
+from botapp.ui import TokenStore, build_list_header, slice_page
 from botapp.utils.text_utils import safe_strip, safe_str
 
 logger = logging.getLogger(__name__)
@@ -958,8 +958,13 @@ async def fetch_recent_reviews(
     limit_per_page: int = 100,
     max_reviews: int = MAX_REVIEWS_LOAD,
     product_cache: Dict[str, str | None] | None = None,
+    target_filtered: int = REVIEWS_PAGE_SIZE * 3,
 ) -> Tuple[List[ReviewCard], str]:
-    """Загрузить отзывы за последние *days* дней одним списком."""
+    """Загрузить свежие отзывы порционно, останавливаясь как только хватает данных.
+
+    Загружаем страницы с самыми новыми отзывами, пока не собрали достаточный пул
+    отфильтрованных карточек для первых экранов и не вышли за рамки периода.
+    """
 
     client = client or get_client()
     product_cache = product_cache if product_cache is not None else {}
@@ -970,9 +975,24 @@ async def fetch_recent_reviews(
     fetch_to_utc = _to_utc(to_msk)
     analytics_from = _iso_date(fetch_from_utc or fetch_since_msk)
     analytics_to = _iso_date(fetch_to_utc or to_msk)
+
     raw: list[Dict[str, Any]] = []
+    filtered_cards: list[ReviewCard] = []
     last_id: str | None = None
     page = 1
+    target_count = max(target_filtered, REVIEWS_PAGE_SIZE)
+    filter_from_date = since_msk.date()
+    filter_to_date = to_msk.date()
+
+    def _should_stop() -> bool:
+        if len(filtered_cards) >= target_count:
+            oldest = min(
+                (_to_msk(c.created_at) for c in filtered_cards if c.created_at),
+                default=None,
+            )
+            if oldest and oldest.date() <= filter_from_date:
+                return True
+        return False
 
     while len(raw) < max_reviews:
         res = await client.review_list(
@@ -989,8 +1009,20 @@ async def fetch_recent_reviews(
         next_last_id = res.get("last_id") or res.get("lastId")
 
         if isinstance(items, list):
-            raw.extend([x for x in items if isinstance(x, dict)])
+            new_raw = [x for x in items if isinstance(x, dict)]
+            raw.extend(new_raw)
+            chunk_cards = [_normalize_review(r) for r in new_raw]
+            chunk_filtered, _ = _filter_reviews_and_stats(
+                chunk_cards,
+                period_from_msk=filter_from_date,
+                period_to_msk=filter_to_date,
+                answer_filter="all",
+            )
+            filtered_cards.extend(chunk_filtered)
         else:
+            break
+
+        if _should_stop():
             break
 
         if len(raw) >= max_reviews:
@@ -1004,15 +1036,13 @@ async def fetch_recent_reviews(
             page += 1
             continue
         break
+
     if raw:
         # DEBUG: один пример для сверки схемы ReviewAPI, чтобы не спамить логи
         logger.debug("Sample review payload: %r", raw[0])
-    cards = [_normalize_review(r) for r in raw if isinstance(r, dict)]
-    filter_from_date = since_msk.date()
-    filter_to_date = to_msk.date()
 
     filtered_cards, stats = _filter_reviews_and_stats(
-        cards,
+        filtered_cards,
         period_from_msk=filter_from_date,
         period_to_msk=filter_to_date,
         answer_filter="all",
@@ -1032,7 +1062,7 @@ async def fetch_recent_reviews(
     unanswered_count = len(filter_reviews(filtered_cards, answer_filter="unanswered"))
     answered_count = len(filter_reviews(filtered_cards, answer_filter="answered"))
 
-    raw_dates_utc = [dt for dt in (_to_utc(c.created_at) for c in cards) if dt]
+    raw_dates_utc = [dt for dt in (_to_utc(c.created_at) for c in filtered_cards) if dt]
     raw_dates_msk = [dt.astimezone(MSK_TZ) for dt in raw_dates_utc]
     filtered_dates_msk = [dt for dt in (_to_msk(c.created_at) for c in filtered_cards) if dt]
 
@@ -1106,7 +1136,7 @@ def build_reviews_table(
         "all": "Все",
     }.get(category, category)
 
-    header = format_period_header(
+    header = build_list_header(
         f"🗂 Отзывы: {category_label}", pretty_period, safe_page, total_pages
     )
 

@@ -51,6 +51,10 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _to_iso(dt) -> str | None:
+    return dt.isoformat() if isinstance(dt, datetime) else None
+
+
 async def _clear_other_review_sections(bot, user_id: int) -> None:
     await delete_section_message(user_id, SECTION_REVIEW_PROMPT, bot, force=True)
 
@@ -241,7 +245,7 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
 
         upsert_review_reply(
             review_id=card.id,
-            created_at=card.created_at,
+            created_at=_to_iso(card.created_at),
             product_name=card.product_name,
             rating=card.rating,
             review_text=card.text,
@@ -297,7 +301,7 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
 
         upsert_review_reply(
             review_id=card.id,
-            created_at=card.created_at,
+            created_at=_to_iso(card.created_at),
             product_name=card.product_name,
             rating=card.rating,
             review_text=card.text,
@@ -346,7 +350,7 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
 
         upsert_review_reply(
             review_id=card.id,
-            created_at=card.created_at,
+            created_at=_to_iso(card.created_at),
             product_name=card.product_name,
             rating=card.rating,
             review_text=card.text,
@@ -423,7 +427,7 @@ async def review_reprompt_text(message: Message, state: FSMContext) -> None:
 
     upsert_review_reply(
         review_id=card.id,
-        created_at=card.created_at,
+        created_at=_to_iso(card.created_at),
         product_name=card.product_name,
         rating=card.rating,
         review_text=card.text,
@@ -461,7 +465,7 @@ async def review_manual_text(message: Message, state: FSMContext) -> None:
 
     upsert_review_reply(
         review_id=card.id,
-        created_at=card.created_at,
+        created_at=_to_iso(card.created_at),
         product_name=card.product_name,
         rating=card.rating,
         review_text=card.text,

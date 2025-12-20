@@ -7,6 +7,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from botapp.api.ozon_client import has_write_credentials
 from botapp.keyboards import MenuCallbackData
+from botapp.ui import build_list_keyboard
 
 
 class ReviewsCallbackData(CallbackData, prefix="reviews"):
@@ -192,64 +193,24 @@ def reviews_list_keyboard(
     total_pages: int,
     items: list[tuple[str, str, int]],
 ) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
+    def _build_cb(action: str, cat: str, target_page: int, token: str | None) -> str:
+        return ReviewsCallbackData(
+            action=action,
+            category=cat,
+            token=token,
+            page=target_page,
+        ).pack()
 
-    for label, token, idx in items:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=label,
-                    callback_data=ReviewsCallbackData(
-                        action="open",
-                        category=category,
-                        index=idx,
-                        token=token,
-                        page=page,
-                    ).pack(),
-                )
-            ]
-        )
-
-    filter_row = [
-        InlineKeyboardButton(
-            text="Все",
-            callback_data=ReviewsCallbackData(action="list", category="all", page=0).pack(),
-        ),
-        InlineKeyboardButton(
-            text="Без ответа",
-            callback_data=ReviewsCallbackData(action="list", category="unanswered", page=0).pack(),
-        ),
-        InlineKeyboardButton(
-            text="С ответом",
-            callback_data=ReviewsCallbackData(action="list", category="answered", page=0).pack(),
-        ),
-    ]
-
-    safe_total_pages = max(total_pages, 1)
-    nav_row = [
-        InlineKeyboardButton(
-            text="⏮️" if page > 0 else "◀️ Назад",
-            callback_data=ReviewsCallbackData(
-                action="page", category=category, page=max(page - 1, 0)
-            ).pack(),
-        ),
-        InlineKeyboardButton(
-            text=f"Стр. {page + 1}/{safe_total_pages}",
-            callback_data=ReviewsCallbackData(action="noop", category=category, page=page).pack(),
-        ),
-        InlineKeyboardButton(
-            text="Вперёд ▶️" if page + 1 < total_pages else "⏭️",
-            callback_data=ReviewsCallbackData(
-                action="page",
-                category=category,
-                page=min(page + 1, max(total_pages - 1, 0)),
-            ).pack(),
-        ),
-    ]
-
-    rows.append(nav_row)
-    rows.append(filter_row)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return build_list_keyboard(
+        items=items,
+        category=category,
+        page=page,
+        total_pages=total_pages,
+        build_callback_data=_build_cb,
+        open_action="open",
+        refresh_action="refresh",
+        menu_callback_data=MenuCallbackData(section="home", action="open").pack(),
+    )
 
 
 def review_draft_keyboard(

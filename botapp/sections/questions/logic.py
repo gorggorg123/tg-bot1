@@ -23,7 +23,7 @@ from botapp.api.ozon_client import (
     get_questions_list,
 )
 from botapp.sections._base import is_cache_fresh
-from botapp.ui import TokenStore, format_period_header, slice_page
+from botapp.ui import TokenStore, build_list_header, slice_page
 from botapp.utils.text_utils import safe_strip, safe_str
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,7 @@ MSK_TZ = timezone(MSK_SHIFT)
 
 # Сколько вопросов на странице списка
 QUESTIONS_PAGE_SIZE = 10
+INITIAL_QUESTIONS_TARGET = QUESTIONS_PAGE_SIZE * 3
 
 # Время жизни кеша списка вопросов
 CACHE_TTL_SECONDS = 120
@@ -304,12 +305,29 @@ async def refresh_questions(user_id: int, category: str = "all", *, force: bool 
         if cached:
             return cached
 
-    # Загружаем все вопросы один раз и фильтруем локально
-    questions = await get_questions_list(
-        status=None,
-        limit=200,
-        offset=0,
-    )
+    questions: list[Question] = []
+    offset = 0
+    limit = 200
+
+    while True:
+        batch = await get_questions_list(
+            status=None,
+            limit=limit,
+            offset=offset,
+        )
+
+        if not isinstance(batch, list):
+            break
+
+        questions.extend(batch)
+
+        if len(batch) < limit:
+            break
+
+        if len(questions) >= INITIAL_QUESTIONS_TARGET:
+            break
+
+        offset += limit
 
     await _prefetch_question_product_names(questions)
 
@@ -596,7 +614,7 @@ def build_questions_table(
         "all": "Все",
     }.get(category, category)
 
-    header = format_period_header(
+    header = build_list_header(
         f"🗂 Вопросы: {category_label}", pretty_period, safe_page, total_pages
     )
 
