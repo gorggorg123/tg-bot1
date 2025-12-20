@@ -5,6 +5,7 @@ import json
 import os
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
@@ -49,9 +50,15 @@ def _read_json(path: Path, default: Any) -> Any:
 
 def _write_json_atomic(path: Path, data: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    txt = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True)
+    txt = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True, default=_json_default)
     tmp.write_text(txt, encoding="utf-8")
     tmp.replace(path)
+
+
+def _json_default(obj: Any) -> Any:
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
 @dataclass

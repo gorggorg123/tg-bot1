@@ -1,7 +1,6 @@
 # botapp/sections/chats/logic.py
 from __future__ import annotations
 
-import hashlib
 import html
 import logging
 import re
@@ -16,12 +15,16 @@ from botapp.api.ozon_client import (
     chat_history as ozon_chat_history,
     chat_list as ozon_chat_list,
 )
+from botapp.sections._base import is_cache_fresh
+from botapp.ui import TokenStore
 
 logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 10
 CACHE_TTL_SECONDS = 30
 THREAD_TTL_SECONDS = 15
+
+_chat_tokens = TokenStore(ttl_seconds=CACHE_TTL_SECONDS)
 
 DEFAULT_THREAD_LIMIT = 30
 MAX_THREAD_LIMIT = 180
@@ -30,11 +33,6 @@ MAX_THREAD_LIMIT = 180
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-
-def _cache_fresh(dt: datetime | None, ttl: int) -> bool:
-    if not dt:
-        return False
-    return (_now_utc() - dt) <= timedelta(seconds=int(ttl))
 
 
 def _trim(s: str, n: int) -> str:
@@ -58,7 +56,7 @@ def _is_premium_plus_error(exc: Exception) -> bool:
 
 
 def _short_token(user_id: int, chat_id: str) -> str:
-    return hashlib.blake2s(f"{user_id}:c:{chat_id}".encode("utf-8"), digest_size=8).hexdigest()
+    return _chat_tokens.generate(user_id, chat_id, key=chat_id)
 
 
 @dataclass(slots=True)
@@ -215,11 +213,11 @@ def normalize_thread_messages(raw_messages: list[dict], *, customer_only: bool =
 
 async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
     cache = _cc(user_id)
-    if not force and cache.chats and _cache_fresh(cache.fetched_at, CACHE_TTL_SECONDS):
+    if not force and cache.chats and is_cache_fresh(cache.fetched_at, CACHE_TTL_SECONDS):
         return
 
     try:
-        resp = await ozon_chat_list(limit=200, offset=0, refresh=True)
+        resp = await ozon_chat_list(limit=200, offset=0)
     except OzonAPIError as exc:
         if _is_premium_plus_error(exc):
             cache.error = "premium_plus_required"
@@ -230,11 +228,12 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
             return
         raise
 
-    chats = resp.chats or []
+    chats = resp.chats or list(resp.iter_items())
 
     # simple ordering: unread first, then by last_message_id desc
     chats.sort(key=lambda c: (-(int(c.unread_count or 0)), -(int(c.last_message_id or 0))))
 
+    _chat_tokens.clear(user_id)
     cache.chats = chats
     cache.fetched_at = _now_utc()
     cache.error = None
@@ -242,7 +241,9 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
     cache.token_to_chat_id.clear()
     cache.chat_id_to_token.clear()
     for c in chats:
-        cid = str(c.chat_id)
+        cid = c.safe_chat_id or str(c.chat_id or "").strip()
+        if not cid:
+            continue
         tok = _short_token(user_id, cid)
         cache.chat_id_to_token[cid] = tok
         cache.token_to_chat_id[tok] = cid
@@ -266,7 +267,9 @@ async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = Fals
 
     items: list[dict] = []
     for c in chunk:
-        cid = str(c.chat_id)
+        cid = c.safe_chat_id or str(c.chat_id or "").strip()
+        if not cid:
+            continue
         tok = cache.chat_id_to_token.get(cid) or _short_token(user_id, cid)
         title = (c.title or "").strip() or f"Чат {cid}"
         title = _trim(title.replace("\n", " "), 42)
@@ -295,7 +298,7 @@ async def refresh_chat_thread(*, user_id: int, chat_id: str, force: bool = False
     else:
         t.limit = max(10, min(int(t.limit or DEFAULT_THREAD_LIMIT), MAX_THREAD_LIMIT))
 
-    if not force and t.raw_messages and _cache_fresh(t.fetched_at, THREAD_TTL_SECONDS):
+    if not force and t.raw_messages and is_cache_fresh(t.fetched_at, THREAD_TTL_SECONDS):
         return ThreadView(chat_id=cid, raw_messages=t.raw_messages, fetched_at=t.fetched_at, limit=t.limit, last_message_id=t.last_message_id)
 
     resp: ChatHistoryResponse = await ozon_chat_history(cid, limit=t.limit)
