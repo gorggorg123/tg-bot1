@@ -1466,6 +1466,7 @@ async def get_ai_reply_for_review(review: ReviewCard) -> str:
     return await generate_review_reply(
         review_text=review.text,
         product_name=review.product_name,
+        sku=str(review.product_id or review.offer_id or "") or None,
         rating=review.rating,
     )
 

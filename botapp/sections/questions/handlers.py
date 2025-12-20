@@ -9,6 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
+from botapp.ai_memory import MemoryRecord, get_memory_store
 from botapp.api.ai_client import generate_answer_for_question
 from botapp.keyboards import MenuCallbackData
 from botapp.sections.questions.keyboards import (
@@ -240,6 +241,7 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
             draft = await generate_answer_for_question(
                 q.question_text or "",
                 product_name=q.product_name,
+                sku=q.sku,
                 existing_answer=previous,
                 user_prompt=None,
             )
@@ -333,6 +335,7 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
             await send_ephemeral_message(callback, text="⚠️ Не удалось отправить ответ. Попробуй позже.")
             return
 
+        answer_source = (saved.get("answer_source") or "manual")
         upsert_question_answer(
             question_id=q.id,
             created_at=q.created_at,
@@ -340,7 +343,7 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
             product_name=q.product_name,
             question=q.question_text,
             answer=draft,
-            answer_source=(saved.get("answer_source") or "manual"),
+            answer_source=answer_source,
             answer_sent_to_ozon=True,
             answer_sent_at=_now_iso(),
             meta={"sent": True},
@@ -351,6 +354,20 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
         q.answer_text = draft
 
         invalidate_answer_cache(q.id, user_id=user_id)
+
+        try:
+            rec = MemoryRecord.now_iso(
+                kind="question",
+                entity_id=str(q.id),
+                input_text=q.question_text or "",
+                output_text=draft,
+                sku=q.sku,
+                product_title=q.product_name,
+                meta={"answered_via": "ai" if answer_source == "ai" else "manual"},
+            )
+            get_memory_store().add_record(rec)
+        except Exception:
+            logger.exception("Failed to persist question answer to memory")
 
         await send_ephemeral_message(callback, text="✅ Ответ отправлен в Ozon.", ttl=4)
         await _show_question_card(user_id=user_id, category=category, page=page, token=token, callback=callback, force_refresh=True)
@@ -395,6 +412,7 @@ async def question_reprompt_text(message: Message, state: FSMContext) -> None:
         draft = await generate_answer_for_question(
             q.question_text or "",
             product_name=q.product_name,
+            sku=q.sku,
             existing_answer=previous,
             user_prompt=wish,
         )

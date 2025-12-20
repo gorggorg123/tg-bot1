@@ -9,6 +9,8 @@ from pathlib import Path
 
 import httpx
 
+from botapp.ai_memory import fetch_examples, format_examples_block
+
 logger = logging.getLogger(__name__)
 
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
@@ -144,10 +146,16 @@ def _base_rules() -> str:
     return ""
 
 
+def _examples_block(kind: str, *, input_text: str, sku: str | None = None, limit: int = 6) -> str:
+    examples = fetch_examples(kind=kind, input_text=input_text, sku=sku, limit=limit)
+    return format_examples_block(examples)
+
+
 async def generate_review_reply(
     *,
     review_text: str,
     product_name: str | None = None,
+    sku: str | None = None,
     rating: int | None = None,
     previous_answer: str | None = None,
     user_prompt: str | None = None,
@@ -155,8 +163,9 @@ async def generate_review_reply(
     sys = (
         "Ты — помощник продавца на маркетплейсе Ozon. "
         "Пиши ответы на отзывы по-русски, вежливо, без воды, без обещаний того, что нельзя гарантировать. "
-        "Не упоминай внутренние процессы Ozon. "
-        "Если отзыв негативный — сначала сочувствие, затем короткое решение/инструкция, затем приглашение уточнить детали."
+        "Не упоминай внутренние процессы Ozon и не выдумывай факты или сроки доставки. "
+        "Если отзыв негативный — сначала сочувствие, затем короткое решение/инструкция, затем приглашение уточнить детали. "
+        "Если вопрос про доставку — напомни, что доставку организует Ozon, без конкретных дат."
         "\n\n"
         + _base_rules()
     )
@@ -177,6 +186,10 @@ async def generate_review_reply(
         user.append("\nПожелания к ответу (пересборка):")
         user.append(user_prompt)
 
+    examples_block = _examples_block("review", input_text=review_text, sku=sku)
+    if examples_block:
+        sys = sys + "\n\n" + examples_block
+
     user.append(
         "\nСгенерируй один готовый ответ (без списков кнопок и без служебных комментариев). "
         "Максимум 500 символов, если можно — короче."
@@ -189,6 +202,7 @@ async def generate_answer_for_question(
     question_text: str,
     *,
     product_name: str | None = None,
+    sku: str | None = None,
     existing_answer: str | None = None,
     user_prompt: str | None = None,
 ) -> str:
@@ -196,7 +210,8 @@ async def generate_answer_for_question(
         "Ты — помощник продавца на Ozon. "
         "Отвечай строго по делу, без лишних оправданий. "
         "Не обещай сроки доставки (это зона Ozon), не предлагай перейти в мессенджеры. "
-        "Если данных недостаточно — задай 1 уточняющий вопрос в конце."
+        "Если данных недостаточно — задай 1 уточняющий вопрос в конце. "
+        "Не выдумывай детали товара и не обещай невозможное."
         "\n\n"
         + _base_rules()
     )
@@ -215,6 +230,10 @@ async def generate_answer_for_question(
         user.append("\nПожелания к ответу:")
         user.append(user_prompt)
 
+    examples_block = _examples_block("question", input_text=question_text, sku=sku)
+    if examples_block:
+        sys = sys + "\n\n" + examples_block
+
     user.append(
         "\nСгенерируй один готовый ответ. "
         "Максимум 450 символов, тон — профессиональный и доброжелательный."
@@ -229,7 +248,7 @@ async def generate_chat_reply(*, messages_text: str, user_prompt: str | None = N
         "Отвечай только как продавец. "
         "Не повторяй историю полностью; дай один короткий ответ по последнему сообщению покупателя. "
         "Если нужно — уточни детали одним вопросом. "
-        "Не упоминай, что ты ИИ."
+        "Не упоминай, что ты ИИ. Не обещай сроки доставки и не выдумывай детали заказа."
         "\n\n"
         + _base_rules()
     )
@@ -242,6 +261,10 @@ async def generate_chat_reply(*, messages_text: str, user_prompt: str | None = N
 
     user.append("Переписка (контекст):")
     user.append(_clamp_text(messages_text or "", 7000))
+
+    examples_block = _examples_block("chat", input_text=messages_text, sku=None, limit=4)
+    if examples_block:
+        sys = sys + "\n\n" + examples_block
     user.append(
         "\nСформируй ОДИН ответ продавца на последнее сообщение BUYER. "
         "Не добавляй метки BUYER/SELLER в ответ."

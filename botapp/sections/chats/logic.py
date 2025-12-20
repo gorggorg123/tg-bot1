@@ -276,6 +276,20 @@ def normalize_thread_messages(raw_messages: list[dict], *, customer_only: bool =
     return out
 
 
+def last_buyer_message_text(user_id: int, chat_id: str) -> str | None:
+    cid = str(chat_id).strip()
+    t = _tc(user_id, cid)
+    raw_messages = t.raw_messages or []
+    if not raw_messages:
+        return None
+
+    norm = normalize_thread_messages(raw_messages, customer_only=True, include_seller=False)
+    for msg in reversed(norm):
+        if msg.role == "buyer" and (msg.text or "").strip():
+            return msg.text.strip()
+    return None
+
+
 async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
     cache = _cc(user_id)
     lock = _lock_for_chat_list(user_id)
@@ -456,6 +470,7 @@ __all__ = [
     "refresh_chat_thread",
     "load_older_messages",
     "normalize_thread_messages",
+    "last_buyer_message_text",
     "get_chat_bubbles_for_ui",
     "NormalizedMessage",
     "ThreadView",

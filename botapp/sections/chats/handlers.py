@@ -9,6 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
+from botapp.ai_memory import MemoryRecord, get_memory_store
 from botapp.api.ai_client import generate_chat_reply
 from botapp.sections.chats.logic import (
     PremiumPlusRequired,
@@ -16,6 +17,7 @@ from botapp.sections.chats.logic import (
     get_chat_bubbles_for_ui,
     get_chats_table,
     load_older_messages,
+    last_buyer_message_text,
     normalize_thread_messages,
     refresh_chat_thread,
     resolve_chat_id,
@@ -341,6 +343,19 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             logger.exception("chat_send_message failed")
             await send_ephemeral_message(callback, text="⚠️ Не удалось отправить сообщение. Попробуйте позже.")
             return
+
+        try:
+            buyer_text = last_buyer_message_text(user_id, ozon_chat_id) or ""
+            rec = MemoryRecord.now_iso(
+                kind="chat",
+                entity_id=str(ozon_chat_id),
+                input_text=buyer_text,
+                output_text=draft,
+                meta={"answered_via": "ai"},
+            )
+            get_memory_store().add_record(rec)
+        except Exception:
+            logger.exception("Failed to persist chat reply to memory")
 
         await send_ephemeral_message(callback, text="✅ Сообщение отправлено в чат Ozon.")
         await _show_chat_thread(user_id=user_id, token=token, callback=callback, force_refresh=True, show_only_buyer=True)
