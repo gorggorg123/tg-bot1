@@ -1480,6 +1480,9 @@ async def chat_list(
             raise OzonAPIError(f"Ozon API error {status_code} on /v3/chat/list: {data}")
 
         payload = data.get("result") if isinstance(data, dict) else data
+        if not isinstance(payload, dict):
+            logger.warning("Chat list payload is not a dict: %r", payload)
+            return ChatListResponse(chats=[])
         parsed_items: list[ChatListItem] = []
         try:
             parsed = ChatListResponse.model_validate(payload)

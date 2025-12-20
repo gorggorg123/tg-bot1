@@ -994,127 +994,132 @@ async def fetch_recent_reviews(
                 return True
         return False
 
-    while len(raw) < max_reviews:
-        res = await client.review_list(
-            date_start=_iso_no_ms(fetch_from_utc or fetch_since_msk),
-            date_end=_iso_no_ms(fetch_to_utc or to_msk),
-            limit=limit_per_page,
-            last_id=last_id,
-            page=page if last_id is None else None,
-        )
-        if not isinstance(res, dict):
-            break
-        items = res.get("reviews") or res.get("feedbacks") or res.get("items") or []
-        has_next = bool(res.get("has_next") or res.get("hasNext"))
-        next_last_id = res.get("last_id") or res.get("lastId")
-
-        if isinstance(items, list):
-            new_raw = [x for x in items if isinstance(x, dict)]
-            raw.extend(new_raw)
-            chunk_cards = [_normalize_review(r) for r in new_raw]
-            chunk_filtered, _ = _filter_reviews_and_stats(
-                chunk_cards,
-                period_from_msk=filter_from_date,
-                period_to_msk=filter_to_date,
-                answer_filter="all",
+    try:
+        while len(raw) < max_reviews:
+            res = await client.review_list(
+                date_start=_iso_no_ms(fetch_from_utc or fetch_since_msk),
+                date_end=_iso_no_ms(fetch_to_utc or to_msk),
+                limit=limit_per_page,
+                last_id=last_id,
+                page=page if last_id is None else None,
             )
-            filtered_cards.extend(chunk_filtered)
-        else:
+            if not isinstance(res, dict):
+                break
+            items = res.get("reviews") or res.get("feedbacks") or res.get("items") or []
+            has_next = bool(res.get("has_next") or res.get("hasNext"))
+            next_last_id = res.get("last_id") or res.get("lastId")
+
+            if isinstance(items, list):
+                new_raw = [x for x in items if isinstance(x, dict)]
+                raw.extend(new_raw)
+                chunk_cards = [_normalize_review(r) for r in new_raw]
+                chunk_filtered, _ = _filter_reviews_and_stats(
+                    chunk_cards,
+                    period_from_msk=filter_from_date,
+                    period_to_msk=filter_to_date,
+                    answer_filter="all",
+                )
+                filtered_cards.extend(chunk_filtered)
+            else:
+                break
+
+            if _should_stop():
+                break
+
+            if len(raw) >= max_reviews:
+                break
+
+            if has_next and next_last_id:
+                last_id = str(next_last_id)
+                continue
+
+            if has_next:
+                page += 1
+                continue
             break
 
-        if _should_stop():
-            break
+        if raw:
+            # DEBUG: один пример для сверки схемы ReviewAPI, чтобы не спамить логи
+            logger.debug("Sample review payload: %r", raw[0])
 
-        if len(raw) >= max_reviews:
-            break
+        total_candidates = len(filtered_cards)
+        filtered_cards, stats = _filter_reviews_and_stats(
+            filtered_cards,
+            period_from_msk=filter_from_date,
+            period_to_msk=filter_to_date,
+            answer_filter="all",
+        )
+        await _resolve_product_names(
+            filtered_cards,
+            client,
+            product_cache,
+            analytics_from=analytics_from,
+            analytics_to=analytics_to,
+        )
+        filtered_cards.sort(
+            key=lambda c: _to_msk(c.created_at) or datetime.min.replace(tzinfo=MSK_TZ),
+            reverse=True,
+        )
 
-        if has_next and next_last_id:
-            last_id = str(next_last_id)
-            continue
+        unanswered_count = len(filter_reviews(filtered_cards, answer_filter="unanswered"))
+        answered_count = len(filter_reviews(filtered_cards, answer_filter="answered"))
 
-        if has_next:
-            page += 1
-            continue
-        break
+        raw_dates_utc = [dt for dt in (_to_utc(c.created_at) for c in filtered_cards) if dt]
+        raw_dates_msk = [dt.astimezone(MSK_TZ) for dt in raw_dates_utc]
+        filtered_dates_msk = [dt for dt in (_to_msk(c.created_at) for c in filtered_cards) if dt]
 
-    if raw:
-        # DEBUG: один пример для сверки схемы ReviewAPI, чтобы не спамить логи
-        logger.debug("Sample review payload: %r", raw[0])
+        year_counts: dict[int, int] = {}
+        for dt in raw_dates_utc:
+            year_counts[dt.year] = year_counts.get(dt.year, 0) + 1
 
-    filtered_cards, stats = _filter_reviews_and_stats(
-        filtered_cards,
-        period_from_msk=filter_from_date,
-        period_to_msk=filter_to_date,
-        answer_filter="all",
-    )
-    await _resolve_product_names(
-        filtered_cards,
-        client,
-        product_cache,
-        analytics_from=analytics_from,
-        analytics_to=analytics_to,
-    )
-    filtered_cards.sort(
-        key=lambda c: _to_msk(c.created_at) or datetime.min.replace(tzinfo=MSK_TZ),
-        reverse=True,
-    )
+        logger.info(
+            "Reviews fetched from API: %s items (UTC range: %s — %s) | filter_msk_dates=%s..%s",
+            len(raw),
+            (fetch_from_utc or fetch_since_msk).isoformat(),
+            (fetch_to_utc or to_msk).isoformat(),
+            filter_from_date,
+            filter_to_date,
+        )
 
-    unanswered_count = len(filter_reviews(filtered_cards, answer_filter="unanswered"))
-    answered_count = len(filter_reviews(filtered_cards, answer_filter="answered"))
-
-    raw_dates_utc = [dt for dt in (_to_utc(c.created_at) for c in filtered_cards) if dt]
-    raw_dates_msk = [dt.astimezone(MSK_TZ) for dt in raw_dates_utc]
-    filtered_dates_msk = [dt for dt in (_to_msk(c.created_at) for c in filtered_cards) if dt]
-
-    year_counts: dict[int, int] = {}
-    for dt in raw_dates_utc:
-        year_counts[dt.year] = year_counts.get(dt.year, 0) + 1
-
-    logger.info(
-        "Reviews fetched from API: %s items (UTC range: %s — %s) | filter_msk_dates=%s..%s",
-        len(raw),
-        (fetch_from_utc or fetch_since_msk).isoformat(),
-        (fetch_to_utc or to_msk).isoformat(),
-        filter_from_date,
-        filter_to_date,
-    )
-
-    logger.info(
-        "Reviews date span (MSK): raw=%s filtered=%s | raw_span_utc=%s | year_counts=%s",
-        _range_summary_msk(raw_dates_msk),
-        _range_summary_msk(filtered_dates_msk),
-        _range_summary_msk(raw_dates_utc),
-        year_counts,
-    )
-
-    if stats.get("dropped_by_date") == len(cards) and cards:
-        logger.warning(
-            "All reviews dropped by date: window_msk=%s..%s, raw_span=%s",
-            since_msk,
-            to_msk,
+        logger.info(
+            "Reviews date span (MSK): raw=%s filtered=%s | raw_span_utc=%s | year_counts=%s",
             _range_summary_msk(raw_dates_msk),
+            _range_summary_msk(filtered_dates_msk),
+            _range_summary_msk(raw_dates_utc),
+            year_counts,
         )
 
-    debug_dates = False
-    if debug_dates:
-        for sample in filtered_cards[:5]:
-            logger.info(
-                "Review debug: id=%s created_at_raw=%r created_at_parsed=%s created_at_msk=%s",
-                sample.id,
-                sample.raw_created_at,
-                sample.created_at,
-                _to_msk(sample.created_at),
+        if stats.get("dropped_by_date") == total_candidates and total_candidates:
+            logger.warning(
+                "All reviews dropped by date: window_msk=%s..%s, raw_span=%s",
+                since_msk,
+                to_msk,
+                _range_summary_msk(raw_dates_msk),
             )
-    logger.info(
-        "Reviews after filter: %s items for period=%s (МСК), filter=all | unanswered=%s | answered=%s | missing_dates=%s | dropped_by_date=%s",
-        len(filtered_cards),
-        pretty,
-        unanswered_count,
-        answered_count,
-        stats.get("missing_dates", 0),
-        stats.get("dropped_by_date", len(cards) - len(filtered_cards)),
-    )
-    return filtered_cards, pretty
+
+        debug_dates = False
+        if debug_dates:
+            for sample in filtered_cards[:5]:
+                logger.info(
+                    "Review debug: id=%s created_at_raw=%r created_at_parsed=%s created_at_msk=%s",
+                    sample.id,
+                    sample.raw_created_at,
+                    sample.created_at,
+                    _to_msk(sample.created_at),
+                )
+        logger.info(
+            "Reviews after filter: %s items for period=%s (МСК), filter=all | unanswered=%s | answered=%s | missing_dates=%s | dropped_by_date=%s",
+            len(filtered_cards),
+            pretty,
+            unanswered_count,
+            answered_count,
+            stats.get("missing_dates", 0),
+            stats.get("dropped_by_date", total_candidates - len(filtered_cards)),
+        )
+        return filtered_cards, pretty
+    except Exception:
+        logger.exception("Failed to fetch recent reviews")
+        return [], pretty
 
 
 def build_reviews_table(
