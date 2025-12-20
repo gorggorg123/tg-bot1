@@ -55,6 +55,19 @@ class ReviewCard:
     answer_created_at: datetime | None = None
     status: str | None = None
 
+    # Backward-compatible aliases for older handler code
+    @property
+    def has_answer(self) -> bool:
+        return bool(self.answered or (self.answer_text or "").strip())
+
+    @property
+    def seller_comment(self) -> str | None:
+        return self.answer_text
+
+    @seller_comment.setter
+    def seller_comment(self, value: str | None) -> None:
+        self.answer_text = value
+
 
 @dataclass
 class ReviewView:
