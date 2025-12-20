@@ -816,7 +816,10 @@ def format_review_card_text(
     review_text = safe_strip(card.text) or "—"
 
     lines: list[str] = []
-    badge = "✅" if card.answered else "🆕"
+    try:
+        badge = "✅" if card.has_answer else "🆕"
+    except Exception:
+        badge = "✅" if card.answered else "🆕"
     lines.append(f"📝 Отзыв {stars}  •  {badge}")
     lines.append(f"📅 {created_part}{age_part}")
     lines.append(f"🛒 Товар: {product_label}")
@@ -1308,16 +1311,16 @@ def build_reviews_table(
         created = _fmt_dt_msk(_to_msk(card.created_at)) or "—"
         rating = int(card.rating or 0)
         rating = max(0, min(rating, 5))
-        stars = "⭐" * rating if rating else "—"
+        rating_txt = f"★{rating}" if rating else "★–"
 
         prod = _pick_short_product_label(card) or "—"
 
-        badge = "✅" if card.answered else "🆕"
+        badge = "✅" if is_answered(card, user_id) else "⬜"
 
         review_id = card.id or ""
         token = encode_review_id(user_id, review_id)
         if review_id:
-            label = f"{i}) {badge} {created} · {stars} · {prod}"
+            label = f"{i:>2}. {badge} {created} | {rating_txt} | {prod}"
             items.append((label, token or review_id, i - 1))
 
     text = header or " "
