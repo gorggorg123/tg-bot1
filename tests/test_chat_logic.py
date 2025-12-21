@@ -48,6 +48,18 @@ class ChatHistoryFilterTest(unittest.TestCase):
 
         self.assertEqual(texts, ["buyer text", "we reply"])
 
+    def test_messages_sorted_by_time_and_id(self):
+        messages = [
+            {"message_id": 5, "created_at": "2024-01-02T10:00:00Z", "text": "later", "user": {"type": "Seller"}},
+            {"message_id": 2, "created_at": "2024-01-01T10:00:00Z", "text": "first", "user": {"type": "Customer"}},
+            {"message_id": 3, "created_at": "2024-01-01T11:00:00Z", "text": "second", "user": {"type": "Customer"}},
+        ]
+
+        normalized = normalize_thread_messages(messages, customer_only=True, include_seller=True)
+        texts = [m.text for m in normalized]
+
+        self.assertEqual(texts, ["first", "second", "later"])
+
 
 if __name__ == "__main__":
     unittest.main()

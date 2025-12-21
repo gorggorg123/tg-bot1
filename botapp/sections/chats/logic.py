@@ -21,7 +21,7 @@ from botapp.ui import TokenStore
 logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 10
-CACHE_TTL_SECONDS = 30
+CACHE_TTL_SECONDS = 10
 THREAD_TTL_SECONDS = 10
 MSK_TZ = timezone(timedelta(hours=3))
 
@@ -334,9 +334,38 @@ def _extract_created_at(m: dict) -> str | None:
     return None
 
 
+def _sort_key_for_message(m: dict, idx: int) -> tuple[int, int]:
+    """Стабильный ключ сортировки: по времени/ID, затем по порядку."""
+
+    ts = None
+    created_at = _extract_created_at(m)
+    if created_at:
+        try:
+            ts = int(datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp())
+        except Exception:
+            ts = None
+
+    mid = None
+    for key in ("message_id", "id"):
+        val = m.get(key)
+        try:
+            mid = int(val)
+            break
+        except Exception:
+            continue
+
+    return (ts if ts is not None else -10**12, mid if mid is not None else idx)
+
+
 def normalize_thread_messages(raw_messages: list[dict], *, customer_only: bool = True, include_seller: bool = True) -> list[NormalizedMessage]:
     out: list[NormalizedMessage] = []
-    for m in raw_messages or []:
+
+    sorted_pairs = sorted(
+        list(enumerate([m for m in raw_messages or [] if isinstance(m, dict)])),
+        key=lambda pair_idx: _sort_key_for_message(pair_idx[1], pair_idx[0]),
+    )
+
+    for _idx, m in sorted_pairs:
         if not isinstance(m, dict):
             continue
         role = _detect_sender_type(m)
@@ -406,7 +435,12 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
             return
 
         try:
-            resp = await ozon_chat_list(limit=200, offset=0)
+            resp = await ozon_chat_list(
+                limit=200,
+                offset=0,
+                include_service=False,
+                chat_type_whitelist=("buyer_seller", "buyer-seller", "buyer_seller_chat", "buyer_seller"),
+            )
         except OzonAPIError as exc:
             if _is_premium_plus_error(exc):
                 cache.error = "premium_plus_required"
@@ -420,17 +454,31 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
 
         chats = resp.chats or list(resp.iter_items())
 
+        deduped: list[ChatListItem] = []
+        seen: set[str] = set()
+        for c in chats:
+            cid = c.safe_chat_id or str(c.chat_id or "").strip()
+            if not cid:
+                continue
+            ctype = str(c.chat_type or "").lower()
+            if ctype and ctype not in ("buyer_seller", "buyer-seller", "buyer_seller_chat"):
+                continue
+            if cid in seen:
+                continue
+            seen.add(cid)
+            deduped.append(c)
+
         # simple ordering: unread first, then by last_message_id desc
-        chats.sort(key=lambda c: (-(int(c.unread_count or 0)), -(int(c.last_message_id or 0))))
+        deduped.sort(key=lambda c: (-(int(c.unread_count or 0)), -(int(c.last_message_id or 0))))
 
         _chat_tokens.clear(user_id)
-        cache.chats = chats
+        cache.chats = deduped
         cache.fetched_at = _now_utc()
         cache.error = None
 
         cache.token_to_chat_id.clear()
         cache.chat_id_to_token.clear()
-        for c in chats:
+        for c in deduped:
             cid = c.safe_chat_id or str(c.chat_id or "").strip()
             if not cid:
                 continue
@@ -438,7 +486,7 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
             cache.chat_id_to_token[cid] = tok
             cache.token_to_chat_id[tok] = cid
 
-        if not chats:
+        if not deduped:
             logger.info("Chat list returned 0 items for user %s (HTTP 200)", user_id)
 
 
@@ -481,15 +529,16 @@ async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = Fals
             last_snippet = _trim(str(getattr(c, "last_message_text", "") or extras.get("last_message_text") or ""), 60)
             last_time = _fmt_time(getattr(c, "last_message_time", None) or extras.get("last_message_time"))
 
-        badge = f" ({int(c.unread_count or 0)} непроч.)" if int(c.unread_count or 0) > 0 else ""
+        badge = f" непр.:{int(c.unread_count or 0)}" if int(c.unread_count or 0) > 0 else ""
         subtitle_parts = [p for p in (last_snippet, last_time) if p]
-        subtitle = " | ".join(subtitle_parts)
+        subtitle = " • ".join(subtitle_parts)
         short_id = cid[-8:] if len(cid) > 8 else cid
-        caption = f"{title} • <code>{short_id}</code>"
+        caption_bits = [title, f"ID:{short_id}"]
         if subtitle:
-            caption = _trim(f"{title}\n{subtitle}{badge}\nID: {short_id}", 96)
-        elif badge:
-            caption = _trim(f"{title}{badge}\nID: {short_id}", 96)
+            caption_bits.append(subtitle)
+        if badge:
+            caption_bits.append(badge)
+        caption = _trim(" • ".join([bit for bit in caption_bits if bit]).replace("\n", " "), 64)
 
         items.append({"token": tok, "title": caption or title, "unread_count": int(c.unread_count or 0)})
 
