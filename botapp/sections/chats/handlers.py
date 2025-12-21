@@ -1,6 +1,7 @@
 # botapp/chats_handlers.py
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Dict, List, Tuple
 
@@ -17,6 +18,7 @@ from botapp.sections.chats.logic import (
     get_chat_bubbles_for_ui,
     get_chats_table,
     load_older_messages,
+    last_buyer_message,
     last_buyer_message_text,
     normalize_thread_messages,
     refresh_chat_thread,
@@ -60,6 +62,29 @@ router = Router()
 _CHAT_BUBBLES: Dict[Tuple[int, str], List[int]] = {}
 
 
+async def _send_with_retry(chat_id: str, text: str, attempts: int = 3) -> None:
+    delay = 1.2
+    last_exc: Exception | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            await chat_send_message(chat_id, text)
+            return
+        except OzonAPIError as exc:
+            last_exc = exc
+            if attempt >= attempts - 1:
+                break
+            await asyncio.sleep(delay)
+            delay *= 1.6
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts - 1:
+                break
+            await asyncio.sleep(delay)
+            delay *= 1.6
+    if last_exc:
+        raise last_exc
+
+
 def _bkey(user_id: int, ozon_chat_id: str) -> Tuple[int, str]:
     return (int(user_id), str(ozon_chat_id).strip())
 
@@ -89,8 +114,15 @@ def _build_ai_context_text(norm_msgs) -> str:
     for m in norm_msgs:
         who = "BUYER" if m.role == "buyer" else "SELLER"
         txt = (m.text or "").strip().replace("\n", " ")
+        suffix = []
+        if m.context:
+            if m.context.get("posting_number"):
+                suffix.append(f"order {m.context['posting_number']}")
+            if m.context.get("sku"):
+                suffix.append(f"sku {m.context['sku']}")
+        meta = f" ({', '.join(suffix)})" if suffix else ""
         if txt:
-            lines.append(f"{who}: {txt}")
+            lines.append(f"{who}{meta}: {txt}")
     return "\n".join(lines[-80:])
 
 
@@ -178,7 +210,7 @@ async def _show_chat_thread(user_id: int, token: str, callback: CallbackQuery | 
             user_id=user_id,
             chat_id=ozon_chat_id,
             force_refresh=force_refresh,
-            customer_only=False,
+            customer_only=True,
             include_seller=True,
             max_messages=30,
         )
@@ -276,7 +308,7 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
 
         th = await refresh_chat_thread(user_id=user_id, chat_id=ozon_chat_id, force=True, limit=30)
         norm = normalize_thread_messages(th.raw_messages, customer_only=True, include_seller=True)
-        context_text = _build_ai_context_text(norm)
+        context_text = _build_ai_context_text(norm) or "История пуста. Ответь вежливо и уточни детали заказа при необходимости."
 
         st = get_chat_ai_state(ozon_chat_id) or {}
         user_prompt = (st.get("user_prompt") or "").strip() or None
@@ -342,7 +374,7 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             return
 
         try:
-            await chat_send_message(ozon_chat_id, draft)
+            await _send_with_retry(ozon_chat_id, draft)
         except OzonAPIError as exc:
             hint = (
                 " Обновите чат или дождитесь сообщения от покупателя, если нельзя писать первым."
@@ -358,16 +390,20 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             return
 
         try:
-            buyer_text = last_buyer_message_text(user_id, ozon_chat_id) or ""
+            buyer_msg = last_buyer_message(user_id, ozon_chat_id)
+            buyer_text = buyer_msg.text if buyer_msg else ""
             rec = ApprovedAnswer.now_iso(
                 kind="chat",
                 ozon_entity_id=str(ozon_chat_id),
                 input_text=buyer_text,
                 answer_text=draft,
-                product_id=None,
+                product_id=(buyer_msg.context.get("sku") if buyer_msg and buyer_msg.context else None),
                 product_name=None,
                 rating=None,
-                meta={"answered_via": "ai"},
+                meta={
+                    "answered_via": "ai",
+                    "posting_number": buyer_msg.context.get("posting_number") if buyer_msg and buyer_msg.context else None,
+                },
             )
             get_approved_memory_store().add_approved_answer(rec)
         except Exception:

@@ -75,11 +75,15 @@ class ApprovedMemoryStore:
             )
 
     def _compute_hash(self, rec: ApprovedAnswer) -> str:
+        norm_input = (rec.input_text or "").strip().lower()
+        norm_answer = (rec.answer_text or "").strip().lower()
         base = "|".join(
             [
                 (rec.kind or "").strip(),
                 (rec.ozon_entity_id or "").strip(),
-                (rec.answer_text or "").strip(),
+                (rec.product_id or "").strip(),
+                norm_input,
+                norm_answer,
             ]
         )
         return hashlib.sha256(base.encode("utf-8", errors="ignore")).hexdigest()
