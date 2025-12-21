@@ -21,8 +21,9 @@ from botapp.ui import TokenStore
 logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 10
-CACHE_TTL_SECONDS = 30
+CACHE_TTL_SECONDS = 10
 THREAD_TTL_SECONDS = 10
+MSK_TZ = timezone(timedelta(hours=3))
 
 _chat_tokens = TokenStore(ttl_seconds=CACHE_TTL_SECONDS)
 _chat_list_locks: dict[int, asyncio.Lock] = {}
@@ -138,6 +139,7 @@ class NormalizedMessage:
     role: str  # buyer | seller | ozon
     text: str
     created_at: str | None = None
+    context: dict[str, str] | None = None
     attachments: list[str] = field(default_factory=list)
     raw: dict | None = None
 
@@ -205,7 +207,7 @@ def _detect_sender_type(m: dict) -> str:
             candidates.append(v.lower())
 
     # nested structures
-    for k in ("from", "sender", "author"):
+    for k in ("from", "sender", "author", "user"):
         v = m.get(k)
         if isinstance(v, dict):
             for kk in ("type", "role", "user_type", "kind"):
@@ -215,6 +217,8 @@ def _detect_sender_type(m: dict) -> str:
 
     blob = " ".join(candidates)
 
+    if any(x in blob for x in ("notification", "system", "unspecified", "auto")):
+        return "ozon"
     if any(x in blob for x in ("customer", "buyer", "client", "consumer", "user")):
         return "buyer"
     if any(x in blob for x in ("seller", "vendor", "shop", "merchant")):
@@ -297,6 +301,31 @@ def _extract_attachments(m: dict) -> list[str]:
     return attachments
 
 
+def _extract_context(m: dict) -> dict[str, str]:
+    ctx: dict[str, str] = {}
+
+    for key in ("sku", "posting_number", "order_number", "product_id"):
+        v = m.get(key)
+        if isinstance(v, (str, int)) and str(v).strip():
+            ctx[key] = str(v).strip()
+
+    payload = m.get("payload")
+    if isinstance(payload, dict):
+        for key in ("sku", "posting_number", "order_number"):
+            v = payload.get(key)
+            if isinstance(v, (str, int)) and str(v).strip():
+                ctx.setdefault(key, str(v).strip())
+
+        ctx_block = payload.get("context")
+        if isinstance(ctx_block, dict):
+            for key in ("sku", "posting_number", "order_number"):
+                v = ctx_block.get(key)
+                if isinstance(v, (str, int)) and str(v).strip():
+                    ctx.setdefault(key, str(v).strip())
+
+    return ctx
+
+
 def _extract_created_at(m: dict) -> str | None:
     for k in ("created_at", "create_time", "timestamp", "date", "time"):
         v = m.get(k)
@@ -305,9 +334,38 @@ def _extract_created_at(m: dict) -> str | None:
     return None
 
 
+def _sort_key_for_message(m: dict, idx: int) -> tuple[int, int]:
+    """Стабильный ключ сортировки: по времени/ID, затем по порядку."""
+
+    ts = None
+    created_at = _extract_created_at(m)
+    if created_at:
+        try:
+            ts = int(datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp())
+        except Exception:
+            ts = None
+
+    mid = None
+    for key in ("message_id", "id"):
+        val = m.get(key)
+        try:
+            mid = int(val)
+            break
+        except Exception:
+            continue
+
+    return (ts if ts is not None else -10**12, mid if mid is not None else idx)
+
+
 def normalize_thread_messages(raw_messages: list[dict], *, customer_only: bool = True, include_seller: bool = True) -> list[NormalizedMessage]:
     out: list[NormalizedMessage] = []
-    for m in raw_messages or []:
+
+    sorted_pairs = sorted(
+        list(enumerate([m for m in raw_messages or [] if isinstance(m, dict)])),
+        key=lambda pair_idx: _sort_key_for_message(pair_idx[1], pair_idx[0]),
+    )
+
+    for _idx, m in sorted_pairs:
         if not isinstance(m, dict):
             continue
         role = _detect_sender_type(m)
@@ -321,7 +379,7 @@ def normalize_thread_messages(raw_messages: list[dict], *, customer_only: bool =
             continue
 
         if customer_only:
-            if role == "ozon":
+            if role not in ("buyer", "seller"):
                 continue
             if role == "seller" and not include_seller:
                 continue
@@ -331,6 +389,7 @@ def normalize_thread_messages(raw_messages: list[dict], *, customer_only: bool =
                 role=role,
                 text=txt,
                 created_at=_extract_created_at(m),
+                context=_extract_context(m) or None,
                 attachments=attachments,
                 raw=m,
             )
@@ -353,6 +412,20 @@ def last_buyer_message_text(user_id: int, chat_id: str) -> str | None:
     return None
 
 
+def last_buyer_message(user_id: int, chat_id: str) -> NormalizedMessage | None:
+    cid = str(chat_id).strip()
+    t = _tc(user_id, cid)
+    raw_messages = t.raw_messages or []
+    if not raw_messages:
+        return None
+
+    norm = normalize_thread_messages(raw_messages, customer_only=True, include_seller=False)
+    for msg in reversed(norm):
+        if msg.role == "buyer" and (msg.text or "").strip():
+            return msg
+    return None
+
+
 async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
     cache = _cc(user_id)
     lock = _lock_for_chat_list(user_id)
@@ -362,7 +435,12 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
             return
 
         try:
-            resp = await ozon_chat_list(limit=200, offset=0)
+            resp = await ozon_chat_list(
+                limit=200,
+                offset=0,
+                include_service=False,
+                chat_type_whitelist=("buyer_seller", "buyer-seller", "buyer_seller_chat", "buyer_seller"),
+            )
         except OzonAPIError as exc:
             if _is_premium_plus_error(exc):
                 cache.error = "premium_plus_required"
@@ -376,17 +454,31 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
 
         chats = resp.chats or list(resp.iter_items())
 
+        deduped: list[ChatListItem] = []
+        seen: set[str] = set()
+        for c in chats:
+            cid = c.safe_chat_id or str(c.chat_id or "").strip()
+            if not cid:
+                continue
+            ctype = str(c.chat_type or "").lower()
+            if ctype and ctype not in ("buyer_seller", "buyer-seller", "buyer_seller_chat"):
+                continue
+            if cid in seen:
+                continue
+            seen.add(cid)
+            deduped.append(c)
+
         # simple ordering: unread first, then by last_message_id desc
-        chats.sort(key=lambda c: (-(int(c.unread_count or 0)), -(int(c.last_message_id or 0))))
+        deduped.sort(key=lambda c: (-(int(c.unread_count or 0)), -(int(c.last_message_id or 0))))
 
         _chat_tokens.clear(user_id)
-        cache.chats = chats
+        cache.chats = deduped
         cache.fetched_at = _now_utc()
         cache.error = None
 
         cache.token_to_chat_id.clear()
         cache.chat_id_to_token.clear()
-        for c in chats:
+        for c in deduped:
             cid = c.safe_chat_id or str(c.chat_id or "").strip()
             if not cid:
                 continue
@@ -394,7 +486,7 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
             cache.chat_id_to_token[cid] = tok
             cache.token_to_chat_id[tok] = cid
 
-        if not chats:
+        if not deduped:
             logger.info("Chat list returned 0 items for user %s (HTTP 200)", user_id)
 
 
@@ -419,6 +511,9 @@ async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = Fals
         cid = c.safe_chat_id or str(c.chat_id or "").strip()
         if not cid:
             continue
+        ctype = str(c.chat_type or "").lower()
+        if ctype and ctype not in ("buyer_seller", "buyer-seller", "buyer_seller_chat"):
+            continue
         tok = cache.chat_id_to_token.get(cid) or _short_token(user_id, cid)
         title = (c.title or "").strip() or f"Чат {cid}"
         title = _trim(title.replace("\n", " "), 42)
@@ -434,14 +529,16 @@ async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = Fals
             last_snippet = _trim(str(getattr(c, "last_message_text", "") or extras.get("last_message_text") or ""), 60)
             last_time = _fmt_time(getattr(c, "last_message_time", None) or extras.get("last_message_time"))
 
-        badge = f" ({int(c.unread_count or 0)} непроч.)" if int(c.unread_count or 0) > 0 else ""
+        badge = f" непр.:{int(c.unread_count or 0)}" if int(c.unread_count or 0) > 0 else ""
         subtitle_parts = [p for p in (last_snippet, last_time) if p]
-        subtitle = " | ".join(subtitle_parts)
-        caption = title
+        subtitle = " • ".join(subtitle_parts)
+        short_id = cid[-8:] if len(cid) > 8 else cid
+        caption_bits = [title, f"ID:{short_id}"]
         if subtitle:
-            caption = _trim(f"{title}\n{subtitle}{badge}", 64)
-        elif badge:
-            caption = _trim(f"{title}{badge}", 64)
+            caption_bits.append(subtitle)
+        if badge:
+            caption_bits.append(badge)
+        caption = _trim(" • ".join([bit for bit in caption_bits if bit]).replace("\n", " "), 64)
 
         items.append({"token": tok, "title": caption or title, "unread_count": int(c.unread_count or 0)})
 
@@ -522,7 +619,7 @@ def _fmt_time(created_at: str | None) -> str:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).strftime("%H:%M")
+        return dt.astimezone(MSK_TZ).strftime("%d.%m %H:%M")
     except Exception:
         return ""
 
@@ -531,11 +628,23 @@ def _bubble_text(msg: NormalizedMessage) -> str:
     tm = _fmt_time(msg.created_at)
     txt = _escape(msg.text)
 
-    label = "Покупатель" if msg.role == "buyer" else ("Вы" if msg.role == "seller" else "Сервис")
+    label = "👤 Покупатель" if msg.role == "buyer" else ("🏪 Мы" if msg.role == "seller" else "Сервис")
     prefix = f"<b>{label}:</b> "
+    suffix = ""
+    if msg.context:
+        bits: list[str] = []
+        sku = msg.context.get("sku") or msg.context.get("product_id")
+        posting = msg.context.get("posting_number") or msg.context.get("order_number")
+        if sku:
+            bits.append(f"SKU {sku}")
+        if posting:
+            bits.append(f"Заказ {posting}")
+        if bits:
+            suffix = "\n<i>" + ", ".join(bits) + "</i>"
+
     if tm:
-        return f"{prefix}{txt}\n<i>{tm}</i>"
-    return prefix + txt
+        return f"{prefix}{txt}{suffix}\n<i>{tm}</i>"
+    return prefix + txt + suffix
 
 
 async def get_chat_bubbles_for_ui(
@@ -567,6 +676,7 @@ __all__ = [
     "load_older_messages",
     "normalize_thread_messages",
     "last_buyer_message_text",
+    "last_buyer_message",
     "get_chat_bubbles_for_ui",
     "NormalizedMessage",
     "ThreadView",

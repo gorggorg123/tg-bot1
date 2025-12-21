@@ -14,7 +14,14 @@ from urllib.parse import urlparse, unquote
 
 import httpx
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 # Разрешаем использовать поля с префиксом ``model_`` (ozonapi модели с model_id/model_info).
 BaseModel.model_config = ConfigDict(**dict(BaseModel.model_config), protected_namespaces=())
@@ -1425,10 +1432,26 @@ class ChatListItem(BaseModel):
     id: str | None = None
     title: str | None = None
     chat_type: str | None = None
+    chat_status: str | None = None
+    created_at: str | None = None
     unread_count: int | None = None
     last_message_id: int | None = None
+    first_unread_message_id: int | None = None
 
     model_config = ConfigDict(extra="allow", protected_namespaces=(), populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_nested_chat(cls, values: object) -> object:
+        if not isinstance(values, dict):
+            return values
+
+        nested = values.get("chat")
+        if isinstance(nested, dict):
+            merged = {**values, **nested}
+            merged.pop("chat", None)
+            return merged
+        return values
 
     @property
     def safe_chat_id(self) -> str | None:
@@ -1488,6 +1511,58 @@ class ChatHistoryResponse(BaseModel):
         for bucket in candidates:
             for item in bucket:
                 yield item
+
+
+class ChatMessage(BaseModel):
+    message_id: int | str | None = None
+    created_at: str | None = None
+    is_read: bool | None = None
+    is_image: bool | None = None
+    moderate_image_status: str | None = None
+    data: list[str] = Field(default_factory=list)
+    context: dict | None = None
+    user: dict | None = None
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+    @field_validator("data", mode="before")
+    @classmethod
+    def _ensure_data_list(cls, v: object) -> list[str]:
+        if isinstance(v, list):
+            return [str(item) for item in v if item not in (None, "")]
+        if v in (None, ""):
+            return []
+        return [str(v)]
+
+    @field_validator("message_id", mode="before")
+    @classmethod
+    def _coerce_id(cls, v: object) -> int | str | None:
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except Exception:
+            try:
+                return str(v)
+            except Exception:
+                return None
+
+    @property
+    def text(self) -> str:
+        return "\n".join([item for item in self.data if (item or "").strip()])
+
+    def to_dict(self) -> dict:
+        return {
+            "message_id": self.message_id,
+            "created_at": self.created_at,
+            "is_read": bool(self.is_read) if self.is_read is not None else None,
+            "is_image": bool(self.is_image) if self.is_image is not None else None,
+            "moderate_image_status": self.moderate_image_status,
+            "data": list(self.data),
+            "text": self.text,
+            "context": self.context or {},
+            "user": self.user or {},
+        }
 
 
 def _merge_nested_block(item: dict, key: str) -> dict:
@@ -1557,6 +1632,7 @@ async def chat_list(
     unread_only: bool = False,
     include_service: bool = False,
     refresh: bool | None = None,  # backward-compatible no-op
+    chat_type_whitelist: tuple[str, ...] = ("buyer_seller", "buyer-seller", "buyer_seller_chat"),
 ) -> ChatListResponse:
     """List chats via the current v3 endpoint.
 
@@ -1569,12 +1645,15 @@ async def chat_list(
     offset_cur = max(0, int(offset or 0))
 
     safe_status = (chat_status or "ALL").upper()
+    whitelist = tuple(str(x).lower() for x in chat_type_whitelist)
+
     body_filter: dict[str, object] = {
         "chat_status": safe_status,
         "unread_only": bool(unread_only),
     }
 
     collected: list[ChatListItem] = []
+    seen_ids: set[str] = set()
     max_pages = 50  # защита от бесконечного цикла при странных пагинациях
     for _ in range(max_pages):
         if len(collected) >= safe_limit:
@@ -1618,14 +1697,24 @@ async def chat_list(
         if not parsed_items:
             break
 
+        new_items = 0
         for item in parsed_items:
             if not include_service:
                 ctype = str(item.chat_type or "").lower()
-                if ctype and ctype not in ("buyer_seller", "buyer-seller", "buyer_seller_chat"):
+                if ctype and whitelist and ctype not in whitelist:
                     continue
+            cid = (item.safe_chat_id or str(item.chat_id or "").strip() or "").strip()
+            if cid and cid in seen_ids:
+                continue
+            if cid:
+                seen_ids.add(cid)
             collected.append(item)
+            new_items += 1
 
         if len(parsed_items) < page_limit:
+            break
+
+        if new_items == 0:
             break
 
         offset_cur += len(parsed_items)
@@ -1635,7 +1724,11 @@ async def chat_list(
 
 async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:
     client = get_client()
-    body = {"chat_id": chat_id, "limit": max(1, min(limit, 50))}
+    body = {
+        "chat_id": chat_id,
+        "limit": max(1, min(limit, 50)),
+        "direction": "Backward",  # запрашиваем свежие сообщения, но отсортируем ниже
+    }
     status_code, data = await client._post_with_status("/v3/chat/history", body)
     if status_code >= 400 or not isinstance(data, dict):
         message = None
