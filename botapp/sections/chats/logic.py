@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 PAGE_SIZE = 10
 CACHE_TTL_SECONDS = 30
 THREAD_TTL_SECONDS = 10
+MSK_TZ = timezone(timedelta(hours=3))
 
 _chat_tokens = TokenStore(ttl_seconds=CACHE_TTL_SECONDS)
 _chat_list_locks: dict[int, asyncio.Lock] = {}
@@ -138,6 +139,7 @@ class NormalizedMessage:
     role: str  # buyer | seller | ozon
     text: str
     created_at: str | None = None
+    context: dict[str, str] | None = None
     attachments: list[str] = field(default_factory=list)
     raw: dict | None = None
 
@@ -205,7 +207,7 @@ def _detect_sender_type(m: dict) -> str:
             candidates.append(v.lower())
 
     # nested structures
-    for k in ("from", "sender", "author"):
+    for k in ("from", "sender", "author", "user"):
         v = m.get(k)
         if isinstance(v, dict):
             for kk in ("type", "role", "user_type", "kind"):
@@ -215,6 +217,8 @@ def _detect_sender_type(m: dict) -> str:
 
     blob = " ".join(candidates)
 
+    if any(x in blob for x in ("notification", "system", "unspecified", "auto")):
+        return "ozon"
     if any(x in blob for x in ("customer", "buyer", "client", "consumer", "user")):
         return "buyer"
     if any(x in blob for x in ("seller", "vendor", "shop", "merchant")):
@@ -297,6 +301,31 @@ def _extract_attachments(m: dict) -> list[str]:
     return attachments
 
 
+def _extract_context(m: dict) -> dict[str, str]:
+    ctx: dict[str, str] = {}
+
+    for key in ("sku", "posting_number", "order_number", "product_id"):
+        v = m.get(key)
+        if isinstance(v, (str, int)) and str(v).strip():
+            ctx[key] = str(v).strip()
+
+    payload = m.get("payload")
+    if isinstance(payload, dict):
+        for key in ("sku", "posting_number", "order_number"):
+            v = payload.get(key)
+            if isinstance(v, (str, int)) and str(v).strip():
+                ctx.setdefault(key, str(v).strip())
+
+        ctx_block = payload.get("context")
+        if isinstance(ctx_block, dict):
+            for key in ("sku", "posting_number", "order_number"):
+                v = ctx_block.get(key)
+                if isinstance(v, (str, int)) and str(v).strip():
+                    ctx.setdefault(key, str(v).strip())
+
+    return ctx
+
+
 def _extract_created_at(m: dict) -> str | None:
     for k in ("created_at", "create_time", "timestamp", "date", "time"):
         v = m.get(k)
@@ -321,7 +350,7 @@ def normalize_thread_messages(raw_messages: list[dict], *, customer_only: bool =
             continue
 
         if customer_only:
-            if role == "ozon":
+            if role not in ("buyer", "seller"):
                 continue
             if role == "seller" and not include_seller:
                 continue
@@ -331,6 +360,7 @@ def normalize_thread_messages(raw_messages: list[dict], *, customer_only: bool =
                 role=role,
                 text=txt,
                 created_at=_extract_created_at(m),
+                context=_extract_context(m) or None,
                 attachments=attachments,
                 raw=m,
             )
@@ -350,6 +380,20 @@ def last_buyer_message_text(user_id: int, chat_id: str) -> str | None:
     for msg in reversed(norm):
         if msg.role == "buyer" and (msg.text or "").strip():
             return msg.text.strip()
+    return None
+
+
+def last_buyer_message(user_id: int, chat_id: str) -> NormalizedMessage | None:
+    cid = str(chat_id).strip()
+    t = _tc(user_id, cid)
+    raw_messages = t.raw_messages or []
+    if not raw_messages:
+        return None
+
+    norm = normalize_thread_messages(raw_messages, customer_only=True, include_seller=False)
+    for msg in reversed(norm):
+        if msg.role == "buyer" and (msg.text or "").strip():
+            return msg
     return None
 
 
@@ -419,6 +463,9 @@ async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = Fals
         cid = c.safe_chat_id or str(c.chat_id or "").strip()
         if not cid:
             continue
+        ctype = str(c.chat_type or "").lower()
+        if ctype and ctype not in ("buyer_seller", "buyer-seller", "buyer_seller_chat"):
+            continue
         tok = cache.chat_id_to_token.get(cid) or _short_token(user_id, cid)
         title = (c.title or "").strip() or f"Чат {cid}"
         title = _trim(title.replace("\n", " "), 42)
@@ -437,11 +484,12 @@ async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = Fals
         badge = f" ({int(c.unread_count or 0)} непроч.)" if int(c.unread_count or 0) > 0 else ""
         subtitle_parts = [p for p in (last_snippet, last_time) if p]
         subtitle = " | ".join(subtitle_parts)
-        caption = title
+        short_id = cid[-8:] if len(cid) > 8 else cid
+        caption = f"{title} • <code>{short_id}</code>"
         if subtitle:
-            caption = _trim(f"{title}\n{subtitle}{badge}", 64)
+            caption = _trim(f"{title}\n{subtitle}{badge}\nID: {short_id}", 96)
         elif badge:
-            caption = _trim(f"{title}{badge}", 64)
+            caption = _trim(f"{title}{badge}\nID: {short_id}", 96)
 
         items.append({"token": tok, "title": caption or title, "unread_count": int(c.unread_count or 0)})
 
@@ -522,7 +570,7 @@ def _fmt_time(created_at: str | None) -> str:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).strftime("%H:%M")
+        return dt.astimezone(MSK_TZ).strftime("%d.%m %H:%M")
     except Exception:
         return ""
 
@@ -531,11 +579,23 @@ def _bubble_text(msg: NormalizedMessage) -> str:
     tm = _fmt_time(msg.created_at)
     txt = _escape(msg.text)
 
-    label = "Покупатель" if msg.role == "buyer" else ("Вы" if msg.role == "seller" else "Сервис")
+    label = "👤 Покупатель" if msg.role == "buyer" else ("🏪 Мы" if msg.role == "seller" else "Сервис")
     prefix = f"<b>{label}:</b> "
+    suffix = ""
+    if msg.context:
+        bits: list[str] = []
+        sku = msg.context.get("sku") or msg.context.get("product_id")
+        posting = msg.context.get("posting_number") or msg.context.get("order_number")
+        if sku:
+            bits.append(f"SKU {sku}")
+        if posting:
+            bits.append(f"Заказ {posting}")
+        if bits:
+            suffix = "\n<i>" + ", ".join(bits) + "</i>"
+
     if tm:
-        return f"{prefix}{txt}\n<i>{tm}</i>"
-    return prefix + txt
+        return f"{prefix}{txt}{suffix}\n<i>{tm}</i>"
+    return prefix + txt + suffix
 
 
 async def get_chat_bubbles_for_ui(
@@ -567,6 +627,7 @@ __all__ = [
     "load_older_messages",
     "normalize_thread_messages",
     "last_buyer_message_text",
+    "last_buyer_message",
     "get_chat_bubbles_for_ui",
     "NormalizedMessage",
     "ThreadView",

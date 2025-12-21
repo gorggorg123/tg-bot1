@@ -14,7 +14,14 @@ from urllib.parse import urlparse, unquote
 
 import httpx
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 # Разрешаем использовать поля с префиксом ``model_`` (ozonapi модели с model_id/model_info).
 BaseModel.model_config = ConfigDict(**dict(BaseModel.model_config), protected_namespaces=())
@@ -1425,10 +1432,26 @@ class ChatListItem(BaseModel):
     id: str | None = None
     title: str | None = None
     chat_type: str | None = None
+    chat_status: str | None = None
+    created_at: str | None = None
     unread_count: int | None = None
     last_message_id: int | None = None
+    first_unread_message_id: int | None = None
 
     model_config = ConfigDict(extra="allow", protected_namespaces=(), populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_nested_chat(cls, values: object) -> object:
+        if not isinstance(values, dict):
+            return values
+
+        nested = values.get("chat")
+        if isinstance(nested, dict):
+            merged = {**values, **nested}
+            merged.pop("chat", None)
+            return merged
+        return values
 
     @property
     def safe_chat_id(self) -> str | None:
@@ -1557,6 +1580,7 @@ async def chat_list(
     unread_only: bool = False,
     include_service: bool = False,
     refresh: bool | None = None,  # backward-compatible no-op
+    chat_type_whitelist: tuple[str, ...] = ("buyer_seller", "buyer-seller", "buyer_seller_chat"),
 ) -> ChatListResponse:
     """List chats via the current v3 endpoint.
 
@@ -1621,7 +1645,7 @@ async def chat_list(
         for item in parsed_items:
             if not include_service:
                 ctype = str(item.chat_type or "").lower()
-                if ctype and ctype not in ("buyer_seller", "buyer-seller", "buyer_seller_chat"):
+                if ctype and ctype not in chat_type_whitelist:
                     continue
             collected.append(item)
 
