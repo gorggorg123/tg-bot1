@@ -252,6 +252,16 @@ def chat_draft_keyboard(chat_id: str) -> InlineKeyboardMarkup:
                     callback_data=ChatsCallbackData(action="refresh_thread", token=chat_id).pack(),
                 )
             ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ К списку чатов",
+                    callback_data=ChatsCallbackData(action="list", token=chat_id).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="⬅️ В меню",
+                    callback_data=MenuCallbackData(section="home", action="open").pack(),
+                )
+            ],
         ]
     )
 

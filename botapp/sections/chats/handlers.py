@@ -603,7 +603,6 @@ async def chat_reprompt_text(message: Message, state: FSMContext) -> None:
         user_prompt=user_prompt,
     )
 
-    await safe_delete_message(message.bot, message.chat.id, message.message_id)
     await state.clear()
 
 
