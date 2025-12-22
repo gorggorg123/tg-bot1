@@ -23,8 +23,6 @@ def chats_list_keyboard(
     items: list[dict],
     page: int,
     total_pages: int,
-    unread_only: bool = False,
-    show_service: bool = False,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for item in items:
@@ -36,33 +34,17 @@ def chats_list_keyboard(
             [
                 InlineKeyboardButton(
                     text=caption,
-                    callback_data=ChatsCallbackData(action="open", token=token, chat_id=token).pack(),
-                )
-            ]
-        )
+                callback_data=ChatsCallbackData(action="open", token=token, chat_id=token).pack(),
+            )
+        ]
+    )
 
     safe_total = max(total_pages, 1)
     rows.append(
         [
             InlineKeyboardButton(
-                text="🔎 Только непрочитанные" if not unread_only else "📄 Все чаты",
-                callback_data=ChatsCallbackData(action="filter", page=page).pack(),
-            )
-        ]
-    )
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="🛡️ Показывать служебные" if not show_service else "🙈 Скрыть служебные",
-                callback_data=ChatsCallbackData(action="service", page=page).pack(),
-            )
-        ]
-    )
-    rows.append(
-        [
-            InlineKeyboardButton(
                 text="⬅️" if page > 0 else "⏮️",
-                callback_data=ChatsCallbackData(action="list", page=max(page - 1, 0)).pack(),
+                callback_data=ChatsCallbackData(action="page", page=max(page - 1, 0)).pack(),
             ),
             InlineKeyboardButton(
                 text=f"Стр. {page + 1}/{safe_total}",
@@ -71,7 +53,7 @@ def chats_list_keyboard(
             InlineKeyboardButton(
                 text="➡️" if page + 1 < total_pages else "⏭️",
                 callback_data=ChatsCallbackData(
-                    action="list", page=min(page + 1, max(total_pages - 1, 0))
+                    action="page", page=min(page + 1, max(total_pages - 1, 0))
                 ).pack(),
             ),
         ]
@@ -87,24 +69,30 @@ def chats_list_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def chat_header_keyboard(token: str) -> InlineKeyboardMarkup:
+def chat_header_keyboard(token: str, page: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="➡️ Новые",
+                    text="🔄 Обновить",
                     callback_data=ChatsCallbackData(action="refresh_thread", token=token).pack(),
                 ),
                 InlineKeyboardButton(
-                    text="⬅️ Старые",
+                    text="⬅️ Еще раньше",
                     callback_data=ChatsCallbackData(action="older", token=token).pack(),
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="🤖 ИИ-ответ",
+                    text="🤖 Сгенерировать ответ",
                     callback_data=ChatsCallbackData(action="ai", token=token).pack(),
                 ),
+                InlineKeyboardButton(
+                    text="✏️ Править вручную",
+                    callback_data=ChatsCallbackData(action="edit_ai", token=token).pack(),
+                ),
+            ],
+            [
                 InlineKeyboardButton(
                     text="🧹 Очистить",
                     callback_data=ChatsCallbackData(action="clear", token=token).pack(),
@@ -113,7 +101,11 @@ def chat_header_keyboard(token: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text="⬅️ К списку чатов",
-                    callback_data=ChatsCallbackData(action="exit", token=token).pack(),
+                    callback_data=ChatsCallbackData(action="list", token=token, page=page).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="⬅️ В меню",
+                    callback_data=MenuCallbackData(section="home", action="open").pack(),
                 )
             ],
         ]
@@ -226,26 +218,38 @@ def chat_draft_keyboard(chat_id: str) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ Отправить",
-                    callback_data=ChatsCallbackData(action="draft_send", chat_id=chat_id).pack(),
+                    text="📨 Отправить в Ozon",
+                    callback_data=ChatsCallbackData(action="send_ai", token=chat_id).pack(),
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🔁 Пересобрать по моему промту",
-                    callback_data=ChatsCallbackData(action="reprompt", chat_id=chat_id).pack(),
+                    text="🔁 Перегенерировать",
+                    callback_data=ChatsCallbackData(action="ai", token=chat_id).pack(),
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="✏️ Изменить вручную",
-                    callback_data=ChatsCallbackData(action="draft_edit", chat_id=chat_id).pack(),
+                    text="🧩 Пересобрать по моему промту",
+                    callback_data=ChatsCallbackData(action="ai_my_prompt", token=chat_id).pack(),
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Назад к чату",
-                    callback_data=ChatsCallbackData(action="open", chat_id=chat_id).pack(),
+                    text="✍️ Мой промт",
+                    callback_data=ChatsCallbackData(action="set_my_prompt", token=chat_id).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✏️ Править вручную",
+                    callback_data=ChatsCallbackData(action="edit_ai", token=chat_id).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data=ChatsCallbackData(action="refresh_thread", token=chat_id).pack(),
                 )
             ],
         ]
