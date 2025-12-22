@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
+from datetime import datetime, timezone
 from typing import Dict, List, Tuple
 
 from aiogram import F, Router
@@ -56,7 +58,12 @@ from botapp.utils.message_gc import (
     send_section_message,
 )
 from botapp.api.ozon_client import OzonAPIError, chat_send_message, download_chat_file
-from botapp.utils.storage import get_chat_ai_state, save_chat_ai_state
+from botapp.utils.storage import (
+    ChatAIState,
+    clear_chat_ai_state,
+    load_chat_ai_state,
+    save_chat_ai_state,
+)
 from botapp.utils import safe_delete_message, send_ephemeral_message
 
 logger = logging.getLogger(__name__)
@@ -139,6 +146,17 @@ async def _send_bubbles(
                 _CHAT_BUBBLES[key].append(sent.message_id)
 
 
+def _load_ai_state(user_id: int, chat_id: str) -> ChatAIState:
+    state = load_chat_ai_state(user_id, chat_id)
+    if state:
+        return state
+    return ChatAIState(chat_id=str(chat_id).strip(), user_id=int(user_id))
+
+
+def _save_ai_state(state: ChatAIState) -> None:
+    save_chat_ai_state(user_id=state.user_id, chat_id=state.chat_id, state=state)
+
+
 class ChatStates(StatesGroup):
     reprompt = State()
     edit_ai = State()
@@ -159,6 +177,62 @@ def _build_ai_context_text(norm_msgs) -> str:
         if txt:
             lines.append(f"{who}{meta}: {txt}")
     return "\n".join(lines[-80:])
+
+
+async def _render_ai_draft_message(
+    *,
+    token: str,
+    draft: str,
+    callback: CallbackQuery | None = None,
+    message: Message | None = None,
+    user_id: int,
+) -> None:
+    safe_draft = html.escape(draft)
+    await send_section_message(
+        SECTION_CHAT_PROMPT,
+        text="<b>ИИ-черновик:</b>\n\n" + safe_draft,
+        reply_markup=chat_ai_draft_keyboard(token=token),
+        callback=callback,
+        message=message,
+        user_id=user_id,
+    )
+
+
+async def _generate_and_render_draft(
+    *,
+    user_id: int,
+    token: str,
+    callback: CallbackQuery | None = None,
+    message: Message | None = None,
+    user_prompt: str | None = None,
+) -> None:
+    ozon_chat_id = resolve_chat_id(user_id, token) or token
+    if not ozon_chat_id:
+        await send_ephemeral_message(callback or message, text="⚠️ Не удалось определить чат.")
+        return
+    ai_state = _load_ai_state(user_id, ozon_chat_id)
+
+    th = await refresh_chat_thread(user_id=user_id, chat_id=ozon_chat_id, force=True, limit=30)
+    norm = normalize_thread_messages(th.raw_messages, customer_only=True, include_seller=True)
+    context_text = _build_ai_context_text(norm) or "История пуста. Ответь вежливо и уточни детали заказа при необходимости."
+
+    try:
+        draft = await generate_chat_reply(messages_text=context_text, user_prompt=user_prompt or ai_state.last_user_prompt)
+    except Exception as exc:
+        await send_ephemeral_message(callback or message, text=f"⚠️ ИИ-ответ не получился: {exc}")
+        return
+
+    draft = (draft or "").strip()
+    if len(draft) < 2:
+        await send_ephemeral_message(callback or message, text="⚠️ ИИ вернул пустой ответ.")
+        return
+
+    ai_state.draft_text = draft
+    ai_state.draft_created_at = datetime.now(timezone.utc)
+    ai_state.last_user_prompt = user_prompt or ai_state.last_user_prompt
+    _save_ai_state(ai_state)
+
+    await _render_ai_draft_message(token=token, draft=draft, callback=callback, message=message, user_id=user_id)
 
 
 async def _clear_other_sections(bot, user_id: int, preserve_message_id: int | None = None) -> None:
@@ -229,9 +303,12 @@ async def _show_chat_thread(user_id: int, token: str, callback: CallbackQuery | 
         await send_ephemeral_message(callback or message, text="⚠️ Не удалось открыть чат (нет chat_id).")
         return
 
+    ai_state = _load_ai_state(user_id, ozon_chat_id)
+    ai_state.last_opened_at = datetime.now(timezone.utc)
+
     await _delete_bubbles_in_chat(bot, tg_chat_id, user_id, ozon_chat_id)
 
-    await send_section_message(
+    header = await send_section_message(
         SECTION_CHAT_HISTORY,
         text=f"<b>Чат</b>\nID: <code>{ozon_chat_id}</code>\n\nНиже — последние сообщения.",
         reply_markup=chat_header_keyboard(token=token, page=last_seen_page(user_id)),
@@ -239,6 +316,9 @@ async def _show_chat_thread(user_id: int, token: str, callback: CallbackQuery | 
         message=message,
         user_id=user_id,
     )
+    if header and header.message_id:
+        ai_state.ui_message_id = header.message_id
+    _save_ai_state(ai_state)
 
     try:
         messages = await get_chat_bubbles_for_ui(
@@ -265,6 +345,15 @@ async def _show_chat_thread(user_id: int, token: str, callback: CallbackQuery | 
         ]
 
     await _send_bubbles(bot, tg_chat_id, user_id, ozon_chat_id, messages)
+
+    if ai_state.draft_text:
+        await _render_ai_draft_message(
+            token=token,
+            draft=ai_state.draft_text,
+            callback=callback,
+            message=message,
+            user_id=user_id,
+        )
 
 
 @router.message(F.text == "/chats")
@@ -346,41 +435,14 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
     if action == "clear":
         ozon_chat_id = resolve_chat_id(user_id, token) or token
         await _delete_bubbles_in_chat(callback.message.bot, callback.message.chat.id, user_id, ozon_chat_id)
-        save_chat_ai_state(chat_id=ozon_chat_id, ai_draft="", user_prompt="", meta={"cleared": True})
+        clear_chat_ai_state(user_id, ozon_chat_id)
+        await delete_section_message(user_id, SECTION_CHAT_PROMPT, callback.message.bot, force=True)
         await send_ephemeral_message(callback, text="🧹 Очищено.")
         await _show_chat_thread(user_id=user_id, token=token, callback=callback, force_refresh=False, show_only_buyer=True)
         return
 
     if action == "ai":
-        ozon_chat_id = resolve_chat_id(user_id, token) or token
-
-        th = await refresh_chat_thread(user_id=user_id, chat_id=ozon_chat_id, force=True, limit=30)
-        norm = normalize_thread_messages(th.raw_messages, customer_only=True, include_seller=True)
-        context_text = _build_ai_context_text(norm) or "История пуста. Ответь вежливо и уточни детали заказа при необходимости."
-
-        st = get_chat_ai_state(ozon_chat_id) or {}
-        user_prompt = (st.get("user_prompt") or "").strip() or None
-
-        try:
-            draft = await generate_chat_reply(messages_text=context_text, user_prompt=user_prompt)
-        except Exception as exc:
-            await send_ephemeral_message(callback, text=f"⚠️ ИИ-ответ не получился: {exc}")
-            return
-
-        draft = (draft or "").strip()
-        if len(draft) < 2:
-            await send_ephemeral_message(callback, text="⚠️ ИИ вернул пустой ответ.")
-            return
-
-        save_chat_ai_state(chat_id=ozon_chat_id, ai_draft=draft, user_prompt=user_prompt or "", meta={"len": len(draft)})
-
-        await send_section_message(
-            SECTION_CHAT_PROMPT,
-            text="<b>ИИ-черновик:</b>\n\n" + draft,
-            reply_markup=chat_ai_draft_keyboard(token=token),
-            callback=callback,
-            user_id=user_id,
-        )
+        await _generate_and_render_draft(user_id=user_id, token=token, callback=callback)
         return
 
     if action == "set_my_prompt":
@@ -402,8 +464,8 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
 
     if action == "ai_my_prompt":
         ozon_chat_id = resolve_chat_id(user_id, token) or token
-        st = get_chat_ai_state(ozon_chat_id) or {}
-        user_prompt = (st.get("user_prompt") or "").strip()
+        ai_state = _load_ai_state(user_id, ozon_chat_id)
+        user_prompt = (ai_state.last_user_prompt or "").strip()
         if not user_prompt:
             # попросим ввести промт и вернемся
             await state.set_state(ChatStates.reprompt)
@@ -421,29 +483,11 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             )
             return
 
-        th = await refresh_chat_thread(user_id=user_id, chat_id=ozon_chat_id, force=True, limit=30)
-        norm = normalize_thread_messages(th.raw_messages, customer_only=True, include_seller=True)
-        context_text = _build_ai_context_text(norm) or "История пуста. Ответь вежливо и уточни детали заказа при необходимости."
-
-        try:
-            draft = await generate_chat_reply(messages_text=context_text, user_prompt=user_prompt)
-        except Exception as exc:
-            await send_ephemeral_message(callback, text=f"⚠️ ИИ-ответ не получился: {exc}")
-            return
-
-        draft = (draft or "").strip()
-        if len(draft) < 2:
-            await send_ephemeral_message(callback, text="⚠️ ИИ вернул пустой ответ.")
-            return
-
-        save_chat_ai_state(chat_id=ozon_chat_id, ai_draft=draft, user_prompt=user_prompt, meta={"len": len(draft), "custom": True})
-
-        await send_section_message(
-            SECTION_CHAT_PROMPT,
-            text="<b>ИИ-черновик:</b>\n\n" + draft,
-            reply_markup=chat_ai_draft_keyboard(token=token),
-            callback=callback,
+        await _generate_and_render_draft(
             user_id=user_id,
+            token=token,
+            callback=callback,
+            user_prompt=user_prompt,
         )
         return
 
@@ -479,8 +523,8 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
 
     if action == "send_ai":
         ozon_chat_id = resolve_chat_id(user_id, token) or token
-        st = get_chat_ai_state(ozon_chat_id) or {}
-        draft = (st.get("ai_draft") or "").strip()
+        ai_state = _load_ai_state(user_id, ozon_chat_id)
+        draft = (ai_state.draft_text or "").strip()
         if len(draft) < 2:
             await send_ephemeral_message(callback, text="⚠️ Нет ИИ-черновика. Сначала нажми «ИИ-ответ».")
             return
@@ -521,6 +565,8 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         except Exception:
             logger.exception("Failed to persist chat reply to memory")
 
+        clear_chat_ai_state(user_id, ozon_chat_id)
+        await delete_section_message(user_id, SECTION_CHAT_PROMPT, callback.message.bot, force=True)
         await send_ephemeral_message(callback, text="✅ Сообщение отправлено в чат Ozon.")
         await _show_chat_thread(user_id=user_id, token=token, callback=callback, force_refresh=True, show_only_buyer=True)
         return
@@ -541,7 +587,6 @@ async def cancel_chat_fsm(message: Message, state: FSMContext) -> None:
 async def chat_reprompt_text(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
     payload = await state.get_data()
-    await state.clear()
 
     token = (payload.get("token") or "").strip()
     ozon_chat_id = resolve_chat_id(user_id, token) or token
@@ -551,16 +596,21 @@ async def chat_reprompt_text(message: Message, state: FSMContext) -> None:
         await send_ephemeral_message(message, text="⚠️ Слишком коротко.", ttl=3)
         return
 
-    st = get_chat_ai_state(ozon_chat_id) or {}
-    save_chat_ai_state(chat_id=ozon_chat_id, ai_draft=st.get("ai_draft") or "", user_prompt=user_prompt, meta={"set": True})
-    await send_ephemeral_message(message, text="✅ Промпт сохранён. Нажми «ИИ-ответ» в шапке чата.", ttl=4)
+    await _generate_and_render_draft(
+        user_id=user_id,
+        token=token,
+        message=message,
+        user_prompt=user_prompt,
+    )
+
+    await safe_delete_message(message.bot, message.chat.id, message.message_id)
+    await state.clear()
 
 
 @router.message(ChatStates.edit_ai)
 async def chat_edit_ai_text(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
     payload = await state.get_data()
-    await state.clear()
 
     token = (payload.get("token") or "").strip()
     ozon_chat_id = resolve_chat_id(user_id, token) or token
@@ -570,13 +620,17 @@ async def chat_edit_ai_text(message: Message, state: FSMContext) -> None:
         await send_ephemeral_message(message, text="⚠️ Слишком коротко.", ttl=3)
         return
 
-    st = get_chat_ai_state(ozon_chat_id) or {}
-    save_chat_ai_state(chat_id=ozon_chat_id, ai_draft=txt, user_prompt=st.get("user_prompt") or "", meta={"edited": True})
+    ai_state = _load_ai_state(user_id, ozon_chat_id)
+    ai_state.draft_text = txt
+    ai_state.draft_created_at = datetime.now(timezone.utc)
+    ai_state.last_user_prompt = ai_state.last_user_prompt or ""
+    _save_ai_state(ai_state)
 
-    await send_section_message(
-        SECTION_CHAT_PROMPT,
-        text="<b>ИИ-черновик обновлён:</b>\n\n" + txt,
-        reply_markup=chat_ai_draft_keyboard(token=token),
+    await _render_ai_draft_message(
+        token=token,
+        draft=txt,
         message=message,
         user_id=user_id,
     )
+    await safe_delete_message(message.bot, message.chat.id, message.message_id)
+    await state.clear()

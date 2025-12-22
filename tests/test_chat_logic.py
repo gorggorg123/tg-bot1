@@ -1,5 +1,9 @@
 import asyncio
+import importlib
+import os
+import tempfile
 import unittest
+from datetime import datetime, timezone
 
 from botapp.ozon_client import ChatListResponse
 from botapp.sections.chats.logic import (
@@ -8,6 +12,7 @@ from botapp.sections.chats.logic import (
     normalize_thread_messages,
     resolve_product_title_for_message,
 )
+from botapp.utils import storage
 from botapp.sections.chats.logic import _bubble_text  # type: ignore
 
 
@@ -88,6 +93,38 @@ class MediaExtractionTest(unittest.TestCase):
         self.assertEqual(clean, "Фото тут и ссылка")
         self.assertIn("pic1.jpg", "".join(urls))
         self.assertIn("pic2.jpg", "".join(urls))
+
+
+class ChatAIStateStorageTest(unittest.TestCase):
+    def test_chat_ai_state_persistence(self):
+        prev = os.environ.get("STORAGE_DIR")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["STORAGE_DIR"] = tmp
+            importlib.reload(storage)
+
+            state = storage.ChatAIState(
+                chat_id="cid-1",
+                user_id=42,
+                draft_text="Привет",
+                draft_created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                last_user_prompt="будь дружелюбным",
+                ui_message_id=777,
+                last_opened_at=datetime(2024, 1, 2, tzinfo=timezone.utc),
+            )
+            storage.save_chat_ai_state(user_id=state.user_id, chat_id=state.chat_id, state=state)
+
+            loaded = storage.load_chat_ai_state(42, "cid-1")
+            self.assertIsNotNone(loaded)
+            assert loaded  # mypy/typing
+            self.assertEqual(loaded.draft_text, "Привет")
+            self.assertEqual(loaded.last_user_prompt, "будь дружелюбным")
+            self.assertEqual(loaded.ui_message_id, 777)
+
+            storage.clear_chat_ai_state(42, "cid-1")
+            self.assertIsNone(storage.load_chat_ai_state(42, "cid-1"))
+        if prev is not None:
+            os.environ["STORAGE_DIR"] = prev
+        importlib.reload(storage)
 
 
 if __name__ == "__main__":

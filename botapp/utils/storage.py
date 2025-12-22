@@ -5,7 +5,7 @@ import json
 import os
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
@@ -59,6 +59,17 @@ def _json_default(obj: Any) -> Any:
     if isinstance(obj, datetime):
         return obj.isoformat()
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+@dataclass
+class ChatAIState:
+    chat_id: str
+    user_id: int
+    draft_text: str | None = None
+    draft_created_at: datetime | None = None
+    last_user_prompt: str | None = None
+    ui_message_id: int | None = None
+    last_opened_at: datetime | None = None
 
 
 @dataclass
@@ -189,31 +200,78 @@ def upsert_question_answer(
         _write_json_atomic(QUESTIONS_FILE, _STORE.questions)
 
 
-def get_chat_ai_state(chat_id: str) -> dict | None:
+def _parse_dt(val: Any) -> datetime | None:
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, str):
+        try:
+            return datetime.fromisoformat(val)
+        except Exception:
+            return None
+    return None
+
+
+def load_chat_ai_state(user_id: int, chat_id: str) -> ChatAIState | None:
     _ensure_loaded()
     cid = str(chat_id).strip()
     if not cid:
         return None
+
+    key = f"{int(user_id)}:{cid}"
+    fallback_key = cid
+
     with _LOCK:
-        v = _STORE.chats.get(cid)
-        return dict(v) if isinstance(v, dict) else None
+        data = _STORE.chats.get(key) or _STORE.chats.get(fallback_key)
+        if not isinstance(data, dict):
+            return None
+
+    draft = data.get("draft_text") or data.get("ai_draft") or ""
+    prompt = data.get("last_user_prompt") or data.get("user_prompt") or ""
+
+    return ChatAIState(
+        chat_id=cid,
+        user_id=int(user_id),
+        draft_text=draft or None,
+        draft_created_at=_parse_dt(data.get("draft_created_at")),
+        last_user_prompt=prompt or None,
+        ui_message_id=data.get("ui_message_id"),
+        last_opened_at=_parse_dt(data.get("last_opened_at")),
+    )
 
 
-def save_chat_ai_state(*, chat_id: str, ai_draft: str, user_prompt: str, meta: dict | None = None) -> None:
+def save_chat_ai_state(*, user_id: int, chat_id: str, state: ChatAIState) -> None:
     _ensure_loaded()
     cid = str(chat_id).strip()
     if not cid:
         return
 
+    key = f"{int(user_id)}:{cid}"
     payload = {
         "chat_id": cid,
-        "ai_draft": (ai_draft or ""),
-        "user_prompt": (user_prompt or ""),
-        "meta": meta or {},
+        "user_id": int(user_id),
+        "draft_text": state.draft_text or "",
+        "draft_created_at": state.draft_created_at.isoformat() if state.draft_created_at else None,
+        "last_user_prompt": state.last_user_prompt or "",
+        "ui_message_id": state.ui_message_id,
+        "last_opened_at": state.last_opened_at.isoformat() if state.last_opened_at else None,
     }
 
     with _LOCK:
-        _STORE.chats[cid] = payload
+        _STORE.chats[key] = payload
+        _write_json_atomic(CHATS_FILE, _STORE.chats)
+
+
+def clear_chat_ai_state(user_id: int, chat_id: str) -> None:
+    _ensure_loaded()
+    cid = str(chat_id).strip()
+    if not cid:
+        return
+    key = f"{int(user_id)}:{cid}"
+    with _LOCK:
+        _STORE.chats.pop(key, None)
+        _STORE.chats.pop(cid, None)
         _write_json_atomic(CHATS_FILE, _STORE.chats)
 
 
@@ -222,7 +280,9 @@ __all__ = [
     "upsert_review_reply",
     "get_question_answer",
     "upsert_question_answer",
-    "get_chat_ai_state",
+    "ChatAIState",
+    "load_chat_ai_state",
     "save_chat_ai_state",
+    "clear_chat_ai_state",
     "flush_storage",
 ]
