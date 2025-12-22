@@ -1240,7 +1240,13 @@ def build_reviews_table(
         review_id = card.id or ""
         token = encode_review_id(user_id, review_id)
         if review_id:
-            label = f"{i:>2}. {badge} {created} | {rating_txt} | {prod}"
+            meta = f"{i:>2}. {badge} {created} | {rating_txt}"
+            prod_trimmed = prod[:46] + ("…" if len(prod) > 46 else "")
+            label = f"{meta}\n{prod_trimmed}"
+            if len(label) > 64:
+                overflow = len(label) - 64
+                prod_trimmed = prod_trimmed[: max(0, len(prod_trimmed) - overflow - 1)] + "…"
+                label = f"{meta}\n{prod_trimmed}"
             items.append((label, token or review_id, i - 1))
 
     text = header or " "
