@@ -708,9 +708,13 @@ def build_questions_table(
 
         qid = safe_strip(getattr(q, "id", None))
         if qid:
-            parts = [f"{i}) {badge}", date_part]
-            parts.append(product)
-            label = " · ".join(parts)
+            meta = f"{i:>2}) {badge} {date_part}"
+            prod_trimmed = product[:46] + ("…" if len(product) > 46 else "")
+            label = f"{meta}\n{prod_trimmed}"
+            if len(label) > 64:
+                overflow = len(label) - 64
+                prod_trimmed = prod_trimmed[: max(0, len(prod_trimmed) - overflow - 1)] + "…"
+                label = f"{meta}\n{prod_trimmed}"
             items.append((label, qid, i - 1))
 
     text = header or " "

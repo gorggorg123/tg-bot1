@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol, Tuple
 
 
 def is_cache_fresh(loaded_at: datetime | None, ttl_seconds: int) -> bool:
     if not loaded_at:
         return False
-    return (datetime.utcnow() - loaded_at) < timedelta(seconds=int(ttl_seconds))
+    now = datetime.now(timezone.utc)
+    if loaded_at.tzinfo is None:
+        loaded_at = loaded_at.replace(tzinfo=timezone.utc)
+    return (now - loaded_at) < timedelta(seconds=int(ttl_seconds))
 
 
 @dataclass

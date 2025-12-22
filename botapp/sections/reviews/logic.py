@@ -5,11 +5,14 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from botapp.api.ai_client import AIClientError, generate_review_reply
 from botapp.api.ozon_client import OzonClient, _product_name_cache, get_client
+from botapp.catalog_cache import (
+    get_sku_title_from_cache as _get_sku_title_from_cache,
+    save_sku_title_to_cache as _save_sku_title_to_cache,
+)
 from botapp.sections._base import is_cache_fresh
 from botapp.ui import TokenStore, build_list_header, slice_page
 from botapp.utils.text_utils import safe_strip, safe_str
@@ -25,15 +28,8 @@ TELEGRAM_SOFT_LIMIT = 4000
 REVIEWS_PAGE_SIZE = 10
 CACHE_TTL_SECONDS = 120
 SESSION_TTL = timedelta(seconds=CACHE_TTL_SECONDS)
-SKU_TITLE_CACHE_TTL = timedelta(hours=12)
-SKU_TITLE_CACHE_PATH = Path(__file__).resolve().parents[3] / "data" / "sku_title_cache.json"
-SKU_TITLE_CACHE_KEY = "titles"
-
 _sessions: dict[int, "ReviewSession"] = {}
 _review_tokens = TokenStore(ttl_seconds=CACHE_TTL_SECONDS)
-_sku_title_cache: dict[str, str] = {}
-_sku_title_cache_loaded = False
-_sku_title_cache_expire_at: datetime | None = None
 
 _normalize_debug_logged = 0
 
@@ -229,82 +225,6 @@ def _msk_range_last_days(days: int = DEFAULT_RECENT_DAYS) -> Tuple[datetime, dat
     pretty = f"{start_msk:%d.%m.%Y} 00:00 — {end_msk:%d.%m.%Y %H:%M} (МСК)"
     return start_msk, end_msk, pretty
 
-
-def _load_sku_title_cache() -> None:
-    """Загрузить persistent-кэш sku->title с диска (если ещё не загружен)."""
-
-    global _sku_title_cache_loaded, _sku_title_cache, _sku_title_cache_expire_at
-
-    if _sku_title_cache_loaded:
-        if _sku_title_cache_expire_at and datetime.utcnow() > _sku_title_cache_expire_at:
-            _sku_title_cache = {}
-            _sku_title_cache_expire_at = None
-        return
-
-    _sku_title_cache_loaded = True
-
-    if not SKU_TITLE_CACHE_PATH.exists():
-        return
-
-    try:
-        with SKU_TITLE_CACHE_PATH.open("r", encoding="utf-8") as f:
-            payload = json.load(f)
-    except Exception as exc:  # pragma: no cover - best effort
-        logger.debug("Failed to load SKU title cache: %s", exc)
-        return
-
-    expires_at_raw = payload.get("expires_at")
-    cache_data = payload.get(SKU_TITLE_CACHE_KEY) if isinstance(payload, dict) else None
-    try:
-        if expires_at_raw:
-            _sku_title_cache_expire_at = datetime.fromisoformat(str(expires_at_raw))
-    except Exception:
-        _sku_title_cache_expire_at = None
-
-    if _sku_title_cache_expire_at and datetime.utcnow() > _sku_title_cache_expire_at:
-        return
-
-    if not isinstance(cache_data, dict):
-        return
-
-    try:
-        _sku_title_cache = {str(k): safe_strip(v) for k, v in cache_data.items() if safe_strip(v)}
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Invalid SKU title cache contents: %s", exc)
-        _sku_title_cache = {}
-
-
-def _persist_sku_title_cache() -> None:
-    """Сохранить persistent-кэш sku->title на диск."""
-
-    global _sku_title_cache_expire_at
-
-    _sku_title_cache_expire_at = datetime.utcnow() + SKU_TITLE_CACHE_TTL
-    try:
-        SKU_TITLE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with SKU_TITLE_CACHE_PATH.open("w", encoding="utf-8") as f:
-            json.dump(
-                {"expires_at": _sku_title_cache_expire_at.isoformat(), SKU_TITLE_CACHE_KEY: _sku_title_cache},
-                f,
-                ensure_ascii=False,
-            )
-    except Exception as exc:  # pragma: no cover - best effort
-        logger.debug("Failed to persist SKU title cache: %s", exc)
-
-
-def _get_sku_title_from_cache(key: str | None) -> str | None:
-    if not key:
-        return None
-    _load_sku_title_cache()
-    return _sku_title_cache.get(str(key))
-
-
-def _save_sku_title_to_cache(key: str | int | None, title: str | None) -> None:
-    if not key or not safe_strip(title):
-        return
-    _load_sku_title_cache()
-    _sku_title_cache[str(key)] = safe_strip(title)  # type: ignore[index]
-    _persist_sku_title_cache()
 
 
 def _has_answer_payload(review: ReviewCard) -> bool:
@@ -1320,7 +1240,13 @@ def build_reviews_table(
         review_id = card.id or ""
         token = encode_review_id(user_id, review_id)
         if review_id:
-            label = f"{i:>2}. {badge} {created} | {rating_txt} | {prod}"
+            meta = f"{i:>2}. {badge} {created} | {rating_txt}"
+            prod_trimmed = prod[:46] + ("…" if len(prod) > 46 else "")
+            label = f"{meta}\n{prod_trimmed}"
+            if len(label) > 64:
+                overflow = len(label) - 64
+                prod_trimmed = prod_trimmed[: max(0, len(prod_trimmed) - overflow - 1)] + "…"
+                label = f"{meta}\n{prod_trimmed}"
             items.append((label, token or review_id, i - 1))
 
     text = header or " "
