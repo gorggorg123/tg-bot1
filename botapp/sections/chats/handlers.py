@@ -8,7 +8,7 @@ from typing import Dict, List, Tuple
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from botapp.ai_memory import ApprovedAnswer, get_approved_memory_store
 from botapp.api.ai_client import generate_chat_reply
@@ -20,9 +20,13 @@ from botapp.sections.chats.logic import (
     load_older_messages,
     last_buyer_message,
     last_buyer_message_text,
+    last_seen_page,
+    NormalizedMessage,
     normalize_thread_messages,
     refresh_chat_thread,
     resolve_chat_id,
+    _bubble_text,
+    _fmt_time,
 )
 from botapp.keyboards import MenuCallbackData, back_home_keyboard
 from botapp.sections.chats.keyboards import (
@@ -51,7 +55,7 @@ from botapp.utils.message_gc import (
     delete_section_message,
     send_section_message,
 )
-from botapp.api.ozon_client import OzonAPIError, chat_send_message
+from botapp.api.ozon_client import OzonAPIError, chat_send_message, download_chat_file
 from botapp.utils.storage import get_chat_ai_state, save_chat_ai_state
 from botapp.utils import safe_delete_message, send_ephemeral_message
 
@@ -96,12 +100,43 @@ async def _delete_bubbles_in_chat(bot, chat_id: int, user_id: int, ozon_chat_id:
         await safe_delete_message(bot, chat_id, mid)
 
 
-async def _send_bubbles(bot, chat_id: int, user_id: int, ozon_chat_id: str, bubbles: List[str]) -> None:
+async def _send_bubbles(
+    bot,
+    chat_id: int,
+    user_id: int,
+    ozon_chat_id: str,
+    messages: List[NormalizedMessage],
+) -> None:
     key = _bkey(user_id, ozon_chat_id)
     _CHAT_BUBBLES[key] = []
-    for b in bubbles:
-        msg = await bot.send_message(chat_id, b, parse_mode="HTML")
-        _CHAT_BUBBLES[key].append(msg.message_id)
+
+    for msg in messages:
+        bubble_text = _bubble_text(msg)
+        if bubble_text.strip():
+            sent = await bot.send_message(chat_id, bubble_text, parse_mode="HTML")
+            _CHAT_BUBBLES[key].append(sent.message_id)
+
+        if not msg.media_urls:
+            continue
+
+        role_label = "👤 Покупатель" if msg.role == "buyer" else ("🏪 Мы" if msg.role == "seller" else "Сообщение")
+        tm = _fmt_time(msg.created_at)
+        caption = f"{role_label}: фото"
+        if tm:
+            caption += f"\n<i>{tm}</i>"
+
+        for url in msg.media_urls:
+            try:
+                content, filename, _content_type = await download_chat_file(url)
+                fname = filename or url.rsplit("/", 1)[-1] or "photo.jpg"
+                photo = BufferedInputFile(content, filename=fname)
+                sent_photo = await bot.send_photo(chat_id, photo, caption=caption, parse_mode="HTML")
+                _CHAT_BUBBLES[key].append(sent_photo.message_id)
+            except Exception:
+                logger.exception("Failed to send chat photo from %s", url)
+                fallback = f"{role_label}: {url}"
+                sent = await bot.send_message(chat_id, fallback)
+                _CHAT_BUBBLES[key].append(sent.message_id)
 
 
 class ChatStates(StatesGroup):
@@ -199,14 +234,14 @@ async def _show_chat_thread(user_id: int, token: str, callback: CallbackQuery | 
     await send_section_message(
         SECTION_CHAT_HISTORY,
         text=f"<b>Чат</b>\nID: <code>{ozon_chat_id}</code>\n\nНиже — последние сообщения.",
-        reply_markup=chat_header_keyboard(token=token),
+        reply_markup=chat_header_keyboard(token=token, page=last_seen_page(user_id)),
         callback=callback,
         message=message,
         user_id=user_id,
     )
 
     try:
-        bubbles = await get_chat_bubbles_for_ui(
+        messages = await get_chat_bubbles_for_ui(
             user_id=user_id,
             chat_id=ozon_chat_id,
             force_refresh=force_refresh,
@@ -224,10 +259,12 @@ async def _show_chat_thread(user_id: int, token: str, callback: CallbackQuery | 
         )
         return
 
-    if not bubbles:
-        bubbles = ["<b>Пока нет текстовых сообщений.</b>"]
+    if not messages:
+        messages = [
+            NormalizedMessage(role="seller", text="Пока нет текстовых сообщений.", created_at=None)
+        ]
 
-    await _send_bubbles(bot, tg_chat_id, user_id, ozon_chat_id, bubbles)
+    await _send_bubbles(bot, tg_chat_id, user_id, ozon_chat_id, messages)
 
 
 @router.message(F.text == "/chats")
@@ -270,6 +307,16 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         await _show_chats_list(user_id=user_id, page=page, callback=callback, force_refresh=(action == "refresh"))
         return
 
+    if action == "list":
+        ozon_chat_id = resolve_chat_id(user_id, token) or token
+        if ozon_chat_id:
+            await _delete_bubbles_in_chat(callback.message.bot, callback.message.chat.id, user_id, ozon_chat_id)
+        await delete_section_message(user_id, SECTION_CHAT_HISTORY, callback.message.bot, force=True)
+        await delete_section_message(user_id, SECTION_CHAT_PROMPT, callback.message.bot, force=True)
+        target_page = page if page is not None else last_seen_page(user_id)
+        await _show_chats_list(user_id=user_id, page=target_page, callback=callback, force_refresh=False)
+        return
+
     if action == "open":
         await _show_chat_thread(user_id=user_id, token=token, callback=callback, force_refresh=True, show_only_buyer=True)
         return
@@ -292,7 +339,8 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         await _delete_bubbles_in_chat(callback.message.bot, callback.message.chat.id, user_id, ozon_chat_id)
         await delete_section_message(user_id, SECTION_CHAT_HISTORY, callback.message.bot, force=True)
         await delete_section_message(user_id, SECTION_CHAT_PROMPT, callback.message.bot, force=True)
-        await _show_chats_list(user_id=user_id, page=0, callback=callback, force_refresh=False)
+        target_page = page if page is not None else last_seen_page(user_id)
+        await _show_chats_list(user_id=user_id, page=target_page, callback=callback, force_refresh=False)
         return
 
     if action == "clear":
@@ -325,6 +373,70 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             return
 
         save_chat_ai_state(chat_id=ozon_chat_id, ai_draft=draft, user_prompt=user_prompt or "", meta={"len": len(draft)})
+
+        await send_section_message(
+            SECTION_CHAT_PROMPT,
+            text="<b>ИИ-черновик:</b>\n\n" + draft,
+            reply_markup=chat_ai_draft_keyboard(token=token),
+            callback=callback,
+            user_id=user_id,
+        )
+        return
+
+    if action == "set_my_prompt":
+        await state.set_state(ChatStates.reprompt)
+        await state.update_data(token=token)
+
+        await send_section_message(
+            SECTION_CHAT_PROMPT,
+            text=(
+                "<b>Свой промт для ИИ</b>\n\n"
+                "Отправь текст с пожеланиями к стилю/ответу.\n"
+                "Отмена: /cancel"
+            ),
+            reply_markup=None,
+            callback=callback,
+            user_id=user_id,
+        )
+        return
+
+    if action == "ai_my_prompt":
+        ozon_chat_id = resolve_chat_id(user_id, token) or token
+        st = get_chat_ai_state(ozon_chat_id) or {}
+        user_prompt = (st.get("user_prompt") or "").strip()
+        if not user_prompt:
+            # попросим ввести промт и вернемся
+            await state.set_state(ChatStates.reprompt)
+            await state.update_data(token=token)
+            await send_section_message(
+                SECTION_CHAT_PROMPT,
+                text=(
+                    "<b>Свой промт для ИИ</b>\n\n"
+                    "Отправь текст с пожеланиями к стилю/ответу.\n"
+                    "Отмена: /cancel"
+                ),
+                reply_markup=None,
+                callback=callback,
+                user_id=user_id,
+            )
+            return
+
+        th = await refresh_chat_thread(user_id=user_id, chat_id=ozon_chat_id, force=True, limit=30)
+        norm = normalize_thread_messages(th.raw_messages, customer_only=True, include_seller=True)
+        context_text = _build_ai_context_text(norm) or "История пуста. Ответь вежливо и уточни детали заказа при необходимости."
+
+        try:
+            draft = await generate_chat_reply(messages_text=context_text, user_prompt=user_prompt)
+        except Exception as exc:
+            await send_ephemeral_message(callback, text=f"⚠️ ИИ-ответ не получился: {exc}")
+            return
+
+        draft = (draft or "").strip()
+        if len(draft) < 2:
+            await send_ephemeral_message(callback, text="⚠️ ИИ вернул пустой ответ.")
+            return
+
+        save_chat_ai_state(chat_id=ozon_chat_id, ai_draft=draft, user_prompt=user_prompt, meta={"len": len(draft), "custom": True})
 
         await send_section_message(
             SECTION_CHAT_PROMPT,

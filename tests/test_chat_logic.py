@@ -1,7 +1,14 @@
+import asyncio
 import unittest
 
 from botapp.ozon_client import ChatListResponse
-from botapp.sections.chats.logic import normalize_thread_messages
+from botapp.sections.chats.logic import (
+    NormalizedMessage,
+    extract_media_urls_from_text,
+    normalize_thread_messages,
+    resolve_product_title_for_message,
+)
+from botapp.sections.chats.logic import _bubble_text  # type: ignore
 
 
 class ChatListNormalizationTest(unittest.TestCase):
@@ -59,6 +66,28 @@ class ChatHistoryFilterTest(unittest.TestCase):
         texts = [m.text for m in normalized]
 
         self.assertEqual(texts, ["first", "second", "later"])
+
+
+class ChatProductTitleTest(unittest.TestCase):
+    def test_bubble_contains_product_title(self):
+        msg = NormalizedMessage(role="buyer", text="hi", product_title="Очень хороший товар 🔥")
+        bubble = _bubble_text(msg)
+        self.assertIn("Товар:", bubble)
+        self.assertIn("Очень хороший товар", bubble)
+
+    def test_resolve_uses_chat_title_fallback(self):
+        msg = NormalizedMessage(role="buyer", text="hi")
+        title = asyncio.run(resolve_product_title_for_message(1, msg, chat_title="Чудо-чайник"))
+        self.assertEqual(title, "Чудо-чайник")
+
+
+class MediaExtractionTest(unittest.TestCase):
+    def test_media_urls_are_removed_from_text(self):
+        text = "Фото тут ![](https://api-seller.ozon.ru/v2/chat/file/pic1.jpg) и ссылка https://api-seller.ozon.ru/v2/chat/file/pic2.jpg"
+        clean, urls = extract_media_urls_from_text(text)
+        self.assertEqual(clean, "Фото тут и ссылка")
+        self.assertIn("pic1.jpg", "".join(urls))
+        self.assertIn("pic2.jpg", "".join(urls))
 
 
 if __name__ == "__main__":

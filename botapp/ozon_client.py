@@ -299,6 +299,10 @@ class OzonAPIError(RuntimeError):
     """Ошибка вызова Ozon API."""
 
 
+class RateLimitExceeded(OzonAPIError):
+    """429 Too Many Requests с исчерпанными ретраями."""
+
+
 class OzonProductNotFound(OzonAPIError):
     """Товар не найден (404)."""
 
@@ -343,72 +347,20 @@ class OzonClient:
     ) -> tuple[int, Dict[str, Any] | None]:
         """Отправить POST-запрос и вернуть статус + JSON без raise_for_status."""
 
-        suffix = path if path.startswith("/") else f"/{path}"
-        url = f"{BASE_URL}{suffix}"
-        max_attempts = 4
-        backoffs = [0.5, 1.0, 2.0, 4.0]
-        r: httpx.Response | None = None
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                r = await self._http_client.post(url, json=json)
-            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as exc:
-                if attempt >= max_attempts:
-                    raise
-
-                delay = (backoffs[min(attempt - 1, len(backoffs) - 1)] + random.uniform(0, 0.25))
-                logger.warning(
-                    "Ozon %s retry %s/%s after %.2fs due to %s",
-                    suffix,
-                    attempt,
-                    max_attempts,
-                    delay,
-                    exc,
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            status = r.status_code
-            retryable_status = status == 429 or status in {500, 502, 503, 504}
-            if retryable_status and attempt < max_attempts:
-                retry_after_header = r.headers.get("Retry-After") if status == 429 else None
-                retry_after: float | None = None
-                if retry_after_header:
-                    try:
-                        retry_after = float(retry_after_header)
-                    except Exception:
-                        retry_after = None
-
-                delay = retry_after if retry_after is not None else backoffs[min(attempt - 1, len(backoffs) - 1)]
-                delay += random.uniform(0, 0.25)
-                logger.warning(
-                    "Ozon %s retry %s/%s on HTTP %s in %.2fs",
-                    suffix,
-                    attempt,
-                    max_attempts,
-                    status,
-                    delay,
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            break
-
-        if r is None:
-            raise RuntimeError("HTTP client did not return a response")
-
-        status = r.status_code
-        request_id = r.headers.get("X-Request-Id") or r.headers.get("X-Ozon-Request-Id")
+        response = await self._post_with_retries(path, json)
+        status = response.status_code
+        request_id = response.headers.get("X-Request-Id") or response.headers.get("X-Ozon-Request-Id")
         try:
-            data = r.json()
+            data = response.json()
         except Exception:
             try:
-                raw = await r.aread()
+                raw = await response.aread()
             except Exception:
                 raw = b""
             logger.error(
-                "Ozon %s -> HTTP %s (request_id=%s) JSON decode failed: %s",
-                url,
+                "Ozon %s%s -> HTTP %s (request_id=%s) JSON decode failed: %s",
+                BASE_URL,
+                path if path.startswith("/") else f"/{path}",
                 status,
                 request_id or "-",
                 raw[:500],
@@ -416,30 +368,131 @@ class OzonClient:
             return status, {"raw": raw.decode(errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)}
 
         if status >= 400:
-            logger.warning("Ozon %s -> HTTP %s (request_id=%s): %s", url, status, request_id or "-", data)
+            logger.warning(
+                "Ozon %s%s -> HTTP %s (request_id=%s): %s",
+                BASE_URL,
+                path if path.startswith("/") else f"/{path}",
+                status,
+                request_id or "-",
+                data,
+            )
 
         return status, data if isinstance(data, dict) else None
 
     async def post(self, path: str, json: Dict[str, Any]) -> Dict[str, Any]:
-        # Формируем абсолютный URL вручную, чтобы в логах всегда была явная точка входа
-        # (на Render фиксировали 404 на https://api-seller.ozon.ru/ без пути).
+        response = await self._post_with_retries(path, json)
+        request_id = response.headers.get("X-Request-Id") or response.headers.get("X-Ozon-Request-Id")
+        status = response.status_code
+        if status == 429:
+            raise RateLimitExceeded(
+                f"Ozon rate limit exceeded on {path}: HTTP 429 (request_id={request_id or '-'})."
+            )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            logger.warning(
+                "Ozon %s%s -> HTTP %s (request_id=%s)",
+                BASE_URL,
+                path if path.startswith("/") else f"/{path}",
+                status,
+                request_id or "-",
+            )
+            raise
+
+        try:
+            return response.json()
+        except Exception:
+            text = await response.aread()
+            logger.error(
+                "Ozon %s%s -> JSON decode failed (request_id=%s): %r",
+                BASE_URL,
+                path if path.startswith("/") else f"/{path}",
+                request_id or "-",
+                text[:500],
+            )
+            raise
+
+    async def _post_with_retries(self, path: str, json: Dict[str, Any]) -> httpx.Response:
         suffix = path if path.startswith("/") else f"/{path}"
         url = f"{BASE_URL}{suffix}"
-        r = await self._http_client.post(url, json=json)
+        max_attempts_429 = 5
+        max_attempts_other = 3
+        base_backoffs = [0.5, 1.0, 2.0, 4.0, 8.0]
+        attempts = 0
+        attempts_429 = 0
+        attempts_other = 0
 
-        # Сначала проверяем статус, чтобы не пытаться парсить HTML/текст 404 как JSON
-        try:
-            r.raise_for_status()
-        except httpx.HTTPStatusError:
-            logger.warning("Ozon %s -> HTTP %s", url, r.status_code)
-            raise
+        while True:
+            attempts += 1
+            try:
+                response = await self._http_client.post(url, json=json)
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as exc:
+                attempts_other += 1
+                if attempts_other >= max_attempts_other:
+                    raise
+                delay = base_backoffs[min(attempts_other - 1, len(base_backoffs) - 1)] + random.uniform(0, 0.25)
+                logger.warning(
+                    "Ozon %s retry %s/%s after %.2fs due to %s",
+                    suffix,
+                    attempts,
+                    max_attempts_other,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+                continue
 
-        try:
-            return r.json()
-        except Exception:
-            text = await r.aread()
-            logger.error("Ozon %s -> JSON decode failed: %r", url, text[:500])
-            raise
+            status = response.status_code
+            request_id = response.headers.get("X-Request-Id") or response.headers.get("X-Ozon-Request-Id")
+
+            if status == 429:
+                attempts_429 += 1
+                retry_after_raw = response.headers.get("Retry-After")
+                retry_after: float | None = None
+                if retry_after_raw:
+                    try:
+                        retry_after = float(retry_after_raw)
+                    except Exception:
+                        retry_after = None
+                if retry_after is not None:
+                    retry_after = min(30.0, max(1.0, retry_after))
+                delay = retry_after if retry_after is not None else base_backoffs[min(attempts_429 - 1, len(base_backoffs) - 1)]
+                delay += random.uniform(0, 0.25)
+                if attempts_429 >= max_attempts_429:
+                    logger.error(
+                        "Ozon %s -> HTTP 429 (request_id=%s) exceeded retries", suffix, request_id or "-"
+                    )
+                    raise RateLimitExceeded(
+                        f"Ozon rate limit exceeded on {path}: HTTP 429 (request_id={request_id or '-'})."
+                    )
+                logger.warning(
+                    "Ozon %s retry %s/%s on HTTP 429 (request_id=%s) in %.2fs",
+                    suffix,
+                    attempts_429,
+                    max_attempts_429,
+                    request_id or "-",
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if status in {500, 502, 503, 504}:
+                attempts_other += 1
+                if attempts_other < max_attempts_other:
+                    delay = base_backoffs[min(attempts_other - 1, len(base_backoffs) - 1)] + random.uniform(0, 0.25)
+                    logger.warning(
+                        "Ozon %s retry %s/%s on HTTP %s (request_id=%s) in %.2fs",
+                        suffix,
+                        attempts_other,
+                        max_attempts_other,
+                        status,
+                        request_id or "-",
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+            return response
 
     async def get(self, path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
         suffix = path if path.startswith("/") else f"/{path}"
@@ -1818,11 +1871,11 @@ async def download_with_auth(url: str) -> bytes:
     return await response.aread()
 
 
-async def download_chat_file(url: str) -> tuple[bytes, str]:
-    """Скачать файл чата с учётом авторизации и вернуть содержимое и мета."""
+async def download_chat_file(url: str) -> tuple[bytes, str, str | None]:
+    """Скачать файл чата с учётом авторизации и вернуть содержимое + имя."""
 
     client = get_client()
-    response = await client._http_client.get(url)
+    response = await client._http_client.get(url, headers={"Accept": "*/*"})
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:  # pragma: no cover - сеть/HTTP
@@ -1830,10 +1883,19 @@ async def download_chat_file(url: str) -> tuple[bytes, str]:
         raise OzonAPIError(f"Не удалось скачать вложение: {exc}") from exc
 
     content = await response.aread()
-    meta = response.headers.get("Content-Type") or ""
-    if not meta:
-        meta = response.headers.get("Content-Disposition") or ""
-    return content, meta
+    content_type = response.headers.get("Content-Type")
+    disposition = response.headers.get("Content-Disposition") or ""
+    filename = ""
+    if "filename=" in disposition:
+        try:
+            filename = disposition.split("filename=")[-1].strip("\"')")
+        except Exception:
+            filename = ""
+
+    if not filename:
+        filename = url.rsplit("/", 1)[-1]
+
+    return content, filename, content_type
 
 
 async def chat_read(chat_id: str, messages: Sequence[dict] | None = None) -> None:

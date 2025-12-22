@@ -69,7 +69,7 @@ def chats_list_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def chat_header_keyboard(token: str) -> InlineKeyboardMarkup:
+def chat_header_keyboard(token: str, page: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -101,7 +101,11 @@ def chat_header_keyboard(token: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text="⬅️ К списку чатов",
-                    callback_data=ChatsCallbackData(action="exit", token=token).pack(),
+                    callback_data=ChatsCallbackData(action="list", token=token, page=page).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="⬅️ В меню",
+                    callback_data=MenuCallbackData(section="home", action="open").pack(),
                 )
             ],
         ]
@@ -222,6 +226,18 @@ def chat_draft_keyboard(chat_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="🔁 Перегенерировать",
                     callback_data=ChatsCallbackData(action="ai", token=chat_id).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧩 Пересобрать по моему промту",
+                    callback_data=ChatsCallbackData(action="ai_my_prompt", token=chat_id).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✍️ Мой промт",
+                    callback_data=ChatsCallbackData(action="set_my_prompt", token=chat_id).pack(),
                 )
             ],
             [
