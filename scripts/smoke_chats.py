@@ -53,7 +53,7 @@ async def _smoke_chat_list_and_history() -> None:
         assert items, "Chat list should have one item"
         assert "Проверочный" in text or "Чаты" in text
 
-        bubbles = await logic.get_chat_bubbles_for_ui(
+        messages = await logic.get_chat_bubbles_for_ui(
             user_id=1,
             chat_id="c1",
             force_refresh=True,
@@ -61,6 +61,7 @@ async def _smoke_chat_list_and_history() -> None:
             include_seller=True,
             max_messages=10,
         )
+        bubbles = [logic._bubble_text(m) for m in messages]
         assert any("Покупатель" in b for b in bubbles)
         assert any("Вы:" in b for b in bubbles)
         assert any("📎" in b for b in bubbles), "Attachments should be surfaced"
