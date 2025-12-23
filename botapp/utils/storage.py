@@ -33,6 +33,7 @@ REVIEWS_FILE = ROOT / "review_replies.json"
 QUESTIONS_FILE = ROOT / "question_answers.json"
 CHATS_FILE = ROOT / "chat_ai_state.json"
 ACTIVATED_CHATS_FILE = ROOT / "activated_chats.json"
+SETTINGS_FILE = ROOT / "settings.json"
 
 _LOCK = threading.RLock()
 _MAX_ACTIVATED_CHATS_PER_USER = 500
@@ -85,9 +86,10 @@ class _Store:
     questions: Dict[str, dict] = None
     chats: Dict[str, dict] = None
     activated_chats: Dict[str, dict] = None
+    settings: Dict[str, dict] = None
 
 
-_STORE = _Store(loaded=False, reviews={}, questions={}, chats={}, activated_chats={})
+_STORE = _Store(loaded=False, reviews={}, questions={}, chats={}, activated_chats={}, settings={})
 
 
 def _ensure_loaded() -> None:
@@ -101,11 +103,13 @@ def _ensure_loaded() -> None:
         questions = _read_json(QUESTIONS_FILE, default={})
         chats = _read_json(CHATS_FILE, default={})
         activated = _read_json(ACTIVATED_CHATS_FILE, default={})
+        settings = _read_json(SETTINGS_FILE, default={})
 
         _STORE.reviews = reviews if isinstance(reviews, dict) else {}
         _STORE.questions = questions if isinstance(questions, dict) else {}
         _STORE.chats = chats if isinstance(chats, dict) else {}
         _STORE.activated_chats = activated if isinstance(activated, dict) else {}
+        _STORE.settings = settings if isinstance(settings, dict) else {}
         _STORE.loaded = True
 
 
@@ -116,6 +120,7 @@ def flush_storage() -> None:
         _write_json_atomic(QUESTIONS_FILE, _STORE.questions)
         _write_json_atomic(CHATS_FILE, _STORE.chats)
         _write_json_atomic(ACTIVATED_CHATS_FILE, _STORE.activated_chats)
+        _write_json_atomic(SETTINGS_FILE, _STORE.settings)
 
 
 def get_review_reply(review_id: str) -> dict | None:
@@ -327,6 +332,59 @@ def mark_chat_activated(user_id: int, chat_id: str) -> None:
         flush_storage()
 
 
+def _user_settings(uid: str) -> dict:
+    settings = _STORE.settings.get(uid)
+    if not isinstance(settings, dict):
+        settings = {}
+    return settings
+
+
+def get_user_settings(user_id: int) -> dict:
+    _ensure_loaded()
+    uid = str(int(user_id))
+    with _LOCK:
+        settings = dict(_user_settings(uid))
+        settings.setdefault("outreach_enabled", False)
+        settings.setdefault("outreach_interval_seconds", 5)
+        return settings
+
+
+def is_outreach_enabled(user_id: int) -> bool:
+    settings = get_user_settings(user_id)
+    return bool(settings.get("outreach_enabled"))
+
+
+def set_outreach_enabled(user_id: int, enabled: bool) -> None:
+    _ensure_loaded()
+    uid = str(int(user_id))
+    with _LOCK:
+        settings = _user_settings(uid)
+        settings["outreach_enabled"] = bool(enabled)
+        settings.setdefault("outreach_interval_seconds", 5)
+        _STORE.settings[uid] = settings
+        flush_storage()
+
+
+def get_outreach_interval_seconds(user_id: int) -> int:
+    settings = get_user_settings(user_id)
+    try:
+        seconds = int(settings.get("outreach_interval_seconds", 5))
+    except Exception:
+        seconds = 5
+    return max(1, seconds)
+
+
+def set_outreach_interval_seconds(user_id: int, seconds: int) -> None:
+    _ensure_loaded()
+    uid = str(int(user_id))
+    with _LOCK:
+        settings = _user_settings(uid)
+        settings["outreach_interval_seconds"] = max(1, int(seconds)) if seconds is not None else 5
+        settings.setdefault("outreach_enabled", False)
+        _STORE.settings[uid] = settings
+        flush_storage()
+
+
 __all__ = [
     "get_review_reply",
     "upsert_review_reply",
@@ -338,5 +396,10 @@ __all__ = [
     "clear_chat_ai_state",
     "get_activated_chat_ids",
     "mark_chat_activated",
+    "get_user_settings",
+    "is_outreach_enabled",
+    "set_outreach_enabled",
+    "get_outreach_interval_seconds",
+    "set_outreach_interval_seconds",
     "flush_storage",
 ]
