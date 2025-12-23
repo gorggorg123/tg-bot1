@@ -25,6 +25,7 @@ from botapp.sections.chats.logic import (
     last_seen_page,
     NormalizedMessage,
     normalize_thread_messages,
+    refresh_chats_list,
     refresh_chat_thread,
     resolve_chat_id,
     _chat_title_from_cache,
@@ -416,8 +417,13 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
     if action in ("noop", ""):
         return
 
-    if action in ("page", "refresh"):
-        await _show_chats_list(user_id=user_id, page=page, callback=callback, force_refresh=(action == "refresh"))
+    if action == "refresh":
+        await refresh_chats_list(user_id, force=True)
+        await _show_chats_list(user_id=user_id, page=page, callback=callback, force_refresh=False)
+        return
+
+    if action == "page":
+        await _show_chats_list(user_id=user_id, page=page, callback=callback, force_refresh=False)
         return
 
     if action == "list":

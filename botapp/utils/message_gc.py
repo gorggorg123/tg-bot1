@@ -11,6 +11,8 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 logger = logging.getLogger(__name__)
 
+NOT_MODIFIED = object()
+
 # -----------------------------------------------------------------------------
 # Section IDs (единый реестр "экранов")
 # -----------------------------------------------------------------------------
@@ -80,6 +82,7 @@ async def _safe_delete(bot, chat_id: int, message_id: int) -> bool:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
         return True
     except (TelegramBadRequest, TelegramForbiddenError):
+        logger.warning("Failed to delete message %s/%s due to telegram constraints", chat_id, message_id)
         return False
     except Exception:
         logger.exception("Unexpected error while deleting message %s/%s", chat_id, message_id)
@@ -109,7 +112,7 @@ async def _safe_edit(
         return None
     except TelegramBadRequest as exc:
         if "message is not modified" in str(exc).lower():
-            return None
+            return NOT_MODIFIED
         return None
     except (TelegramForbiddenError,):
         return None
@@ -151,6 +154,9 @@ async def render_section(
                 reply_markup=reply_markup,
                 parse_mode=parse_mode,
             )
+            if edited is NOT_MODIFIED:
+                _set_ref(user_id, section, prev.chat_id, target_message_id)
+                return None
             if edited:
                 _set_ref(user_id, section, prev.chat_id, target_message_id)
                 return edited
@@ -176,9 +182,67 @@ async def render_section(
     if callback and callback.message:
         current_mid = callback.message.message_id
         prev = _get_ref(user_id, section)
+        prev_same_chat = prev and prev.chat_id == chat_id
 
-        if prev and (prev.chat_id != chat_id or prev.message_id != current_mid):
-            await _safe_delete(bot, prev.chat_id, prev.message_id)
+        if prev_same_chat:
+            target_mid = prev.message_id
+            edited = await _safe_edit(
+                bot,
+                chat_id=prev.chat_id,
+                message_id=target_mid,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+            )
+            if edited is NOT_MODIFIED:
+                _set_ref(user_id, section, prev.chat_id, target_mid)
+                return None
+            if edited is None:
+                logger.info(
+                    "Edit failed for section=%s user_id=%s target_mid=%s, sending new message",
+                    section,
+                    user_id,
+                    target_mid,
+                )
+                try:
+                    sent = await bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        reply_markup=reply_markup,
+                        parse_mode=parse_mode,
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to send fallback section message section=%s user_id=%s",
+                        section,
+                        user_id,
+                    )
+                    return None
+
+                if prev.message_id != sent.message_id:
+                    deleted = await _safe_delete(bot, prev.chat_id, prev.message_id)
+                    if not deleted:
+                        logger.warning(
+                            "Failed to delete previous section message section=%s user_id=%s mid=%s",
+                            section,
+                            user_id,
+                            prev.message_id,
+                        )
+
+                _set_ref(user_id, section, chat_id, sent.message_id)
+                return sent
+
+            _set_ref(user_id, section, prev.chat_id, target_mid)
+            return edited
+
+        if prev is None:
+            logger.info(
+                "No previous section message, editing trigger for section=%s user_id=%s mid=%s",
+                section,
+                user_id,
+                current_mid,
+            )
 
         edited = await _safe_edit(
             bot,
@@ -188,7 +252,16 @@ async def render_section(
             reply_markup=reply_markup,
             parse_mode=parse_mode,
         )
+        if edited is NOT_MODIFIED:
+            _set_ref(user_id, section, chat_id, current_mid)
+            return None
         if edited is None:
+            logger.info(
+                "Edit failed for section=%s user_id=%s target_mid=%s, sending new message",
+                section,
+                user_id,
+                current_mid,
+            )
             try:
                 sent = await bot.send_message(
                     chat_id=chat_id,
@@ -205,7 +278,16 @@ async def render_section(
                 )
                 return None
 
-            await _safe_delete(bot, chat_id, current_mid)
+            if prev and prev.chat_id != chat_id:
+                deleted = await _safe_delete(bot, prev.chat_id, prev.message_id)
+                if not deleted:
+                    logger.warning(
+                        "Failed to delete previous section message section=%s user_id=%s mid=%s",
+                        section,
+                        user_id,
+                        prev.message_id,
+                    )
+
             _set_ref(user_id, section, chat_id, sent.message_id)
             return sent
 
@@ -222,6 +304,9 @@ async def render_section(
             reply_markup=reply_markup,
             parse_mode=parse_mode,
         )
+        if edited is NOT_MODIFIED:
+            _set_ref(user_id, section, prev.chat_id, prev.message_id)
+            return None
         if edited is None:
             try:
                 sent = await bot.send_message(

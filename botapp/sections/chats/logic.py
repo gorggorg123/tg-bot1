@@ -23,7 +23,7 @@ from botapp.ui import TokenStore
 logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 10
-CACHE_TTL_SECONDS = 10
+CACHE_TTL_SECONDS = 60
 THREAD_TTL_SECONDS = 10
 MSK_TZ = timezone(timedelta(hours=3))
 
