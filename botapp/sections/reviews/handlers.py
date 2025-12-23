@@ -23,6 +23,7 @@ from botapp.utils.message_gc import (
     SECTION_REVIEW_PROMPT,
     SECTION_REVIEWS_LIST,
     delete_section_message,
+    render_section,
     send_section_message,
 )
 from botapp.api.ozon_client import OzonAPIError, get_client, get_write_client, has_write_credentials
@@ -311,8 +312,11 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
     if action in ("reprompt", "card_reprompt"):
         await state.set_state(ReviewStates.reprompt)
         await state.update_data(category=category, page=page, token=token)
-        await send_section_message(
+        await render_section(
             SECTION_REVIEW_PROMPT,
+            bot=callback.message.bot,
+            chat_id=callback.message.chat.id,
+            user_id=user_id,
             text=(
                 "<b>Пересобрать ответ на отзыв</b>\n\n"
                 "Напиши пожелания к ответу (тон, стиль, что обязательно учесть).\n"
@@ -320,15 +324,18 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             ),
             reply_markup=None,
             callback=callback,
-            user_id=user_id,
+            mode="section_only",
         )
         return
 
     if action in ("manual", "card_manual"):
         await state.set_state(ReviewStates.manual)
         await state.update_data(category=category, page=page, token=token)
-        await send_section_message(
+        await render_section(
             SECTION_REVIEW_PROMPT,
+            bot=callback.message.bot,
+            chat_id=callback.message.chat.id,
+            user_id=user_id,
             text=(
                 "<b>Ввод ответа вручную</b>\n\n"
                 "Отправь текст ответа одним сообщением.\n"
@@ -336,7 +343,7 @@ async def reviews_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             ),
             reply_markup=None,
             callback=callback,
-            user_id=user_id,
+            mode="section_only",
         )
         return
 
