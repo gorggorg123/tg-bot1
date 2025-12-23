@@ -542,6 +542,11 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             callback=callback,
             mode="section_only",
         )
+        await send_ephemeral_message(
+            callback,
+            text="✍️ Напиши промт одним сообщением. Отмена: /cancel",
+            ttl=6,
+        )
         return
 
     if action == "edit_ai":

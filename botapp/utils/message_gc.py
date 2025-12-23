@@ -136,17 +136,23 @@ async def render_section(
         trigger_mid = callback.message.message_id if callback and callback.message else None
         prev = _get_ref(user_id, section)
 
-        if prev and prev.chat_id == chat_id and prev.message_id != trigger_mid:
+        if prev and prev.chat_id == chat_id:
+            target_message_id = None
+            if prev.message_id == trigger_mid:
+                target_message_id = trigger_mid
+            else:
+                target_message_id = prev.message_id
+
             edited = await _safe_edit(
                 bot,
                 chat_id=prev.chat_id,
-                message_id=prev.message_id,
+                message_id=target_message_id,
                 text=text,
                 reply_markup=reply_markup,
                 parse_mode=parse_mode,
             )
             if edited:
-                _set_ref(user_id, section, prev.chat_id, prev.message_id)
+                _set_ref(user_id, section, prev.chat_id, target_message_id)
                 return edited
 
         try:

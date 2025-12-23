@@ -786,9 +786,6 @@ def _bubble_text(msg: NormalizedMessage) -> str:
     label = "👤 Покупатель" if msg.role == "buyer" else ("🏪 Мы" if msg.role == "seller" else "Сервис")
     prefix = f"<b>{label}:</b> "
     suffix = ""
-    product_line = ""
-    if msg.product_title:
-        product_line = "\n" + "🛒 Товар: <i>" + _trim(_escape(msg.product_title), 80) + "</i>"
     if msg.context:
         bits: list[str] = []
         sku = msg.context.get("sku") or msg.context.get("product_id")
@@ -801,8 +798,8 @@ def _bubble_text(msg: NormalizedMessage) -> str:
             suffix = "\n<i>" + ", ".join(bits) + "</i>"
 
     if tm:
-        return f"{prefix}{txt}{product_line}{suffix}\n<i>{tm}</i>"
-    return prefix + txt + product_line + suffix
+        return f"{prefix}{txt}{suffix}\n<i>{tm}</i>"
+    return prefix + txt + suffix
 
 
 async def get_chat_bubbles_for_ui(

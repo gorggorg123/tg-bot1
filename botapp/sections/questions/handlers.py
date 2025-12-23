@@ -301,6 +301,11 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
             callback=callback,
             mode="section_only",
         )
+        await send_ephemeral_message(
+            callback,
+            text="✍️ Напиши пожелания к ответу одним сообщением. Отмена: /cancel",
+            ttl=6,
+        )
         return
 
     if action in ("manual", "card_manual"):
