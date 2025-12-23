@@ -61,6 +61,14 @@ def chats_list_keyboard(
     rows.append(
         [
             InlineKeyboardButton(
+                text="🔄 Обновить",
+                callback_data=ChatsCallbackData(action="refresh", page=page).pack(),
+            ),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
                 text="⬅️ В меню",
                 callback_data=MenuCallbackData(section="home", action="open").pack(),
             )
