@@ -26,7 +26,7 @@ class WarehouseCallbackData(CallbackData, prefix="warehouse"):
 # ---------------------------------------------------------------------------
 
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
+def main_menu_keyboard(outreach_enabled: bool = False) -> InlineKeyboardMarkup:
     """Главное меню: держим основные разделы на виду."""
 
     kb: list[list[InlineKeyboardButton]] = [
@@ -60,6 +60,12 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 text="🏭 Склад",
                 callback_data=MenuCallbackData(section="warehouse", action="open", extra="").pack(),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="📣 Рассылка: ВКЛ" if outreach_enabled else "📣 Рассылка: ВЫКЛ",
+                callback_data=MenuCallbackData(section="outreach", action="toggle", extra="").pack(),
             ),
         ],
         [
