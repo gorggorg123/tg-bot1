@@ -27,6 +27,7 @@ from botapp.sections.chats.logic import (
     normalize_thread_messages,
     refresh_chat_thread,
     resolve_chat_id,
+    _chat_title_from_cache,
     _bubble_text,
     _fmt_time,
 )
@@ -324,9 +325,16 @@ async def _show_chat_thread(user_id: int, token: str, callback: CallbackQuery | 
 
     await _delete_bubbles_in_chat(bot, tg_chat_id, user_id, ozon_chat_id)
 
+    cached_title = _chat_title_from_cache(user_id, ozon_chat_id)
+    safe_title = html.escape(cached_title) if cached_title else None
+    title_line = f"<b>{safe_title}</b>" if safe_title else "<b>Чат</b>"
+    header_text = (
+        f"{title_line}\nID: <code>{ozon_chat_id}</code>\n\nНиже — последние сообщения."
+    )
+
     header = await send_section_message(
         SECTION_CHAT_HISTORY,
-        text=f"<b>Чат</b>\nID: <code>{ozon_chat_id}</code>\n\nНиже — последние сообщения.",
+        text=header_text,
         reply_markup=chat_header_keyboard(token=token, page=last_seen_page(user_id)),
         callback=callback,
         message=message,

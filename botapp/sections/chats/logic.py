@@ -124,6 +124,7 @@ class ChatsCache:
     chats: list[ChatListItem] = field(default_factory=list)
     token_to_chat_id: dict[str, str] = field(default_factory=dict)
     chat_id_to_token: dict[str, str] = field(default_factory=dict)
+    chat_titles: dict[str, str] = field(default_factory=dict)
     error: str | None = None
     last_page: int = 0
 
@@ -192,6 +193,8 @@ def _tc(user_id: int, chat_id: str) -> ThreadCache:
 def _chat_title_from_cache(user_id: int, chat_id: str) -> str | None:
     cid = str(chat_id).strip()
     cache = _cc(user_id)
+    if cache.chat_titles.get(cid):
+        return cache.chat_titles[cid]
     for c in cache.chats:
         if (c.safe_chat_id or str(c.chat_id or "").strip()) == cid:
             raw_title = (c.title or "").strip()
@@ -498,6 +501,32 @@ async def resolve_product_title_for_message(
     return None
 
 
+def derive_chat_title_from_thread(thread: list[NormalizedMessage]) -> str | None:
+    """Attempt to infer a chat title from buyer messages."""
+
+    first_buyer: NormalizedMessage | None = None
+    for msg in thread:
+        if msg.role == "buyer" and (msg.text or "").strip():
+            first_buyer = msg
+            break
+
+    if not first_buyer:
+        return None
+
+    text = (first_buyer.text or "").strip()
+    pattern = re.compile(r"(?:товар[ау]?|по\s+товару)\s*[\"“«](.{6,80}?)[\"”»]", re.IGNORECASE)
+    match = pattern.search(text)
+    if match:
+        return match.group(1).strip()
+
+    generic = re.compile(r"[\"“«](.{6,80}?)[\"”»]")
+    match = generic.search(text)
+    if match:
+        return match.group(1).strip()
+
+    return None
+
+
 def last_buyer_message_text(user_id: int, chat_id: str) -> str | None:
     cid = str(chat_id).strip()
     t = _tc(user_id, cid)
@@ -616,8 +645,10 @@ async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = Fals
         if ctype and ctype not in ("buyer_seller", "buyer-seller", "buyer_seller_chat"):
             continue
         tok = cache.chat_id_to_token.get(cid) or _short_token(user_id, cid)
+        cached_title = cache.chat_titles.get(cid)
         raw_title = (c.title or "").strip()
-        title = _trim((raw_title or f"Чат {cid}").replace("\n", " "), 42)
+        final_title = cached_title or raw_title
+        title = _trim((final_title or f"Чат {cid}").replace("\n", " "), 42)
         extras = getattr(c, "model_extra", {}) or {}
         last_message = extras.get("last_message") or getattr(c, "last_message", None)
         if isinstance(last_message, dict):
@@ -702,6 +733,16 @@ async def refresh_chat_thread(*, user_id: int, chat_id: str, force: bool = False
         t.last_message_id = _extract_last_message_id(t.raw_messages)
         t.fetched_at = _now_utc()
         t.error = None
+
+        try:
+            normalized_thread = normalize_thread_messages(t.raw_messages, customer_only=True, include_seller=True)
+            title = derive_chat_title_from_thread(normalized_thread)
+            if title and cid:
+                cache = _cc(user_id)
+                cache.chat_titles[cid] = title
+                logger.info("Derived chat title for %s: %s", cid, title)
+        except Exception:
+            logger.debug("Failed to derive chat title for %s", cid, exc_info=True)
 
         return ThreadView(
             chat_id=cid,
