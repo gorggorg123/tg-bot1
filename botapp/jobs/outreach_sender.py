@@ -41,13 +41,21 @@ def enqueue_outreach(job: OutreachJob) -> None:
 
 async def outreach_sender_loop(stop_event: asyncio.Event) -> None:
     logger.info("Outreach sender loop started")
-    while not stop_event.is_set():
+    while True:
+        if stop_event.is_set() and _queue.empty():
+            break
         try:
             job = await asyncio.wait_for(_queue.get(), timeout=1.0)
         except asyncio.TimeoutError:
+            if stop_event.is_set():
+                break
             continue
 
         try:
+            if stop_event.is_set():
+                logger.info("Stop requested; dropping outreach job chat=%s", job.chat_id)
+                continue
+
             if not is_outreach_enabled(job.user_id):
                 logger.info("Outreach disabled; skipping job chat=%s", job.chat_id)
                 continue
@@ -59,7 +67,12 @@ async def outreach_sender_loop(stop_event: asyncio.Event) -> None:
             _queue.task_done()
 
         interval = max(1, get_outreach_interval_seconds(job.user_id))
-        await asyncio.sleep(interval)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+        if stop_event.is_set():
+            break
 
     logger.info("Outreach sender loop stopped")
 
