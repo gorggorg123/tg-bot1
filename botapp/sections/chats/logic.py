@@ -562,7 +562,7 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
 
     activated = get_activated_chat_ids(user_id)
     activation_checks = 0
-    activation_checks_limit = 5
+    activation_checks_limit = 20 if len(activated) == 0 else 5
 
     async with lock:
         if not force and cache.chats and is_cache_fresh(cache.fetched_at, CACHE_TTL_SECONDS):
@@ -599,9 +599,8 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
                 continue
             unread_count = int(c.unread_count or 0)
 
-            if unread_count > 0 and cid not in activated and activation_checks < activation_checks_limit:
+            if cid not in activated and activation_checks < activation_checks_limit:
                 try:
-                    activation_checks += 1
                     history = await ozon_chat_history(cid, limit=10)
                     for m in history or []:
                         if not isinstance(m, dict):
@@ -611,7 +610,14 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
                             activated.add(cid)
                             break
                 except Exception:
-                    logger.debug("Failed to auto-activate chat %s for user %s", cid, user_id, exc_info=True)
+                    logger.debug(
+                        "Failed to auto-activate chat %s for user %s",
+                        cid,
+                        user_id,
+                        exc_info=True,
+                    )
+                finally:
+                    activation_checks += 1
 
             if unread_count <= 0 and cid not in activated:
                 continue
@@ -640,6 +646,13 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
 
         if not deduped:
             logger.info("Chat list returned 0 items for user %s (HTTP 200)", user_id)
+        logger.info(
+            "Chats list: total_from_api=%s, activated=%s, shown=%s, activation_checks=%s",
+            len(chats),
+            len(activated),
+            len(deduped),
+            activation_checks,
+        )
 
 
 async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = False) -> tuple[str, list[dict], int, int]:
