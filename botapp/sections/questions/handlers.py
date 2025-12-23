@@ -22,6 +22,7 @@ from botapp.utils.message_gc import (
     SECTION_QUESTION_PROMPT,
     SECTION_QUESTIONS_LIST,
     delete_section_message,
+    render_section,
     send_section_message,
 )
 from botapp.api.ozon_client import OzonAPIError, has_write_credentials, send_question_answer
@@ -286,8 +287,11 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
     if action in ("reprompt", "card_reprompt"):
         await state.set_state(QuestionStates.reprompt)
         await state.update_data(category=category, page=page, token=token)
-        await send_section_message(
+        await render_section(
             SECTION_QUESTION_PROMPT,
+            bot=callback.message.bot,
+            chat_id=callback.message.chat.id,
+            user_id=user_id,
             text=(
                 "<b>Пересобрать ответ на вопрос</b>\n\n"
                 "Напиши пожелания (тон, что учесть).\n"
@@ -295,15 +299,18 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
             ),
             reply_markup=None,
             callback=callback,
-            user_id=user_id,
+            mode="section_only",
         )
         return
 
     if action in ("manual", "card_manual"):
         await state.set_state(QuestionStates.manual)
         await state.update_data(category=category, page=page, token=token)
-        await send_section_message(
+        await render_section(
             SECTION_QUESTION_PROMPT,
+            bot=callback.message.bot,
+            chat_id=callback.message.chat.id,
+            user_id=user_id,
             text=(
                 "<b>Ввод ответа вручную</b>\n\n"
                 "Отправь текст ответа одним сообщением.\n"
@@ -311,7 +318,7 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
             ),
             reply_markup=None,
             callback=callback,
-            user_id=user_id,
+            mode="section_only",
         )
         return
 

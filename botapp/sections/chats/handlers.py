@@ -27,6 +27,7 @@ from botapp.sections.chats.logic import (
     normalize_thread_messages,
     refresh_chat_thread,
     resolve_chat_id,
+    _chat_title_from_cache,
     _bubble_text,
     _fmt_time,
 )
@@ -55,6 +56,7 @@ from botapp.utils.message_gc import (
     SECTION_WAREHOUSE_PLAN,
     SECTION_WAREHOUSE_PROMPT,
     delete_section_message,
+    render_section,
     send_section_message,
 )
 from botapp.api.ozon_client import OzonAPIError, chat_send_message, download_chat_file
@@ -186,15 +188,22 @@ async def _render_ai_draft_message(
     callback: CallbackQuery | None = None,
     message: Message | None = None,
     user_id: int,
+    mode: str = "edit_trigger",
 ) -> None:
+    bot = callback.message.bot if callback and callback.message else message.bot if message else None
+    chat_id = callback.message.chat.id if callback and callback.message else message.chat.id if message else None
+    if bot is None or chat_id is None:
+        return
     safe_draft = html.escape(draft)
-    await send_section_message(
+    await render_section(
         SECTION_CHAT_PROMPT,
+        bot=bot,
+        chat_id=chat_id,
+        user_id=user_id,
         text="<b>ИИ-черновик:</b>\n\n" + safe_draft,
         reply_markup=chat_ai_draft_keyboard(token=token),
         callback=callback,
-        message=message,
-        user_id=user_id,
+        mode=mode,
     )
 
 
@@ -205,6 +214,7 @@ async def _generate_and_render_draft(
     callback: CallbackQuery | None = None,
     message: Message | None = None,
     user_prompt: str | None = None,
+    render_mode: str = "edit_trigger",
 ) -> None:
     ozon_chat_id = resolve_chat_id(user_id, token) or token
     if not ozon_chat_id:
@@ -232,7 +242,14 @@ async def _generate_and_render_draft(
     ai_state.last_user_prompt = user_prompt or ai_state.last_user_prompt
     _save_ai_state(ai_state)
 
-    await _render_ai_draft_message(token=token, draft=draft, callback=callback, message=message, user_id=user_id)
+    await _render_ai_draft_message(
+        token=token,
+        draft=draft,
+        callback=callback,
+        message=message,
+        user_id=user_id,
+        mode=render_mode,
+    )
 
 
 async def _clear_other_sections(bot, user_id: int, preserve_message_id: int | None = None) -> None:
@@ -308,9 +325,16 @@ async def _show_chat_thread(user_id: int, token: str, callback: CallbackQuery | 
 
     await _delete_bubbles_in_chat(bot, tg_chat_id, user_id, ozon_chat_id)
 
+    cached_title = _chat_title_from_cache(user_id, ozon_chat_id)
+    safe_title = html.escape(cached_title) if cached_title else None
+    title_line = f"<b>{safe_title}</b>" if safe_title else "<b>Чат</b>"
+    header_text = (
+        f"{title_line}\nID: <code>{ozon_chat_id}</code>\n\nНиже — последние сообщения."
+    )
+
     header = await send_section_message(
         SECTION_CHAT_HISTORY,
-        text=f"<b>Чат</b>\nID: <code>{ozon_chat_id}</code>\n\nНиже — последние сообщения.",
+        text=header_text,
         reply_markup=chat_header_keyboard(token=token, page=last_seen_page(user_id)),
         callback=callback,
         message=message,
@@ -442,15 +466,20 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     if action == "ai":
-        await _generate_and_render_draft(user_id=user_id, token=token, callback=callback)
+        await _generate_and_render_draft(
+            user_id=user_id, token=token, callback=callback, render_mode="section_only"
+        )
         return
 
     if action == "set_my_prompt":
         await state.set_state(ChatStates.reprompt)
         await state.update_data(token=token)
 
-        await send_section_message(
+        await render_section(
             SECTION_CHAT_PROMPT,
+            bot=callback.message.bot,
+            chat_id=callback.message.chat.id,
+            user_id=user_id,
             text=(
                 "<b>Свой промт для ИИ</b>\n\n"
                 "Отправь текст с пожеланиями к стилю/ответу.\n"
@@ -458,7 +487,7 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             ),
             reply_markup=None,
             callback=callback,
-            user_id=user_id,
+            mode="section_only",
         )
         return
 
@@ -470,8 +499,11 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             # попросим ввести промт и вернемся
             await state.set_state(ChatStates.reprompt)
             await state.update_data(token=token)
-            await send_section_message(
+            await render_section(
                 SECTION_CHAT_PROMPT,
+                bot=callback.message.bot,
+                chat_id=callback.message.chat.id,
+                user_id=user_id,
                 text=(
                     "<b>Свой промт для ИИ</b>\n\n"
                     "Отправь текст с пожеланиями к стилю/ответу.\n"
@@ -479,7 +511,7 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
                 ),
                 reply_markup=None,
                 callback=callback,
-                user_id=user_id,
+                mode="section_only",
             )
             return
 
@@ -488,6 +520,7 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             token=token,
             callback=callback,
             user_prompt=user_prompt,
+            render_mode="section_only",
         )
         return
 
@@ -495,8 +528,11 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(ChatStates.reprompt)
         await state.update_data(token=token)
 
-        await send_section_message(
+        await render_section(
             SECTION_CHAT_PROMPT,
+            bot=callback.message.bot,
+            chat_id=callback.message.chat.id,
+            user_id=user_id,
             text=(
                 "<b>Пересобрать промпт для ИИ</b>\n\n"
                 "Напиши правила/пожелания (тон, стиль, что обязательно учесть).\n"
@@ -504,7 +540,7 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
             ),
             reply_markup=None,
             callback=callback,
-            user_id=user_id,
+            mode="section_only",
         )
         return
 
@@ -512,12 +548,17 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(ChatStates.edit_ai)
         await state.update_data(token=token)
 
-        await send_section_message(
+        await render_section(
             SECTION_CHAT_PROMPT,
-            text="<b>Редактирование ИИ-черновика</b>\n\nОтправь новый текст одним сообщением.\nОтмена: /cancel",
+            bot=callback.message.bot,
+            chat_id=callback.message.chat.id,
+            user_id=user_id,
+            text=(
+                "<b>Редактирование ИИ-черновика</b>\n\nОтправь новый текст одним сообщением.\nОтмена: /cancel"
+            ),
             reply_markup=None,
             callback=callback,
-            user_id=user_id,
+            mode="section_only",
         )
         return
 

@@ -708,7 +708,8 @@ def build_questions_table(
 
         qid = safe_strip(getattr(q, "id", None))
         if qid:
-            meta = f"{i:>2}) {badge} {date_part}"
+            idx = f"{i:02d})"
+            meta = f"{idx} {badge} {date_part}"
             prod_trimmed = product[:46] + ("…" if len(product) > 46 else "")
             label = f"{meta}\n{prod_trimmed}"
             if len(label) > 64:
