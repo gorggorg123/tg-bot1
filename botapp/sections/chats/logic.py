@@ -19,6 +19,7 @@ from botapp.api.ozon_client import (
 from botapp.catalog_cache import get_sku_title_from_cache, save_sku_title_to_cache
 from botapp.sections._base import is_cache_fresh
 from botapp.ui import TokenStore
+from botapp.utils.storage import get_activated_chat_ids, mark_chat_activated
 
 logger = logging.getLogger(__name__)
 
@@ -559,6 +560,10 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
     cache = _cc(user_id)
     lock = _lock_for_chat_list(user_id)
 
+    activated = get_activated_chat_ids(user_id)
+    activation_checks = 0
+    activation_checks_limit = 20 if len(activated) == 0 else 5
+
     async with lock:
         if not force and cache.chats and is_cache_fresh(cache.fetched_at, CACHE_TTL_SECONDS):
             return
@@ -586,11 +591,35 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
         deduped: list[ChatListItem] = []
         seen: set[str] = set()
         for c in chats:
-            cid = c.safe_chat_id or str(c.chat_id or "").strip()
+            cid = (c.safe_chat_id or str(c.chat_id or "").strip() or "").strip()
             if not cid:
                 continue
             ctype = str(c.chat_type or "").lower()
             if ctype and ctype not in ("buyer_seller", "buyer-seller", "buyer_seller_chat"):
+                continue
+            unread_count = int(c.unread_count or 0)
+
+            if cid not in activated and activation_checks < activation_checks_limit:
+                try:
+                    history = await ozon_chat_history(cid, limit=10)
+                    for m in history or []:
+                        if not isinstance(m, dict):
+                            continue
+                        if _detect_sender_type(m) == "buyer":
+                            mark_chat_activated(user_id, cid)
+                            activated.add(cid)
+                            break
+                except Exception:
+                    logger.debug(
+                        "Failed to auto-activate chat %s for user %s",
+                        cid,
+                        user_id,
+                        exc_info=True,
+                    )
+                finally:
+                    activation_checks += 1
+
+            if unread_count <= 0 and cid not in activated:
                 continue
             if cid in seen:
                 continue
@@ -617,6 +646,13 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
 
         if not deduped:
             logger.info("Chat list returned 0 items for user %s (HTTP 200)", user_id)
+        logger.info(
+            "Chats list: total_from_api=%s, activated=%s, shown=%s, activation_checks=%s",
+            len(chats),
+            len(activated),
+            len(deduped),
+            activation_checks,
+        )
 
 
 async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = False) -> tuple[str, list[dict], int, int]:
@@ -734,6 +770,13 @@ async def refresh_chat_thread(*, user_id: int, chat_id: str, force: bool = False
         t.last_message_id = _extract_last_message_id(t.raw_messages)
         t.fetched_at = _now_utc()
         t.error = None
+
+        for m in t.raw_messages:
+            if not isinstance(m, dict):
+                continue
+            if _detect_sender_type(m) == "buyer":
+                mark_chat_activated(user_id, cid)
+                break
 
         try:
             normalized_thread = normalize_thread_messages(t.raw_messages, customer_only=True, include_seller=True)
