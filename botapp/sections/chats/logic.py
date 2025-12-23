@@ -637,7 +637,7 @@ async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = Fals
     chunk = cache.chats[start:end]
 
     items: list[dict] = []
-    for c in chunk:
+    for i, c in enumerate(chunk, start=1 + start):
         cid = c.safe_chat_id or str(c.chat_id or "").strip()
         if not cid:
             continue
@@ -675,7 +675,8 @@ async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = Fals
         subtitle_parts = [p for p in (last_snippet, last_time) if p]
         subtitle = " • ".join(subtitle_parts)
         short_id = cid[-8:] if len(cid) > 8 else cid
-        caption_bits = [title, f"ID:{short_id}"]
+        idx = f"{i:02d})"
+        caption_bits = [f"{idx} {title}", f"ID:{short_id}"]
         if product_title:
             caption_bits.append(f"Товар: {product_title}")
         if subtitle:
