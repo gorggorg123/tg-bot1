@@ -15,6 +15,7 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from botapp.config import load_ozon_config
+from botapp.jobs.outreach_sender import outreach_sender_loop
 from botapp.ozon_client import close_clients, get_client, has_write_credentials
 from botapp.router import router as root_router
 from botapp.storage import flush_storage
@@ -102,6 +103,8 @@ app = FastAPI()
 
 _polling_task: asyncio.Task | None = None
 _polling_lock = asyncio.Lock()
+_outreach_task: asyncio.Task | None = None
+_outreach_stop: asyncio.Event | None = None
 
 
 async def start_polling_once() -> None:
@@ -135,6 +138,11 @@ async def on_startup() -> None:
     logger.info("Startup: init Ozon client")
     get_client()
 
+    global _outreach_task, _outreach_stop
+    _outreach_stop = asyncio.Event()
+    logger.info("Startup: starting outreach sender loop")
+    _outreach_task = asyncio.create_task(outreach_sender_loop(_outreach_stop))
+
     if not ENABLE_TG_POLLING:
         logger.info("ENABLE_TG_POLLING=0 — Telegram polling disabled")
         return
@@ -149,6 +157,14 @@ async def on_shutdown() -> None:
 
     with suppress(Exception):
         flush_storage()
+
+    global _outreach_task, _outreach_stop
+    if _outreach_stop is not None:
+        _outreach_stop.set()
+    if _outreach_task and not _outreach_task.done():
+        _outreach_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _outreach_task
 
     global _polling_task
     if _polling_task and not _polling_task.done():
