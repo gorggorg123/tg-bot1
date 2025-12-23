@@ -82,6 +82,14 @@ async def _safe_delete(bot, chat_id: int, message_id: int) -> bool:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
         return True
     except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        if "message to delete not found" in str(exc).lower():
+            logger.warning(
+                "Failed to delete message %s/%s due to telegram constraints: %s",
+                chat_id,
+                message_id,
+                exc,
+            )
+            return True
         logger.warning(
             "Failed to delete message %s/%s due to telegram constraints: %s",
             chat_id,
@@ -109,6 +117,14 @@ async def _safe_clear(bot, chat_id: int, message_id: int) -> bool:
         return False
     except TelegramBadRequest as exc:
         if "message is not modified" in str(exc).lower():
+            return True
+        if "message to edit not found" in str(exc).lower():
+            logger.warning(
+                "Failed to clear message %s/%s via edit: %s",
+                chat_id,
+                message_id,
+                exc,
+            )
             return True
         logger.warning(
             "Failed to clear message %s/%s via edit: %s",
