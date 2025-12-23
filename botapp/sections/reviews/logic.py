@@ -1240,7 +1240,8 @@ def build_reviews_table(
         review_id = card.id or ""
         token = encode_review_id(user_id, review_id)
         if review_id:
-            meta = f"{i:>2}. {badge} {created} | {rating_txt}"
+            idx = f"{i:02d})"
+            meta = f"{idx} {badge} {created} | {rating_txt}"
             prod_trimmed = prod[:46] + ("…" if len(prod) > 46 else "")
             label = f"{meta}\n{prod_trimmed}"
             if len(label) > 64:

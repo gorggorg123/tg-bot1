@@ -118,6 +118,151 @@ async def _safe_edit(
         return None
 
 
+async def render_section(
+    section: str,
+    *,
+    bot,
+    chat_id: int,
+    user_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: str | None = "HTML",
+    callback: CallbackQuery | None = None,
+    mode: str = "edit_trigger",
+) -> Message | None:
+    parse_mode = parse_mode or "HTML"
+
+    if mode == "section_only":
+        trigger_mid = callback.message.message_id if callback and callback.message else None
+        prev = _get_ref(user_id, section)
+
+        if prev and prev.chat_id == chat_id:
+            target_message_id = None
+            if prev.message_id == trigger_mid:
+                target_message_id = trigger_mid
+            else:
+                target_message_id = prev.message_id
+
+            edited = await _safe_edit(
+                bot,
+                chat_id=prev.chat_id,
+                message_id=target_message_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+            )
+            if edited:
+                _set_ref(user_id, section, prev.chat_id, target_message_id)
+                return edited
+
+        try:
+            sent = await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            logger.exception("Failed to send section_only message section=%s user_id=%s", section, user_id)
+            return None
+
+        if prev and prev.chat_id == chat_id and prev.message_id != trigger_mid:
+            await _safe_delete(bot, prev.chat_id, prev.message_id)
+
+        _set_ref(user_id, section, chat_id, sent.message_id)
+        return sent
+
+    if callback and callback.message:
+        current_mid = callback.message.message_id
+        prev = _get_ref(user_id, section)
+
+        if prev and (prev.chat_id != chat_id or prev.message_id != current_mid):
+            await _safe_delete(bot, prev.chat_id, prev.message_id)
+
+        edited = await _safe_edit(
+            bot,
+            chat_id=chat_id,
+            message_id=current_mid,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
+        if edited is None:
+            try:
+                sent = await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=parse_mode,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to send fallback section message section=%s user_id=%s",
+                    section,
+                    user_id,
+                )
+                return None
+
+            await _safe_delete(bot, chat_id, current_mid)
+            _set_ref(user_id, section, chat_id, sent.message_id)
+            return sent
+
+        _set_ref(user_id, section, chat_id, current_mid)
+        return edited
+
+    prev = _get_ref(user_id, section)
+    if prev and prev.chat_id == chat_id:
+        edited = await _safe_edit(
+            bot,
+            chat_id=prev.chat_id,
+            message_id=prev.message_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
+        if edited is None:
+            try:
+                sent = await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=parse_mode,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                logger.exception("Failed to send section message section=%s user_id=%s", section, user_id)
+                return None
+
+            if prev:
+                await _safe_delete(bot, prev.chat_id, prev.message_id)
+
+            _set_ref(user_id, section, chat_id, sent.message_id)
+            return sent
+
+        _set_ref(user_id, section, prev.chat_id, prev.message_id)
+        return edited
+
+    try:
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logger.exception("Failed to send section message section=%s user_id=%s", section, user_id)
+        return None
+
+    if prev:
+        await _safe_delete(bot, prev.chat_id, prev.message_id)
+
+    _set_ref(user_id, section, chat_id, sent.message_id)
+    return sent
+
+
 # -----------------------------------------------------------------------------
 # Public API: send/update one “section message”
 # -----------------------------------------------------------------------------
@@ -159,92 +304,17 @@ async def send_section_message(
     if chat_id is None:
         return None
 
-    if callback and callback.message:
-        current_mid = callback.message.message_id
-        prev = _get_ref(user_id, section)
-
-        if prev and (prev.chat_id != chat_id or prev.message_id != current_mid):
-            await _safe_delete(bot, prev.chat_id, prev.message_id)
-
-        edited = await _safe_edit(
-            bot,
-            chat_id=chat_id,
-            message_id=current_mid,
-            text=text,
-            reply_markup=reply_markup,
-        )
-        if edited is None:
-            try:
-                sent = await bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    reply_markup=reply_markup,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to send fallback section message section=%s user_id=%s",
-                    section,
-                    user_id,
-                )
-                return None
-
-            await _safe_delete(bot, chat_id, current_mid)
-            _set_ref(user_id, section, chat_id, sent.message_id)
-            return sent
-
-        _set_ref(user_id, section, chat_id, current_mid)
-        return edited
-
-    prev = _get_ref(user_id, section)
-    if prev and prev.chat_id == chat_id:
-        edited = await _safe_edit(
-            bot,
-            chat_id=prev.chat_id,
-            message_id=prev.message_id,
-            text=text,
-            reply_markup=reply_markup,
-        )
-        if edited is None:
-            try:
-                sent = await bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    reply_markup=reply_markup,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                logger.exception("Failed to send section message section=%s user_id=%s", section, user_id)
-                return None
-
-            if prev:
-                await _safe_delete(bot, prev.chat_id, prev.message_id)
-
-            _set_ref(user_id, section, chat_id, sent.message_id)
-            return sent
-
-        _set_ref(user_id, section, prev.chat_id, prev.message_id)
-        return edited
-
-    try:
-        sent = await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        logger.exception("Failed to send section message section=%s user_id=%s", section, user_id)
-        return None
-
-    if prev:
-        await _safe_delete(bot, prev.chat_id, prev.message_id)
-
-    _set_ref(user_id, section, chat_id, sent.message_id)
-    return sent
+    return await render_section(
+        section,
+        bot=bot,
+        chat_id=chat_id,
+        user_id=user_id,
+        text=text,
+        reply_markup=reply_markup,
+        parse_mode="HTML",
+        callback=callback,
+        mode="edit_trigger",
+    )
 
 
 async def delete_section_message(
@@ -290,6 +360,7 @@ __all__ = [
     "SECTION_WAREHOUSE_MENU",
     "SECTION_WAREHOUSE_PLAN",
     "SECTION_WAREHOUSE_PROMPT",
+    "render_section",
     "send_section_message",
     "delete_section_message",
 ]
