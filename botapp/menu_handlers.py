@@ -79,7 +79,7 @@ async def _close_all_sections(
                 preserve_message_id=preserve_message_id,
             )
         except Exception:
-            continue
+            logger.exception("Failed to delete section=%s for user=%s", sec, user_id)
 
 
 async def _show_menu(*, user_id: int, callback: CallbackQuery | None = None, message: Message | None = None) -> None:

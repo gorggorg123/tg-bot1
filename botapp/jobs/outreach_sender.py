@@ -61,6 +61,7 @@ async def outreach_sender_loop(stop_event: asyncio.Event) -> None:
                 continue
 
             await chat_send_message(job.chat_id, job.text)
+            logger.info("Outreach sent chat=%s", job.chat_id)
         except Exception as e:  # noqa: BLE001
             logger.exception("Outreach send failed for chat=%s: %s", job.chat_id, e)
         finally:

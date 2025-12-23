@@ -81,11 +81,52 @@ async def _safe_delete(bot, chat_id: int, message_id: int) -> bool:
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
         return True
-    except (TelegramBadRequest, TelegramForbiddenError):
-        logger.warning("Failed to delete message %s/%s due to telegram constraints", chat_id, message_id)
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        logger.warning(
+            "Failed to delete message %s/%s due to telegram constraints: %s",
+            chat_id,
+            message_id,
+            exc,
+        )
         return False
     except Exception:
         logger.exception("Unexpected error while deleting message %s/%s", chat_id, message_id)
+        return False
+
+
+async def _safe_clear(bot, chat_id: int, message_id: int) -> bool:
+    try:
+        res = await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="\u200b",
+            reply_markup=None,
+            parse_mode=None,
+            disable_web_page_preview=True,
+        )
+        if isinstance(res, Message) or res is None:
+            return True
+        return False
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return True
+        logger.warning(
+            "Failed to clear message %s/%s via edit: %s",
+            chat_id,
+            message_id,
+            exc,
+        )
+        return False
+    except (TelegramForbiddenError,) as exc:
+        logger.warning(
+            "Failed to clear message %s/%s due to telegram constraints: %s",
+            chat_id,
+            message_id,
+            exc,
+        )
+        return False
+    except Exception:
+        logger.exception("Unexpected error while clearing message %s/%s", chat_id, message_id)
         return False
 
 
@@ -448,8 +489,14 @@ async def delete_section_message(
     if preserve_message_id is not None and int(preserve_message_id) == int(ref.message_id):
         return False
 
-    ok = await _safe_delete(bot, ref.chat_id, ref.message_id)
-    _pop_ref(user_id, section)
+    ok_del = await _safe_delete(bot, ref.chat_id, ref.message_id)
+    ok_clear = False
+    if not ok_del:
+        ok_clear = await _safe_clear(bot, ref.chat_id, ref.message_id)
+
+    ok = ok_del or ok_clear
+    if ok:
+        _pop_ref(user_id, section)
 
     if force:
         return True
