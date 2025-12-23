@@ -7,6 +7,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import time
 from typing import Any, Iterable
 
 from botapp.api.ozon_client import (
@@ -562,7 +563,6 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
 
     activated = get_activated_chat_ids(user_id)
     activation_checks = 0
-    activation_checks_limit = 20 if len(activated) == 0 else 5
 
     async with lock:
         if not force and cache.chats and is_cache_fresh(cache.fetched_at, CACHE_TTL_SECONDS):
@@ -588,18 +588,31 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
 
         chats = resp.chats or list(resp.iter_items())
 
-        deduped: list[ChatListItem] = []
-        seen: set[str] = set()
+        time_budget_seconds = 2.0
+        max_checks = 30
+        concurrency = 4
+        t0 = time.monotonic()
+        semaphore = asyncio.Semaphore(concurrency)
+
+        candidates: list[tuple[int, ChatListItem]] = []
         for c in chats:
             cid = (c.safe_chat_id or str(c.chat_id or "").strip() or "").strip()
-            if not cid:
+            if not cid or cid in activated:
                 continue
-            ctype = str(c.chat_type or "").lower()
-            if ctype and ctype not in ("buyer_seller", "buyer-seller", "buyer_seller_chat"):
-                continue
-            unread_count = int(c.unread_count or 0)
+            try:
+                last_id = int(c.last_message_id or 0)
+            except Exception:
+                last_id = 0
+            if last_id > 0:
+                candidates.append((last_id, c))
 
-            if cid not in activated and activation_checks < activation_checks_limit:
+        candidates.sort(key=lambda item: -item[0])
+
+        async def _probe_and_activate(cid: str) -> None:
+            nonlocal activated
+            async with semaphore:
+                if time.monotonic() - t0 > time_budget_seconds:
+                    return
                 try:
                     history = await ozon_chat_history(cid, limit=10)
                     for m in history or []:
@@ -616,9 +629,30 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
                         user_id,
                         exc_info=True,
                     )
-                finally:
-                    activation_checks += 1
 
+        tasks: list[asyncio.Task[None]] = []
+        for _last_id, c in candidates:
+            if activation_checks >= max_checks or (time.monotonic() - t0) > time_budget_seconds:
+                break
+            cid = (c.safe_chat_id or str(c.chat_id or "").strip() or "").strip()
+            if not cid or cid in activated:
+                continue
+            activation_checks += 1
+            tasks.append(asyncio.create_task(_probe_and_activate(cid)))
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        deduped: list[ChatListItem] = []
+        seen: set[str] = set()
+        for c in chats:
+            cid = (c.safe_chat_id or str(c.chat_id or "").strip() or "").strip()
+            if not cid:
+                continue
+            ctype = str(c.chat_type or "").lower()
+            if ctype and ctype not in ("buyer_seller", "buyer-seller", "buyer_seller_chat"):
+                continue
+            unread_count = int(c.unread_count or 0)
             if unread_count <= 0 and cid not in activated:
                 continue
             if cid in seen:
@@ -646,12 +680,14 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
 
         if not deduped:
             logger.info("Chat list returned 0 items for user %s (HTTP 200)", user_id)
+        spent = time.monotonic() - t0
         logger.info(
-            "Chats list: total_from_api=%s, activated=%s, shown=%s, activation_checks=%s",
+            "Chats list: total_from_api=%s activated=%s shown=%s activation_checks=%s time_spent=%.2fs",
             len(chats),
             len(activated),
             len(deduped),
             activation_checks,
+            spent,
         )
 
 
