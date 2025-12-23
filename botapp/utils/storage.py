@@ -32,8 +32,10 @@ ROOT.mkdir(parents=True, exist_ok=True)
 REVIEWS_FILE = ROOT / "review_replies.json"
 QUESTIONS_FILE = ROOT / "question_answers.json"
 CHATS_FILE = ROOT / "chat_ai_state.json"
+ACTIVATED_CHATS_FILE = ROOT / "activated_chats.json"
 
 _LOCK = threading.RLock()
+_MAX_ACTIVATED_CHATS_PER_USER = 500
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -61,6 +63,10 @@ def _json_default(obj: Any) -> Any:
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 @dataclass
 class ChatAIState:
     chat_id: str
@@ -78,9 +84,10 @@ class _Store:
     reviews: Dict[str, dict] = None
     questions: Dict[str, dict] = None
     chats: Dict[str, dict] = None
+    activated_chats: Dict[str, dict] = None
 
 
-_STORE = _Store(loaded=False, reviews={}, questions={}, chats={})
+_STORE = _Store(loaded=False, reviews={}, questions={}, chats={}, activated_chats={})
 
 
 def _ensure_loaded() -> None:
@@ -93,10 +100,12 @@ def _ensure_loaded() -> None:
         reviews = _read_json(REVIEWS_FILE, default={})
         questions = _read_json(QUESTIONS_FILE, default={})
         chats = _read_json(CHATS_FILE, default={})
+        activated = _read_json(ACTIVATED_CHATS_FILE, default={})
 
         _STORE.reviews = reviews if isinstance(reviews, dict) else {}
         _STORE.questions = questions if isinstance(questions, dict) else {}
         _STORE.chats = chats if isinstance(chats, dict) else {}
+        _STORE.activated_chats = activated if isinstance(activated, dict) else {}
         _STORE.loaded = True
 
 
@@ -106,6 +115,7 @@ def flush_storage() -> None:
         _write_json_atomic(REVIEWS_FILE, _STORE.reviews)
         _write_json_atomic(QUESTIONS_FILE, _STORE.questions)
         _write_json_atomic(CHATS_FILE, _STORE.chats)
+        _write_json_atomic(ACTIVATED_CHATS_FILE, _STORE.activated_chats)
 
 
 def get_review_reply(review_id: str) -> dict | None:
@@ -275,6 +285,48 @@ def clear_chat_ai_state(user_id: int, chat_id: str) -> None:
         _write_json_atomic(CHATS_FILE, _STORE.chats)
 
 
+def _trim_activated_chats(data: Dict[str, dict]) -> Dict[str, dict]:
+    if len(data) <= _MAX_ACTIVATED_CHATS_PER_USER:
+        return data
+
+    def _sort_key(item: tuple[str, dict]) -> datetime:
+        dt = _parse_dt(item[1].get("activated_at"))
+        if dt is None:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        return dt
+
+    sorted_items = sorted(data.items(), key=_sort_key)
+    trimmed = {k: v for k, v in sorted_items[-_MAX_ACTIVATED_CHATS_PER_USER:]}
+    return trimmed
+
+
+def get_activated_chat_ids(user_id: int) -> set[str]:
+    _ensure_loaded()
+    uid = str(int(user_id))
+    with _LOCK:
+        user_chats = _STORE.activated_chats.get(uid)
+        if not isinstance(user_chats, dict):
+            return set()
+        return set(user_chats.keys())
+
+
+def mark_chat_activated(user_id: int, chat_id: str) -> None:
+    _ensure_loaded()
+    cid = str(chat_id).strip()
+    if not cid:
+        return
+
+    uid = str(int(user_id))
+    with _LOCK:
+        user_chats = _STORE.activated_chats.get(uid)
+        if not isinstance(user_chats, dict):
+            user_chats = {}
+
+        user_chats[cid] = {"activated_at": _utc_now_iso()}
+        _STORE.activated_chats[uid] = _trim_activated_chats(user_chats)
+        flush_storage()
+
+
 __all__ = [
     "get_review_reply",
     "upsert_review_reply",
@@ -284,5 +336,7 @@ __all__ = [
     "load_chat_ai_state",
     "save_chat_ai_state",
     "clear_chat_ai_state",
+    "get_activated_chat_ids",
+    "mark_chat_activated",
     "flush_storage",
 ]
