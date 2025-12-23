@@ -14,6 +14,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from botapp.ai_memory import ApprovedAnswer, get_approved_memory_store
 from botapp.api.ai_client import generate_chat_reply
+from botapp.jobs.outreach_sender import DEFAULT_OUTREACH_TEXT, OutreachJob, enqueue_outreach
 from botapp.sections.chats.logic import (
     PremiumPlusRequired,
     friendly_chat_error,
@@ -469,6 +470,29 @@ async def chats_callbacks(callback: CallbackQuery, state: FSMContext) -> None:
         await delete_section_message(user_id, SECTION_CHAT_PROMPT, callback.message.bot, force=True)
         await send_ephemeral_message(callback, text="🧹 Очищено.")
         await _show_chat_thread(user_id=user_id, token=token, callback=callback, force_refresh=False, show_only_buyer=True)
+        return
+
+    if action == "outreach_test":
+        ozon_chat_id = resolve_chat_id(user_id, token) or token
+        if not ozon_chat_id:
+            await send_ephemeral_message(callback, text="⚠️ Не удалось определить чат.")
+            return
+        try:
+            job = OutreachJob(
+                user_id=user_id,
+                chat_id=ozon_chat_id,
+                text=DEFAULT_OUTREACH_TEXT,
+                created_at=datetime.now(timezone.utc),
+            )
+            enqueue_outreach(job)
+            await callback.answer("Поставил в очередь")
+            await send_ephemeral_message(
+                callback,
+                text="📣 Сообщение поставлено в очередь. Отправка идет с интервалом.",
+            )
+        except Exception:
+            logger.exception("Failed to enqueue outreach test for chat %s", ozon_chat_id)
+            await send_ephemeral_message(callback, text="⚠️ Не удалось поставить в очередь.")
         return
 
     if action == "ai":

@@ -36,6 +36,7 @@ from botapp.utils.message_gc import (
     delete_section_message,
     send_section_message,
 )
+from botapp.utils.storage import is_outreach_enabled, set_outreach_enabled
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -78,7 +79,7 @@ async def _close_all_sections(
                 preserve_message_id=preserve_message_id,
             )
         except Exception:
-            continue
+            logger.exception("Failed to delete section=%s for user=%s", sec, user_id)
 
 
 async def _show_menu(*, user_id: int, callback: CallbackQuery | None = None, message: Message | None = None) -> None:
@@ -90,10 +91,12 @@ async def _show_menu(*, user_id: int, callback: CallbackQuery | None = None, mes
         "• <b>Чаты</b> — переписка «пузырями», ИИ-ответ с учётом истории\n"
     )
 
+    enabled = is_outreach_enabled(user_id)
+
     await send_section_message(
         SECTION_MENU,
         text=text,
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(outreach_enabled=enabled),
         callback=callback,
         message=message,
         user_id=user_id,
@@ -133,6 +136,15 @@ async def menu_alias(callback: CallbackQuery, state: FSMContext) -> None:
         preserve_menu=False,
         preserve_message_id=preserve_mid,
     )
+    await _show_menu(user_id=user_id, callback=callback)
+
+
+@router.callback_query(MenuCallbackData.filter(F.section == "outreach"))
+async def toggle_outreach(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    curr = is_outreach_enabled(user_id)
+    set_outreach_enabled(user_id, not curr)
+    await callback.answer("Рассылка включена" if not curr else "Рассылка выключена")
     await _show_menu(user_id=user_id, callback=callback)
 
 

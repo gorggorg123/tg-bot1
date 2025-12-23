@@ -86,6 +86,10 @@ def chat_header_keyboard(token: str, page: int | None = None) -> InlineKeyboardM
                     callback_data=ChatsCallbackData(action="refresh_thread", token=token).pack(),
                 ),
                 InlineKeyboardButton(
+                    text="📣 Спасибо (тест)",
+                    callback_data=ChatsCallbackData(action="outreach_test", token=token).pack(),
+                ),
+                InlineKeyboardButton(
                     text="⬅️ Еще раньше",
                     callback_data=ChatsCallbackData(action="older", token=token).pack(),
                 ),
