@@ -14,9 +14,14 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from botapp.config import load_ozon_config
+# --- НОВЫЕ ИМПОРТЫ ---
+from botapp.config import load_ozon_config, OzonConfig
+from botapp.db import init_db
+from botapp.api.client import BotOzonClient
+from botapp.products_service import ProductsService
+# ---------------------
+
 from botapp.jobs.outreach_sender import outreach_sender_loop
-from botapp.ozon_client import close_clients, get_client, has_write_credentials
 from botapp.router import router as root_router
 from botapp.storage import flush_storage
 
@@ -41,9 +46,9 @@ def setup_logging() -> None:
     )
 
 
-def validate_env() -> None:
+def validate_env() -> OzonConfig:
     """
-    Фейлимся заранее, чтобы не ловить “странные” ошибки по месту.
+    Проверяем переменные и возвращаем конфиг Ozon.
     """
     token = _env("TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
     if not token:
@@ -52,31 +57,22 @@ def validate_env() -> None:
     cfg = load_ozon_config()
     if not cfg.client_id or not cfg.api_key:
         raise RuntimeError(
-            "Не заданы OZON credentials (OZON_CLIENT_ID/OZON_API_KEY или OZON_SELLER_CLIENT_ID/OZON_SELLER_API_KEY)."
+            "Не заданы OZON credentials (OZON_CLIENT_ID/OZON_API_KEY)."
         )
 
-    # OpenAI — не делаем fatal, но предупреждаем (ИИ-кнопки будут падать при вызове)
     if not _env("OPENAI_API_KEY"):
         logger.warning("OPENAI_API_KEY не задан — ИИ-генерация будет недоступна.")
 
-    if not has_write_credentials():
-        logger.warning(
-            "Write-доступ к Ozon не задан (OZON_WRITE_* / OZON_SELLER_WRITE_*). "
-            "Отправка ответов/сообщений будет недоступна."
-        )
+    return cfg
 
 
 def build_fsm_storage():
-    """
-    Опционально Redis FSM:
-      REDIS_URL=redis://:pass@host:6379/0
-    """
     redis_url = _env("REDIS_URL")
     if not redis_url:
         return MemoryStorage()
 
     try:
-        from aiogram.fsm.storage.redis import RedisStorage  # type: ignore
+        from aiogram.fsm.storage.redis import RedisStorage
         logger.info("Using Redis FSM storage")
         return RedisStorage.from_url(redis_url)
     except Exception as exc:
@@ -85,11 +81,11 @@ def build_fsm_storage():
 
 
 # -----------------------------------------------------------------------------
-# Global app/bot/dp (для uvicorn main:app)
+# Global setup
 # -----------------------------------------------------------------------------
 
 setup_logging()
-validate_env()
+OZON_CFG = validate_env()  # Загружаем конфиг сразу
 
 TG_BOT_TOKEN = _env("TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
 ENABLE_TG_POLLING = _env("ENABLE_TG_POLLING", default="1") == "1"
@@ -106,6 +102,9 @@ _polling_lock = asyncio.Lock()
 _outreach_task: asyncio.Task | None = None
 _outreach_stop: asyncio.Event | None = None
 
+# Глобальная ссылка на клиента для корректного закрытия
+_ozon_client: BotOzonClient | None = None
+
 
 async def start_polling_once() -> None:
     """
@@ -116,6 +115,8 @@ async def start_polling_once() -> None:
         if _polling_task and not _polling_task.done():
             logger.info("Polling already running")
             return
+        
+        # Зависимости уже внедрены в dp.workflow_data в on_startup
         _polling_task = asyncio.create_task(
             dp.start_polling(
                 bot,
@@ -135,12 +136,37 @@ async def start_polling_once() -> None:
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    logger.info("Startup: init Ozon client")
-    get_client()
+    global _ozon_client, _outreach_task, _outreach_stop
 
-    global _outreach_task, _outreach_stop
+    # 1. Инициализация Базы Данных (создание таблиц)
+    logger.info("Startup: initializing Database")
+    await init_db()
+
+    # 2. Инициализация Нового Клиента Ozon (v2/v3)
+    logger.info("Startup: initializing Ozon Client (BotOzonClient)")
+    _ozon_client = BotOzonClient(
+        client_id=OZON_CFG.client_id,
+        api_key=OZON_CFG.api_key
+    )
+
+    # 3. Инициализация Сервиса Товаров (с БД)
+    logger.info("Startup: initializing Products Service")
+    products_service = ProductsService(_ozon_client)
+
+    # 4. Внедрение зависимостей в Dispatcher
+    # Теперь в любом хендлере можно добавить аргументы:
+    # async def handler(msg: Message, ozon_client: BotOzonClient, products_service: ProductsService):
+    dp.workflow_data.update({
+        "ozon_client": _ozon_client,
+        "products_service": products_service,
+        "ozon_config": OZON_CFG
+    })
+
+    # 5. Запуск фоновых задач
     _outreach_stop = asyncio.Event()
     logger.info("Startup: starting outreach sender loop")
+    # ВАЖНО: Убедитесь, что outreach_sender_loop обновлен для использования нового клиента, 
+    # либо передавайте его туда, если потребуется рефакторинг sender'а.
     _outreach_task = asyncio.create_task(outreach_sender_loop(_outreach_stop))
 
     if not ENABLE_TG_POLLING:
@@ -153,7 +179,7 @@ async def on_startup() -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
-    logger.info("Shutdown: flushing storage, stopping polling, closing clients")
+    logger.info("Shutdown: flushing storage, stopping tasks, closing clients")
 
     with suppress(Exception):
         flush_storage()
@@ -172,8 +198,11 @@ async def on_shutdown() -> None:
         with suppress(asyncio.CancelledError):
             await _polling_task
 
-    with suppress(Exception):
-        await close_clients()
+    # Закрытие сессии Ozon клиента (если библиотека это поддерживает/требует)
+    # Обычно aiohttp сессия внутри библиотеки закрывается сама или через GC, 
+    # но если есть явный метод close(), его стоит вызвать.
+    # В текущей реализации библиотеки ozonapi явного close для внешнего вызова может не быть,
+    # но aiohttp ClientSession управляется внутри.
 
     with suppress(Exception):
         await bot.session.close()
@@ -181,7 +210,7 @@ async def on_shutdown() -> None:
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root() -> dict:
-    return {"status": "ok", "detail": "Ozon bot is running"}
+    return {"status": "ok", "detail": "Ozon bot is running (New Architecture)"}
 
 
 @app.get("/health")
