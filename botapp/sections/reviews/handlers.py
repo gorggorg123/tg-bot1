@@ -40,6 +40,7 @@ from botapp.sections.reviews.logic import (
 )
 from botapp.utils.storage import get_review_reply, upsert_review_reply
 from botapp.utils import send_ephemeral_message
+from botapp.menu_handlers import _close_all_sections
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -217,7 +218,21 @@ async def cmd_reviews(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(MenuCallbackData.filter(F.section == "reviews"))
 async def menu_reviews(callback: CallbackQuery, state: FSMContext) -> None:
+    preserve_mid = callback.message.message_id if callback.message else None
+    logger.info(
+        "Switch section: from=%s to=%s, preserve_menu=%s mid=%s",
+        "menu",
+        SECTION_REVIEWS_LIST,
+        True,
+        preserve_mid,
+    )
     await state.clear()
+    await _close_all_sections(
+        callback.message.bot,
+        callback.from_user.id,
+        preserve_menu=True,
+        preserve_message_id=preserve_mid,
+    )
     await _show_reviews_list(user_id=callback.from_user.id, category="all", page=0, callback=callback, force_refresh=False)
 
 

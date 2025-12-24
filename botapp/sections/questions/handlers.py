@@ -38,6 +38,7 @@ from botapp.sections.questions.logic import (
     resolve_question_id,
     resolve_question_token,
 )
+from botapp.menu_handlers import _close_all_sections
 from botapp.utils.storage import get_question_answer, upsert_question_answer
 from botapp.utils import send_ephemeral_message
 
@@ -159,7 +160,21 @@ async def cmd_questions(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(MenuCallbackData.filter(F.section == "questions"))
 async def menu_questions(callback: CallbackQuery, state: FSMContext) -> None:
+    preserve_mid = callback.message.message_id if callback.message else None
+    logger.info(
+        "Switch section: from=%s to=%s, preserve_menu=%s mid=%s",
+        "menu",
+        SECTION_QUESTIONS_LIST,
+        True,
+        preserve_mid,
+    )
     await state.clear()
+    await _close_all_sections(
+        callback.message.bot,
+        callback.from_user.id,
+        preserve_menu=True,
+        preserve_message_id=preserve_mid,
+    )
     await _show_questions_list(user_id=callback.from_user.id, category="unanswered", page=0, callback=callback, force_refresh=False)
 
 
