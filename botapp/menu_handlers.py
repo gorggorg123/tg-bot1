@@ -117,12 +117,11 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 async def menu_home(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
-    preserve_mid = callback.message.message_id if callback.message else None
     await _close_all_sections(
         callback.message.bot,
         user_id,
-        preserve_menu=False,
-        preserve_message_id=preserve_mid,
+        preserve_menu=True,
+        preserve_message_id=None,
     )
     await _show_menu(user_id=user_id, callback=callback)
 
@@ -131,12 +130,11 @@ async def menu_home(callback: CallbackQuery, state: FSMContext) -> None:
 async def menu_alias(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
-    preserve_mid = callback.message.message_id if callback.message else None
     await _close_all_sections(
         callback.message.bot,
         user_id,
-        preserve_menu=False,
-        preserve_message_id=preserve_mid,
+        preserve_menu=True,
+        preserve_message_id=None,
     )
     await _show_menu(user_id=user_id, callback=callback)
 
