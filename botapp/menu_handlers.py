@@ -153,6 +153,13 @@ async def menu_fbo(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
     preserve_mid = callback.message.message_id if callback.message else None
+    logger.info(
+        "Switch section: from=%s to=%s, preserve_menu=%s mid=%s",
+        "menu",
+        SECTION_FBO,
+        True,
+        preserve_mid,
+    )
     await _close_all_sections(
         callback.message.bot,
         user_id,
@@ -185,6 +192,13 @@ async def menu_finance(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
     preserve_mid = callback.message.message_id if callback.message else None
+    logger.info(
+        "Switch section: from=%s to=%s, preserve_menu=%s mid=%s",
+        "menu",
+        SECTION_FINANCE_TODAY,
+        True,
+        preserve_mid,
+    )
     await _close_all_sections(
         callback.message.bot,
         user_id,

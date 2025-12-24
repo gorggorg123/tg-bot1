@@ -83,19 +83,9 @@ async def _safe_delete(bot, chat_id: int, message_id: int) -> bool:
         return True
     except (TelegramBadRequest, TelegramForbiddenError) as exc:
         if "message to delete not found" in str(exc).lower():
-            logger.warning(
-                "Failed to delete message %s/%s due to telegram constraints: %s",
-                chat_id,
-                message_id,
-                exc,
-            )
+            logger.warning("Failed to delete message %s/%s: %s", chat_id, message_id, exc)
             return True
-        logger.warning(
-            "Failed to delete message %s/%s due to telegram constraints: %s",
-            chat_id,
-            message_id,
-            exc,
-        )
+        logger.warning("Failed to delete message %s/%s: %s", chat_id, message_id, exc)
         return False
     except Exception:
         logger.exception("Unexpected error while deleting message %s/%s", chat_id, message_id)
@@ -112,34 +102,21 @@ async def _safe_clear(bot, chat_id: int, message_id: int) -> bool:
             parse_mode=None,
             disable_web_page_preview=True,
         )
-        if isinstance(res, Message) or res is None:
-            return True
-        return False
+        return isinstance(res, Message) or res is None
     except TelegramBadRequest as exc:
         if "message is not modified" in str(exc).lower():
-            return True
+            logger.warning("Failed to clear message %s/%s via edit (not modified): %s", chat_id, message_id, exc)
+            return False
         if "message to edit not found" in str(exc).lower():
-            logger.warning(
-                "Failed to clear message %s/%s via edit: %s",
-                chat_id,
-                message_id,
-                exc,
-            )
-            return True
-        logger.warning(
-            "Failed to clear message %s/%s via edit: %s",
-            chat_id,
-            message_id,
-            exc,
-        )
+            logger.warning("Failed to clear message %s/%s via edit (not found): %s", chat_id, message_id, exc)
+            return False
+        if "can't be edited" in str(exc).lower():
+            logger.warning("Failed to clear message %s/%s via edit (cannot edit): %s", chat_id, message_id, exc)
+            return False
+        logger.warning("Failed to clear message %s/%s via edit: %s", chat_id, message_id, exc)
         return False
     except (TelegramForbiddenError,) as exc:
-        logger.warning(
-            "Failed to clear message %s/%s due to telegram constraints: %s",
-            chat_id,
-            message_id,
-            exc,
-        )
+        logger.warning("Failed to clear message %s/%s: %s", chat_id, message_id, exc)
         return False
     except Exception:
         logger.exception("Unexpected error while clearing message %s/%s", chat_id, message_id)
@@ -503,18 +480,66 @@ async def delete_section_message(
         return False
 
     if preserve_message_id is not None and int(preserve_message_id) == int(ref.message_id):
-        return False
+        logger.info(
+            "Preserve mid=%s section=%s user_id=%s -> dropping ref",
+            preserve_message_id,
+            section,
+            user_id,
+        )
+        popped = _pop_ref(user_id, section)
+        if popped:
+            logger.info("Popped ref for section=%s user_id=%s", section, user_id)
+        return True
 
+    logger.info(
+        "Deleting section message section=%s user_id=%s chat_id=%s mid=%s force=%s preserve_mid=%s",
+        section,
+        user_id,
+        ref.chat_id,
+        ref.message_id,
+        force,
+        preserve_message_id,
+    )
     ok_del = await _safe_delete(bot, ref.chat_id, ref.message_id)
+    logger.info(
+        "Delete attempt result section=%s user_id=%s chat_id=%s mid=%s ok=%s",
+        section,
+        user_id,
+        ref.chat_id,
+        ref.message_id,
+        ok_del,
+    )
     ok_clear = False
     if not ok_del:
+        logger.info("Clear fallback used for %s/%s", ref.chat_id, ref.message_id)
+        logger.info(
+            "Clearing section message via edit section=%s user_id=%s chat_id=%s mid=%s",
+            section,
+            user_id,
+            ref.chat_id,
+            ref.message_id,
+        )
         ok_clear = await _safe_clear(bot, ref.chat_id, ref.message_id)
+        logger.info(
+            "Clear attempt result section=%s user_id=%s chat_id=%s mid=%s ok=%s",
+            section,
+            user_id,
+            ref.chat_id,
+            ref.message_id,
+            ok_clear,
+        )
 
     ok = ok_del or ok_clear
     if ok:
-        _pop_ref(user_id, section)
+        popped = _pop_ref(user_id, section)
+        if popped:
+            logger.info("Popped ref for section=%s user_id=%s", section, user_id)
 
     if force:
+        if not ok:
+            popped = _pop_ref(user_id, section)
+            if popped:
+                logger.info("Force pop ref for section=%s user_id=%s", section, user_id)
         return True
     return ok
 

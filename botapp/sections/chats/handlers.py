@@ -34,6 +34,7 @@ from botapp.sections.chats.logic import (
     _fmt_time,
 )
 from botapp.keyboards import MenuCallbackData, back_home_keyboard
+from botapp.menu_handlers import _close_all_sections
 from botapp.sections.chats.keyboards import (
     ChatCallbackData,
     chat_header_keyboard,
@@ -254,30 +255,6 @@ async def _generate_and_render_draft(
     )
 
 
-async def _clear_other_sections(bot, user_id: int, preserve_message_id: int | None = None) -> None:
-    for section in (
-        SECTION_FBO,
-        SECTION_FINANCE_TODAY,
-        SECTION_ACCOUNT,
-        SECTION_REVIEWS_LIST,
-        SECTION_REVIEW_CARD,
-        SECTION_REVIEW_PROMPT,
-        SECTION_QUESTIONS_LIST,
-        SECTION_QUESTION_CARD,
-        SECTION_QUESTION_PROMPT,
-        SECTION_WAREHOUSE_MENU,
-        SECTION_WAREHOUSE_PLAN,
-        SECTION_WAREHOUSE_PROMPT,
-    ):
-        await delete_section_message(
-            user_id,
-            section,
-            bot,
-            force=True,
-            preserve_message_id=preserve_message_id,
-        )
-
-
 async def _show_chats_list(user_id: int, page: int, callback: CallbackQuery | None = None, message: Message | None = None, force_refresh: bool = False) -> None:
     items: list[dict] = []
     try:
@@ -386,7 +363,12 @@ async def _show_chat_thread(user_id: int, token: str, callback: CallbackQuery | 
 async def cmd_chats(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
     await state.clear()
-    await _clear_other_sections(message.bot, user_id, preserve_message_id=message.message_id)
+    await _close_all_sections(
+        message.bot,
+        user_id,
+        preserve_menu=True,
+        preserve_message_id=message.message_id,
+    )
     await _show_chats_list(user_id=user_id, page=0, message=message, force_refresh=True)
 
 
@@ -395,8 +377,18 @@ async def open_chats_from_menu(callback: CallbackQuery, state: FSMContext) -> No
     user_id = callback.from_user.id
     await state.clear()
     preserve_mid = callback.message.message_id if callback.message else None
-    await _clear_other_sections(
-        callback.message.bot, user_id, preserve_message_id=preserve_mid
+    logger.info(
+        "Switch section: from=%s to=%s, preserve_menu=%s mid=%s",
+        "menu",
+        SECTION_CHATS_LIST,
+        True,
+        preserve_mid,
+    )
+    await _close_all_sections(
+        callback.message.bot,
+        user_id,
+        preserve_menu=True,
+        preserve_message_id=preserve_mid,
     )
     await _show_chats_list(user_id=user_id, page=0, callback=callback, force_refresh=True)
 

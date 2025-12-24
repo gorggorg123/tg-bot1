@@ -1933,8 +1933,15 @@ async def chat_send_message(chat_id: str, text: str) -> None:
     if len(text_clean) < 2:
         raise OzonAPIError("Текст сообщения пустой или слишком короткий")
 
+    endpoint = "/v1/chat/send/message"
     body = {"chat_id": chat_id, "text": text_clean}
-    status_code, data = await client._post_with_status("/v1/chat/send/message", body)
+    logger.info(
+        "Sending chat message endpoint=%s payload_keys=%s chat_id=%s",
+        endpoint,
+        sorted(body.keys()),
+        chat_id,
+    )
+    status_code, data = await client._post_with_status(endpoint, body)
     if status_code >= 400:
         message = None
         if isinstance(data, dict):
@@ -1944,6 +1951,49 @@ async def chat_send_message(chat_id: str, text: str) -> None:
         )
     if isinstance(data, dict) and data.get("result") is False:
         raise OzonAPIError("Ozon отклонил отправку сообщения в чат")
+
+
+async def send_outreach_message(
+    *,
+    chat_id: str,
+    text: str,
+    idempotency_key: str | None = None,
+) -> tuple[bool, str | None, int | None]:
+    client = get_write_client()
+    if client is None:
+        return False, "Нет прав на отправку сообщений в чаты Ozon", None
+
+    text_clean = (text or "").strip()
+    if len(text_clean) < 2:
+        return False, "Текст сообщения пустой или слишком короткий", None
+
+    endpoint = "/v1/chat/send/message"
+    body = {"chat_id": chat_id, "text": text_clean}
+    logger.info(
+        "Outreach send request endpoint=%s payload_keys=%s chat_id=%s idempotency_key=%s",
+        endpoint,
+        sorted(body.keys()),
+        chat_id,
+        idempotency_key,
+    )
+    status_code, data = await client._post_with_status(endpoint, body)
+    snippet = repr(data)[:300] if data is not None else ""
+    logger.info(
+        "Outreach response endpoint=%s status=%s chat_id=%s idempotency_key=%s snippet=%s",
+        endpoint,
+        status_code,
+        chat_id,
+        idempotency_key,
+        snippet,
+    )
+    if status_code >= 400:
+        message = None
+        if isinstance(data, dict):
+            message = data.get("message") or data.get("error")
+        return False, f"HTTP {status_code} {message or data}", status_code
+    if isinstance(data, dict) and data.get("result") is False:
+        return False, "Ozon отклонил отправку сообщения в чат", status_code
+    return True, None, status_code
 
 
 async def get_posting_products(posting_number: str) -> list[str]:
