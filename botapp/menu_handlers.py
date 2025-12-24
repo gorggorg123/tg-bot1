@@ -66,8 +66,10 @@ async def _close_all_sections(
         SECTION_WAREHOUSE_PLAN,
         SECTION_WAREHOUSE_PROMPT,
     ]
+
     if not preserve_menu:
-        sections.append(SECTION_MENU)
+        logger.info("Deleting previous menu for user_id=%s before rendering new one", user_id)
+        await delete_section_message(user_id, SECTION_MENU, bot, force=True)
 
     for sec in sections:
         try:

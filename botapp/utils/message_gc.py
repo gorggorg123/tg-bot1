@@ -84,7 +84,7 @@ async def _safe_delete(bot, chat_id: int, message_id: int) -> bool:
     except (TelegramBadRequest, TelegramForbiddenError) as exc:
         if "message to delete not found" in str(exc).lower():
             logger.warning("Failed to delete message %s/%s: %s", chat_id, message_id, exc)
-            return True
+            return False
         logger.warning("Failed to delete message %s/%s: %s", chat_id, message_id, exc)
         return False
     except Exception:
@@ -310,7 +310,23 @@ async def render_section(
         )
         if edited is NOT_MODIFIED:
             if section == SECTION_MENU:
+                old_menu_ref = _get_ref(user_id, SECTION_MENU)
+                if old_menu_ref and old_menu_ref.message_id != current_mid:
+                    logger.info(
+                        "Deleting old menu message mid=%s for user_id=%s before keeping current mid=%s",
+                        old_menu_ref.message_id,
+                        user_id,
+                        current_mid,
+                    )
+                    deleted_old = await _safe_delete(bot, old_menu_ref.chat_id, old_menu_ref.message_id)
+                    logger.info(
+                        "Old menu delete result user_id=%s old_mid=%s ok=%s",
+                        user_id,
+                        old_menu_ref.message_id,
+                        deleted_old,
+                    )
                 _set_ref(user_id, section, chat_id, current_mid)
+                logger.info("Menu ref set to mid=%s for user_id=%s", current_mid, user_id)
             elif prev:
                 _set_ref(user_id, section, prev.chat_id, prev.message_id)
             return None
@@ -337,21 +353,47 @@ async def render_section(
                 )
                 return None
 
-            if prev and prev.chat_id != chat_id and prev.message_id != trigger_mid:
-                deleted = await _safe_delete(bot, prev.chat_id, prev.message_id)
-                if not deleted:
-                    logger.warning(
-                        "Failed to delete previous section message section=%s user_id=%s mid=%s",
+            if prev and prev.message_id != trigger_mid:
+                need_delete = prev.chat_id != chat_id or section == SECTION_MENU
+                if need_delete:
+                    logger.info(
+                        "Deleting old section message before setting new one section=%s user_id=%s old_mid=%s",
                         section,
                         user_id,
                         prev.message_id,
                     )
+                    deleted = await _safe_delete(bot, prev.chat_id, prev.message_id)
+                    logger.info(
+                        "Old section delete result section=%s user_id=%s old_mid=%s ok=%s",
+                        section,
+                        user_id,
+                        prev.message_id,
+                        deleted,
+                    )
 
             _set_ref(user_id, section, chat_id, sent.message_id)
+            if section == SECTION_MENU:
+                logger.info("Menu ref set to mid=%s for user_id=%s", sent.message_id, user_id)
             return sent
 
         if section == SECTION_MENU:
+            old_menu_ref = _get_ref(user_id, SECTION_MENU)
+            if old_menu_ref and old_menu_ref.message_id != current_mid:
+                logger.info(
+                    "Deleting old menu message mid=%s for user_id=%s before setting new mid=%s",
+                    old_menu_ref.message_id,
+                    user_id,
+                    current_mid,
+                )
+                deleted_old = await _safe_delete(bot, old_menu_ref.chat_id, old_menu_ref.message_id)
+                logger.info(
+                    "Old menu delete result user_id=%s old_mid=%s ok=%s",
+                    user_id,
+                    old_menu_ref.message_id,
+                    deleted_old,
+                )
             _set_ref(user_id, section, chat_id, current_mid)
+            logger.info("Menu ref set to mid=%s for user_id=%s", current_mid, user_id)
         elif prev:
             _set_ref(user_id, section, prev.chat_id, prev.message_id)
         return edited
