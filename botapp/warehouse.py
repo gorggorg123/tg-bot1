@@ -28,6 +28,7 @@ from botapp.utils.message_gc import (
     delete_section_message,
     send_section_message,
 )
+from botapp.menu_handlers import _close_all_sections
 from botapp.ozon_client import OzonClient, get_client, get_posting_details
 from botapp.products_service import (
     CatalogProduct,
@@ -149,6 +150,20 @@ def _deserialize_product(data: Dict[str, Any]) -> Product:
 async def open_warehouse(callback: CallbackQuery, callback_data: MenuCallbackData, state: FSMContext) -> None:
     await callback.answer()
     await state.clear()
+    preserve_mid = callback.message.message_id if callback.message else None
+    logger.info(
+        "Switch section: from=%s to=%s, preserve_menu=%s mid=%s",
+        "menu",
+        SECTION_WAREHOUSE_MENU,
+        True,
+        preserve_mid,
+    )
+    await _close_all_sections(
+        callback.message.bot,
+        callback.from_user.id,
+        preserve_menu=True,
+        preserve_message_id=preserve_mid,
+    )
     await send_section_message(
         SECTION_WAREHOUSE_MENU,
         text="🏬 Раздел склада",
@@ -942,4 +957,3 @@ async def inventory_wait_count(message: Message, state: FSMContext) -> None:
     await message.answer(
         "Инвентаризация: введите следующий BoxID или отправьте \"стоп\" для завершения."
     )
-
