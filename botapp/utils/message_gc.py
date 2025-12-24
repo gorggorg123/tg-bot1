@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Any
 
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
@@ -26,7 +26,6 @@ SECTION_CHAT_PROMPT = "chat_prompt"
 SECTION_FBO = "fbo"
 SECTION_FINANCE_TODAY = "finance_today"
 SECTION_ACCOUNT = "account"
-
 SECTION_WAREHOUSE_MENU = "warehouse_menu"
 SECTION_WAREHOUSE_PLAN = "warehouse_plan"
 SECTION_WAREHOUSE_PROMPT = "warehouse_prompt"
@@ -139,17 +138,27 @@ async def render_section(
 
     return sent
 
-# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ---
+# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ДЛЯ СОВМЕСТИМОСТИ ---
 async def send_section_message(
-    user_id: int, section: str, text: str, 
+    section: str,  # <-- Поменял местами, так как в логе SECTION_MENU идет первым
+    text: str, 
     reply_markup: InlineKeyboardMarkup | None, 
+    user_id: int, 
     bot, 
-    callback: CallbackQuery | None = None
+    callback: CallbackQuery | None = None,
+    **kwargs: Any # <-- Принимаем 'message' и всё остальное, чтобы не падать
 ) -> Message | None:
-    """Правильная обертка для обратной совместимости."""
+    """
+    Универсальная обертка. Принимает аргументы в старом порядке 
+    и игнорирует лишние (например, message).
+    """
     chat_id = user_id
+    
+    # Пытаемся достать chat_id из разных источников
     if callback and callback.message:
         chat_id = callback.message.chat.id
+    elif 'message' in kwargs and hasattr(kwargs['message'], 'chat'):
+        chat_id = kwargs['message'].chat.id
         
     return await render_section(
         section=section,
