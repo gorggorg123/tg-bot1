@@ -1,3 +1,4 @@
+# botapp/db.py
 from __future__ import annotations
 
 import logging
@@ -5,7 +6,8 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint, func, select
+# Добавили Float, JSON для товаров
+from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint, func, select, Float, JSON
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -16,18 +18,20 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 logger = logging.getLogger(__name__)
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
+# Используем переменную окружения или дефолтный путь к файлу
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///bot_storage.db")
 
 engine: AsyncEngine = create_async_engine(DATABASE_URL, echo=False, future=True)
-AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+# ВАЖНО: называем переменную async_session, чтобы другие модули могли её импортировать
+async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
 class Base(DeclarativeBase):
     pass
 
 
+# --- Модель для Отзывов (сохраняем, чтобы не сломать логику ответов) ---
 class ReviewAnswer(Base):
     __tablename__ = "review_answers"
     __table_args__ = (UniqueConstraint("review_id", "telegram_user_id", name="uq_review_user"),)
@@ -46,12 +50,33 @@ class ReviewAnswer(Base):
     )
 
 
-async def init_db() -> None:
-    """Инициализировать БД и создать таблицы."""
+# --- НОВАЯ Модель для Товаров (для products_service) ---
+class ProductModel(Base):
+    __tablename__ = "products"
 
+    sku: Mapped[str] = mapped_column(String, primary_key=True)  # Ozon SKU
+    product_id: Mapped[int] = mapped_column(Integer, index=True)
+    offer_id: Mapped[str] = mapped_column(String, index=True)   # Артикул
+    
+    name: Mapped[str] = mapped_column(String)
+    price: Mapped[float] = mapped_column(Float, default=0.0)
+    currency: Mapped[str] = mapped_column(String, default="RUB")
+    
+    marketing_price: Mapped[float] = mapped_column(Float, nullable=True)
+    quant_size: Mapped[int] = mapped_column(Integer, default=1) # Важно для Эконом товаров
+    
+    raw_data: Mapped[dict] = mapped_column(JSON, default={})
+    
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+async def init_db() -> None:
+    """Инициализировать БД и создать все таблицы."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+
+# --- Функции для работы с отзывами (обновлены под async_session) ---
 
 async def _upsert_answer(
     *,
@@ -61,7 +86,7 @@ async def _upsert_answer(
     final: str | None = None,
     status: str,
 ) -> None:
-    async with AsyncSessionLocal() as session:
+    async with async_session() as session:
         result = await session.execute(
             select(ReviewAnswer).where(
                 ReviewAnswer.review_id == review_id,
@@ -95,27 +120,19 @@ async def _upsert_answer(
 
 
 async def save_draft_answer(user_id: int, review_id: str, text: str) -> None:
-    """Сохранить черновик ответа."""
-
     await _upsert_answer(user_id=user_id, review_id=review_id, draft=text, status="draft")
 
 
 async def save_sent_answer(user_id: int, review_id: str, text: str) -> None:
-    """Сохранить финальный отправленный ответ."""
-
     await _upsert_answer(user_id=user_id, review_id=review_id, final=text, status="sent")
 
 
 async def save_error_answer(user_id: int, review_id: str, text: str | None) -> None:
-    """Зафиксировать ответ со статусом ошибки."""
-
     await _upsert_answer(user_id=user_id, review_id=review_id, draft=text, status="error")
 
 
 async def get_last_answer(user_id: int, review_id: str) -> str | None:
-    """Вернуть финальный ответ, если есть, иначе черновик."""
-
-    async with AsyncSessionLocal() as session:
+    async with async_session() as session:
         result = await session.execute(
             select(ReviewAnswer).where(
                 ReviewAnswer.review_id == review_id,
