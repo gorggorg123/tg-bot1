@@ -34,6 +34,8 @@ from botapp.utils.message_gc import (
     SECTION_WAREHOUSE_PLAN,
     SECTION_WAREHOUSE_PROMPT,
     delete_section_message,
+    get_section_message_id,
+    safe_remove_message,
     send_section_message,
 )
 from botapp.utils.storage import is_outreach_enabled, set_outreach_enabled
@@ -117,6 +119,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 async def menu_home(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
+    trigger_mid = callback.message.message_id if callback.message else None
+    # Меню — якорь: НЕ удаляем меню при возврате домой.
+    # Удаляем все секции, включая trigger-сообщение секции.
     await _close_all_sections(
         callback.message.bot,
         user_id,
@@ -124,12 +129,20 @@ async def menu_home(callback: CallbackQuery, state: FSMContext) -> None:
         preserve_message_id=None,
     )
     await _show_menu(user_id=user_id, callback=callback)
+
+    # Best-effort: если нажатие "домой" было из секции, чистим trigger-сообщение секции,
+    # но никогда не трогаем текущее меню.
+    if trigger_mid is not None:
+        menu_mid = get_section_message_id(user_id, SECTION_MENU)
+        if menu_mid is None or int(menu_mid) != int(trigger_mid):
+            await safe_remove_message(callback.message.bot, callback.message.chat.id, int(trigger_mid))
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "menu"))
 async def menu_alias(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
+    trigger_mid = callback.message.message_id if callback.message else None
     await _close_all_sections(
         callback.message.bot,
         user_id,
@@ -137,6 +150,11 @@ async def menu_alias(callback: CallbackQuery, state: FSMContext) -> None:
         preserve_message_id=None,
     )
     await _show_menu(user_id=user_id, callback=callback)
+
+    if trigger_mid is not None:
+        menu_mid = get_section_message_id(user_id, SECTION_MENU)
+        if menu_mid is None or int(menu_mid) != int(trigger_mid):
+            await safe_remove_message(callback.message.bot, callback.message.chat.id, int(trigger_mid))
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "outreach"))

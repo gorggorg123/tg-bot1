@@ -1,4 +1,4 @@
-# botapp/message_gc.py
+# botapp/utils/message_gc.py
 from __future__ import annotations
 
 import logging
@@ -6,15 +6,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 logger = logging.getLogger(__name__)
 
 NOT_MODIFIED = object()
 
 # -----------------------------------------------------------------------------
-# Section IDs (единый реестр "экранов")
+# Section IDs (единый реестр “экранов”)
 # -----------------------------------------------------------------------------
 
 SECTION_MENU = "menu"
@@ -28,8 +28,8 @@ SECTION_QUESTION_CARD = "question_card"
 SECTION_QUESTION_PROMPT = "question_prompt"
 
 SECTION_CHATS_LIST = "chats_list"
-SECTION_CHAT_HISTORY = "chat_history"   # “шапка” чата с кнопками
-SECTION_CHAT_PROMPT = "chat_prompt"     # ИИ-черновик / репромпт / редактирование
+SECTION_CHAT_HISTORY = "chat_history"  # “шапка” чата с кнопками
+SECTION_CHAT_PROMPT = "chat_prompt"  # ИИ-черновик / репромпт / редактирование
 
 SECTION_FBO = "fbo"
 SECTION_FINANCE_TODAY = "finance_today"
@@ -42,6 +42,7 @@ SECTION_WAREHOUSE_PROMPT = "warehouse_prompt"
 # -----------------------------------------------------------------------------
 # In-memory registry: user_id + section -> (chat_id, message_id)
 # -----------------------------------------------------------------------------
+
 
 @dataclass(slots=True)
 class SectionRef:
@@ -66,7 +67,11 @@ def _get_ref(user_id: int, section: str) -> SectionRef | None:
 
 
 def _set_ref(user_id: int, section: str, chat_id: int, message_id: int) -> None:
-    _REGISTRY[_key(user_id, section)] = SectionRef(chat_id=int(chat_id), message_id=int(message_id), updated_at=_now_utc())
+    _REGISTRY[_key(user_id, section)] = SectionRef(
+        chat_id=int(chat_id),
+        message_id=int(message_id),
+        updated_at=_now_utc(),
+    )
 
 
 def _pop_ref(user_id: int, section: str) -> SectionRef | None:
@@ -74,17 +79,32 @@ def _pop_ref(user_id: int, section: str) -> SectionRef | None:
 
 
 # -----------------------------------------------------------------------------
+# Public getters (нужны, чтобы безопасно убирать trigger-сообщение)
+# -----------------------------------------------------------------------------
+
+
+def get_section_ref(user_id: int, section: str) -> SectionRef | None:
+    """Публичный read-only доступ к реестру секций."""
+    return _get_ref(user_id, section)
+
+
+def get_section_message_id(user_id: int, section: str) -> int | None:
+    ref = _get_ref(user_id, section)
+    return ref.message_id if ref else None
+
+
+# -----------------------------------------------------------------------------
 # Safe Telegram ops
 # -----------------------------------------------------------------------------
 
+
 async def _safe_delete(bot, chat_id: int, message_id: int) -> bool:
+    """deleteMessage. Возвращает True только при реальном успехе."""
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
         return True
     except (TelegramBadRequest, TelegramForbiddenError) as exc:
-        if "message to delete not found" in str(exc).lower():
-            logger.warning("Failed to delete message %s/%s: %s", chat_id, message_id, exc)
-            return False
+        # Важно: "message to delete not found" НЕ считаем успехом.
         logger.warning("Failed to delete message %s/%s: %s", chat_id, message_id, exc)
         return False
     except Exception:
@@ -93,6 +113,7 @@ async def _safe_delete(bot, chat_id: int, message_id: int) -> bool:
 
 
 async def _safe_clear(bot, chat_id: int, message_id: int) -> bool:
+    """Fallback: делаем сообщение пустым (\u200b) и убираем inline-клавиатуру."""
     try:
         res = await bot.edit_message_text(
             chat_id=chat_id,
@@ -103,20 +124,8 @@ async def _safe_clear(bot, chat_id: int, message_id: int) -> bool:
             disable_web_page_preview=True,
         )
         return isinstance(res, Message) or res is None
-    except TelegramBadRequest as exc:
-        if "message is not modified" in str(exc).lower():
-            logger.warning("Failed to clear message %s/%s via edit (not modified): %s", chat_id, message_id, exc)
-            return False
-        if "message to edit not found" in str(exc).lower():
-            logger.warning("Failed to clear message %s/%s via edit (not found): %s", chat_id, message_id, exc)
-            return False
-        if "can't be edited" in str(exc).lower():
-            logger.warning("Failed to clear message %s/%s via edit (cannot edit): %s", chat_id, message_id, exc)
-            return False
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
         logger.warning("Failed to clear message %s/%s via edit: %s", chat_id, message_id, exc)
-        return False
-    except (TelegramForbiddenError,) as exc:
-        logger.warning("Failed to clear message %s/%s: %s", chat_id, message_id, exc)
         return False
     except Exception:
         logger.exception("Unexpected error while clearing message %s/%s", chat_id, message_id)
@@ -132,6 +141,7 @@ async def _safe_edit(
     reply_markup: InlineKeyboardMarkup | None,
     parse_mode: str = "HTML",
 ) -> Optional[Message]:
+    """editMessageText. Возвращает Message / NOT_MODIFIED / None."""
     try:
         res = await bot.edit_message_text(
             chat_id=chat_id,
@@ -148,11 +158,31 @@ async def _safe_edit(
         if "message is not modified" in str(exc).lower():
             return NOT_MODIFIED
         return None
-    except (TelegramForbiddenError,):
+    except TelegramForbiddenError:
         return None
     except Exception:
         logger.exception("Unexpected error while editing message %s/%s", chat_id, message_id)
         return None
+
+
+# -----------------------------------------------------------------------------
+# One-call “remove”: delete -> clear fallback
+# -----------------------------------------------------------------------------
+
+
+async def safe_remove_message(bot, chat_id: int, message_id: int) -> bool:
+    """Удалить сообщение, а если не получилось — зачистить через edit."""
+    ok_del = await _safe_delete(bot, chat_id, message_id)
+    if ok_del:
+        return True
+    logger.info("Clear fallback used for %s/%s", chat_id, message_id)
+    ok_clear = await _safe_clear(bot, chat_id, message_id)
+    return ok_clear
+
+
+# -----------------------------------------------------------------------------
+# Rendering (1 сообщение на секцию)
+# -----------------------------------------------------------------------------
 
 
 async def render_section(
@@ -167,275 +197,99 @@ async def render_section(
     callback: CallbackQuery | None = None,
     mode: str = "edit_trigger",
 ) -> Message | None:
+    """Рендер секции.
+
+    Дизайн:
+      - Для каждой секции хранится ref на единственное сообщение.
+      - Если есть ref в том же чате — редактируем его.
+      - Если редактирование не удалось — отправляем новое и удаляем/зачищаем старое.
+      - Для menu стараемся всегда редактировать menu anchor (ref), а не trigger.
+    """
     parse_mode = parse_mode or "HTML"
 
-    if mode == "section_only":
-        trigger_mid = callback.message.message_id if callback and callback.message else None
-        prev = _get_ref(user_id, section)
+    # Сейчас проект использует только "edit_trigger"; оставляем mode для совместимости.
+    if mode not in {"edit_trigger", "section_only"}:
+        mode = "edit_trigger"
 
-        if prev and prev.chat_id == chat_id:
-            target_message_id = None
-            if prev.message_id == trigger_mid:
-                target_message_id = trigger_mid
-            else:
-                target_message_id = prev.message_id
+    trigger_mid: int | None = None
+    if callback and callback.message:
+        trigger_mid = int(callback.message.message_id)
 
-            edited = await _safe_edit(
-                bot,
-                chat_id=prev.chat_id,
-                message_id=target_message_id,
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode=parse_mode,
-            )
-            if edited is NOT_MODIFIED:
-                _set_ref(user_id, section, prev.chat_id, target_message_id)
-                return None
-            if edited:
-                _set_ref(user_id, section, prev.chat_id, target_message_id)
-                return edited
+    prev = _get_ref(user_id, section)
+    prev_same_chat = bool(prev and prev.chat_id == int(chat_id))
 
+    # 1) Если у секции уже есть сообщение в этом чате — редактируем его.
+    if prev_same_chat:
+        target_mid = int(prev.message_id)
+        edited = await _safe_edit(
+            bot,
+            chat_id=int(chat_id),
+            message_id=target_mid,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
+        if edited is NOT_MODIFIED:
+            _set_ref(user_id, section, int(chat_id), target_mid)
+            return None
+        if edited:
+            _set_ref(user_id, section, int(chat_id), target_mid)
+            return edited
+
+        # edit failed -> send new, remove old
+        logger.info(
+            "Edit failed for section=%s user_id=%s target_mid=%s, sending new message",
+            section,
+            user_id,
+            target_mid,
+        )
         try:
             sent = await bot.send_message(
-                chat_id=chat_id,
+                chat_id=int(chat_id),
                 text=text,
                 reply_markup=reply_markup,
                 parse_mode=parse_mode,
                 disable_web_page_preview=True,
             )
         except Exception:
-            logger.exception("Failed to send section_only message section=%s user_id=%s", section, user_id)
+            logger.exception("Failed to send fallback section message section=%s user_id=%s", section, user_id)
             return None
 
-        if prev and prev.chat_id == chat_id and prev.message_id != trigger_mid:
-            await _safe_delete(bot, prev.chat_id, prev.message_id)
+        if sent.message_id != target_mid:
+            await safe_remove_message(bot, int(chat_id), target_mid)
 
-        _set_ref(user_id, section, chat_id, sent.message_id)
+        _set_ref(user_id, section, int(chat_id), int(sent.message_id))
+        if section == SECTION_MENU:
+            logger.info("Menu ref set to mid=%s for user_id=%s", sent.message_id, user_id)
         return sent
 
-    if callback and callback.message:
-        trigger_mid = callback.message.message_id
-        prev = _get_ref(user_id, section)
-        prev_same_chat = prev and prev.chat_id == chat_id
-
-        if section != SECTION_MENU and not prev_same_chat:
-            try:
-                sent = await bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    reply_markup=reply_markup,
-                    parse_mode=parse_mode,
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to send section message (no prev) section=%s user_id=%s",
-                    section,
-                    user_id,
-                )
-                return None
-            if prev and prev.message_id != trigger_mid:
-                await _safe_delete(bot, prev.chat_id, prev.message_id)
-            _set_ref(user_id, section, chat_id, sent.message_id)
-            return sent
-
-        if prev_same_chat:
-            target_mid = prev.message_id
-            edited = await _safe_edit(
-                bot,
-                chat_id=prev.chat_id,
-                message_id=target_mid,
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode=parse_mode,
-            )
-            if edited is NOT_MODIFIED:
-                _set_ref(user_id, section, prev.chat_id, target_mid)
-                return None
-            if edited is None:
-                logger.info(
-                    "Edit failed for section=%s user_id=%s target_mid=%s, sending new message",
-                    section,
-                    user_id,
-                    target_mid,
-                )
-                try:
-                    sent = await bot.send_message(
-                        chat_id=chat_id,
-                        text=text,
-                        reply_markup=reply_markup,
-                        parse_mode=parse_mode,
-                        disable_web_page_preview=True,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to send fallback section message section=%s user_id=%s",
-                        section,
-                        user_id,
-                    )
-                    return None
-
-                if prev.message_id != sent.message_id and prev.message_id != trigger_mid:
-                    deleted = await _safe_delete(bot, prev.chat_id, prev.message_id)
-                    if not deleted:
-                        logger.warning(
-                            "Failed to delete previous section message section=%s user_id=%s mid=%s",
-                            section,
-                            user_id,
-                            prev.message_id,
-                        )
-
-                _set_ref(user_id, section, chat_id, sent.message_id)
-                return sent
-
-            _set_ref(user_id, section, prev.chat_id, target_mid)
+    # 2) Нет prev в этом чате.
+    #    Для menu: если ref отсутствует, можно попробовать edit trigger, но это рискованно,
+    #    поэтому сначала пытаемся edit trigger, а если не вышло — отправляем новое и (опц.) чистим trigger.
+    if section == SECTION_MENU and trigger_mid is not None:
+        edited = await _safe_edit(
+            bot,
+            chat_id=int(chat_id),
+            message_id=int(trigger_mid),
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
+        if edited is NOT_MODIFIED:
+            _set_ref(user_id, section, int(chat_id), int(trigger_mid))
+            logger.info("Menu ref set to mid=%s for user_id=%s", trigger_mid, user_id)
+            return None
+        if edited:
+            _set_ref(user_id, section, int(chat_id), int(trigger_mid))
+            logger.info("Menu ref set to mid=%s for user_id=%s", trigger_mid, user_id)
             return edited
 
-        current_mid = trigger_mid
-        if prev is None:
-            logger.info(
-                "No previous section message, editing trigger for section=%s user_id=%s mid=%s",
-                section,
-                user_id,
-                current_mid,
-            )
+        logger.info("Edit failed for menu trigger mid=%s user_id=%s, sending new menu", trigger_mid, user_id)
 
-        edited = await _safe_edit(
-            bot,
-            chat_id=chat_id,
-            message_id=current_mid,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode,
-        )
-        if edited is NOT_MODIFIED:
-            if section == SECTION_MENU:
-                old_menu_ref = _get_ref(user_id, SECTION_MENU)
-                if old_menu_ref and old_menu_ref.message_id != current_mid:
-                    logger.info(
-                        "Deleting old menu message mid=%s for user_id=%s before keeping current mid=%s",
-                        old_menu_ref.message_id,
-                        user_id,
-                        current_mid,
-                    )
-                    deleted_old = await _safe_delete(bot, old_menu_ref.chat_id, old_menu_ref.message_id)
-                    logger.info(
-                        "Old menu delete result user_id=%s old_mid=%s ok=%s",
-                        user_id,
-                        old_menu_ref.message_id,
-                        deleted_old,
-                    )
-                _set_ref(user_id, section, chat_id, current_mid)
-                logger.info("Menu ref set to mid=%s for user_id=%s", current_mid, user_id)
-            elif prev:
-                _set_ref(user_id, section, prev.chat_id, prev.message_id)
-            return None
-        if edited is None:
-            logger.info(
-                "Edit failed for section=%s user_id=%s target_mid=%s, sending new message",
-                section,
-                user_id,
-                current_mid,
-            )
-            try:
-                sent = await bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    reply_markup=reply_markup,
-                    parse_mode=parse_mode,
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to send fallback section message section=%s user_id=%s",
-                    section,
-                    user_id,
-                )
-                return None
-
-            if prev and prev.message_id != trigger_mid:
-                need_delete = prev.chat_id != chat_id or section == SECTION_MENU
-                if need_delete:
-                    logger.info(
-                        "Deleting old section message before setting new one section=%s user_id=%s old_mid=%s",
-                        section,
-                        user_id,
-                        prev.message_id,
-                    )
-                    deleted = await _safe_delete(bot, prev.chat_id, prev.message_id)
-                    logger.info(
-                        "Old section delete result section=%s user_id=%s old_mid=%s ok=%s",
-                        section,
-                        user_id,
-                        prev.message_id,
-                        deleted,
-                    )
-
-            _set_ref(user_id, section, chat_id, sent.message_id)
-            if section == SECTION_MENU:
-                logger.info("Menu ref set to mid=%s for user_id=%s", sent.message_id, user_id)
-            return sent
-
-        if section == SECTION_MENU:
-            old_menu_ref = _get_ref(user_id, SECTION_MENU)
-            if old_menu_ref and old_menu_ref.message_id != current_mid:
-                logger.info(
-                    "Deleting old menu message mid=%s for user_id=%s before setting new mid=%s",
-                    old_menu_ref.message_id,
-                    user_id,
-                    current_mid,
-                )
-                deleted_old = await _safe_delete(bot, old_menu_ref.chat_id, old_menu_ref.message_id)
-                logger.info(
-                    "Old menu delete result user_id=%s old_mid=%s ok=%s",
-                    user_id,
-                    old_menu_ref.message_id,
-                    deleted_old,
-                )
-            _set_ref(user_id, section, chat_id, current_mid)
-            logger.info("Menu ref set to mid=%s for user_id=%s", current_mid, user_id)
-        elif prev:
-            _set_ref(user_id, section, prev.chat_id, prev.message_id)
-        return edited
-
-    prev = _get_ref(user_id, section)
-    if prev and prev.chat_id == chat_id:
-        edited = await _safe_edit(
-            bot,
-            chat_id=prev.chat_id,
-            message_id=prev.message_id,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode,
-        )
-        if edited is NOT_MODIFIED:
-            _set_ref(user_id, section, prev.chat_id, prev.message_id)
-            return None
-        if edited is None:
-            try:
-                sent = await bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    reply_markup=reply_markup,
-                    parse_mode=parse_mode,
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                logger.exception("Failed to send section message section=%s user_id=%s", section, user_id)
-                return None
-
-            if prev:
-                await _safe_delete(bot, prev.chat_id, prev.message_id)
-
-            _set_ref(user_id, section, chat_id, sent.message_id)
-            return sent
-
-        _set_ref(user_id, section, prev.chat_id, prev.message_id)
-        return edited
-
+    # 3) Отправляем новое сообщение секции.
     try:
         sent = await bot.send_message(
-            chat_id=chat_id,
+            chat_id=int(chat_id),
             text=text,
             reply_markup=reply_markup,
             parse_mode=parse_mode,
@@ -445,16 +299,28 @@ async def render_section(
         logger.exception("Failed to send section message section=%s user_id=%s", section, user_id)
         return None
 
+    # 4) Удаляем/зачищаем предыдущее сообщение секции (если было), кроме trigger (его обычно хочет убрать GC секций).
     if prev:
-        await _safe_delete(bot, prev.chat_id, prev.message_id)
+        if not (trigger_mid is not None and int(prev.message_id) == int(trigger_mid)):
+            await safe_remove_message(bot, int(prev.chat_id), int(prev.message_id))
 
-    _set_ref(user_id, section, chat_id, sent.message_id)
+    _set_ref(user_id, section, int(chat_id), int(sent.message_id))
+    if section == SECTION_MENU:
+        logger.info("Menu ref set to mid=%s for user_id=%s", sent.message_id, user_id)
+
+    # Если мы вынужденно отправили новое меню при callback — можно попытаться убрать trigger, чтобы не оставалось дублей.
+    # Но только если trigger не равен новому menu mid.
+    if section == SECTION_MENU and trigger_mid is not None and int(trigger_mid) != int(sent.message_id):
+        # Никаких попов/реестров тут: просто best-effort очистка.
+        await safe_remove_message(bot, int(chat_id), int(trigger_mid))
+
     return sent
 
 
 # -----------------------------------------------------------------------------
-# Public API: send/update one “section message”
+# Public API
 # -----------------------------------------------------------------------------
+
 
 async def send_section_message(
     section: str,
@@ -465,11 +331,7 @@ async def send_section_message(
     message: Message | None = None,
     user_id: int | None = None,
 ) -> Message | None:
-    """
-    Единая точка для “экранов”:
-      - если секция уже есть: пытаемся редактировать существующее сообщение
-      - если не получается: отправляем новое, а старое (если было) — удаляем
-    """
+    """Единая точка для “экранов” (sections)."""
     if callback is None and message is None:
         return None
 
@@ -485,19 +347,18 @@ async def send_section_message(
     if user_id is None:
         return None
 
-    chat_id = None
     if callback and callback.message and callback.message.chat:
         chat_id = callback.message.chat.id
     elif message and message.chat:
         chat_id = message.chat.id
-    if chat_id is None:
+    else:
         return None
 
     return await render_section(
         section,
         bot=bot,
-        chat_id=chat_id,
-        user_id=user_id,
+        chat_id=int(chat_id),
+        user_id=int(user_id),
         text=text,
         reply_markup=reply_markup,
         parse_mode="HTML",
@@ -514,20 +375,13 @@ async def delete_section_message(
     force: bool = False,
     preserve_message_id: int | None = None,
 ) -> bool:
-    """
-    Удаляет сообщение секции, если оно зарегистрировано.
-    """
+    """Удаляет сообщение секции, если оно зарегистрировано."""
     ref = _get_ref(user_id, section)
     if not ref:
         return False
 
     if preserve_message_id is not None and int(preserve_message_id) == int(ref.message_id):
-        logger.info(
-            "Preserve mid=%s section=%s user_id=%s -> dropping ref",
-            preserve_message_id,
-            section,
-            user_id,
-        )
+        logger.info("Preserve mid=%s section=%s user_id=%s -> dropping ref", preserve_message_id, section, user_id)
         popped = _pop_ref(user_id, section)
         if popped:
             logger.info("Popped ref for section=%s user_id=%s", section, user_id)
@@ -542,48 +396,30 @@ async def delete_section_message(
         force,
         preserve_message_id,
     )
-    ok_del = await _safe_delete(bot, ref.chat_id, ref.message_id)
+
+    ok = await safe_remove_message(bot, int(ref.chat_id), int(ref.message_id))
     logger.info(
         "Delete attempt result section=%s user_id=%s chat_id=%s mid=%s ok=%s",
         section,
         user_id,
         ref.chat_id,
         ref.message_id,
-        ok_del,
+        ok,
     )
-    ok_clear = False
-    if not ok_del:
-        logger.info("Clear fallback used for %s/%s", ref.chat_id, ref.message_id)
-        logger.info(
-            "Clearing section message via edit section=%s user_id=%s chat_id=%s mid=%s",
-            section,
-            user_id,
-            ref.chat_id,
-            ref.message_id,
-        )
-        ok_clear = await _safe_clear(bot, ref.chat_id, ref.message_id)
-        logger.info(
-            "Clear attempt result section=%s user_id=%s chat_id=%s mid=%s ok=%s",
-            section,
-            user_id,
-            ref.chat_id,
-            ref.message_id,
-            ok_clear,
-        )
 
-    ok = ok_del or ok_clear
     if ok:
         popped = _pop_ref(user_id, section)
         if popped:
             logger.info("Popped ref for section=%s user_id=%s", section, user_id)
+        return True
 
     if force:
-        if not ok:
-            popped = _pop_ref(user_id, section)
-            if popped:
-                logger.info("Force pop ref for section=%s user_id=%s", section, user_id)
+        popped = _pop_ref(user_id, section)
+        if popped:
+            logger.info("Force pop ref for section=%s user_id=%s", section, user_id)
         return True
-    return ok
+
+    return False
 
 
 __all__ = [
@@ -603,6 +439,10 @@ __all__ = [
     "SECTION_WAREHOUSE_MENU",
     "SECTION_WAREHOUSE_PLAN",
     "SECTION_WAREHOUSE_PROMPT",
+    "SectionRef",
+    "get_section_ref",
+    "get_section_message_id",
+    "safe_remove_message",
     "render_section",
     "send_section_message",
     "delete_section_message",
