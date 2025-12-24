@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 NOT_MODIFIED = object()
 
-# --- СЕКЦИИ (Константы) ---
+# --- СЕКЦИИ ---
 SECTION_MENU = "menu"
 SECTION_REVIEWS_LIST = "reviews_list"
 SECTION_REVIEW_CARD = "review_card"
@@ -27,7 +27,6 @@ SECTION_FBO = "fbo"
 SECTION_FINANCE_TODAY = "finance_today"
 SECTION_ACCOUNT = "account"
 
-# Складские секции
 SECTION_WAREHOUSE_MENU = "warehouse_menu"
 SECTION_WAREHOUSE_PLAN = "warehouse_plan"
 SECTION_WAREHOUSE_PROMPT = "warehouse_prompt"
@@ -59,12 +58,9 @@ def _set_ref(user_id: int, section: str, chat_id: int, message_id: int) -> None:
 def _pop_ref(user_id: int, section: str) -> SectionRef | None:
     return _REGISTRY.pop(_key(user_id, section), None)
 
-# --- ВОТ ЭТОЙ ФУНКЦИИ НЕ ХВАТАЛО ---
 def get_section_message_id(user_id: int, section: str) -> int | None:
-    """Вернуть ID сообщения секции, если оно есть в реестре."""
     ref = _get_ref(user_id, section)
     return ref.message_id if ref else None
-# -------------------------------------------
 
 # --- БЕЗОПАСНЫЕ МЕТОДЫ TG ---
 
@@ -138,10 +134,32 @@ async def render_section(
     _set_ref(user_id, section, chat_id, sent.message_id)
 
     if trigger_mid and trigger_mid != sent.message_id:
-         if target_mid != trigger_mid: 
+        if target_mid != trigger_mid:
             await safe_remove_message(bot, chat_id, trigger_mid)
 
     return sent
+
+# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ---
+async def send_section_message(
+    user_id: int, section: str, text: str, 
+    reply_markup: InlineKeyboardMarkup | None, 
+    bot, 
+    callback: CallbackQuery | None = None
+) -> Message | None:
+    """Правильная обертка для обратной совместимости."""
+    chat_id = user_id
+    if callback and callback.message:
+        chat_id = callback.message.chat.id
+        
+    return await render_section(
+        section=section,
+        bot=bot,
+        chat_id=chat_id,
+        user_id=user_id,
+        text=text,
+        reply_markup=reply_markup,
+        callback=callback
+    )
 
 async def delete_section_message(user_id: int, section: str, bot, force=False, preserve_message_id=None) -> bool:
     ref = _get_ref(user_id, section)
