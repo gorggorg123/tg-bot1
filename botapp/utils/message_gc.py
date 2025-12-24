@@ -27,11 +27,10 @@ SECTION_FBO = "fbo"
 SECTION_FINANCE_TODAY = "finance_today"
 SECTION_ACCOUNT = "account"
 
-# --- ВОТ ЭТИХ КОНСТАНТ НЕ ХВАТАЛО ---
+# Складские секции
 SECTION_WAREHOUSE_MENU = "warehouse_menu"
 SECTION_WAREHOUSE_PLAN = "warehouse_plan"
 SECTION_WAREHOUSE_PROMPT = "warehouse_prompt"
-# ------------------------------------
 
 @dataclass(slots=True)
 class SectionRef:
@@ -59,6 +58,13 @@ def _set_ref(user_id: int, section: str, chat_id: int, message_id: int) -> None:
 
 def _pop_ref(user_id: int, section: str) -> SectionRef | None:
     return _REGISTRY.pop(_key(user_id, section), None)
+
+# --- ВОТ ЭТОЙ ФУНКЦИИ НЕ ХВАТАЛО ---
+def get_section_message_id(user_id: int, section: str) -> int | None:
+    """Вернуть ID сообщения секции, если оно есть в реестре."""
+    ref = _get_ref(user_id, section)
+    return ref.message_id if ref else None
+# -------------------------------------------
 
 # --- БЕЗОПАСНЫЕ МЕТОДЫ TG ---
 
