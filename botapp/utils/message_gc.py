@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 NOT_MODIFIED = object()
 
-# --- СЕКЦИИ ---
+# --- СЕКЦИИ (Константы) ---
 SECTION_MENU = "menu"
 SECTION_REVIEWS_LIST = "reviews_list"
 SECTION_REVIEW_CARD = "review_card"
@@ -26,7 +26,12 @@ SECTION_CHAT_PROMPT = "chat_prompt"
 SECTION_FBO = "fbo"
 SECTION_FINANCE_TODAY = "finance_today"
 SECTION_ACCOUNT = "account"
+
+# --- ВОТ ЭТИХ КОНСТАНТ НЕ ХВАТАЛО ---
 SECTION_WAREHOUSE_MENU = "warehouse_menu"
+SECTION_WAREHOUSE_PLAN = "warehouse_plan"
+SECTION_WAREHOUSE_PROMPT = "warehouse_prompt"
+# ------------------------------------
 
 @dataclass(slots=True)
 class SectionRef:
@@ -81,7 +86,6 @@ async def _safe_edit(bot, chat_id: int, message_id: int, text: str, reply_markup
         return None
 
 async def safe_remove_message(bot, chat_id: int, message_id: int) -> bool:
-    """Пытаемся удалить, если не вышло — игнорируем (значит уже удалено)"""
     return await _safe_delete(bot, chat_id, message_id)
 
 # --- ГЛАВНАЯ ЛОГИКА ---
@@ -100,13 +104,11 @@ async def render_section(
     prev = _get_ref(user_id, section)
     target_mid: int | None = None
 
-    # ЛОГИКА ВОССТАНОВЛЕНИЯ: Если реестр пуст, но нажали кнопку — захватываем сообщение
     if prev and prev.chat_id == int(chat_id):
         target_mid = int(prev.message_id)
     elif trigger_mid is not None:
         target_mid = int(trigger_mid)
 
-    # 1. Пробуем редактировать
     if target_mid:
         edited = await _safe_edit(bot, chat_id, target_mid, text, reply_markup, parse_mode)
         if edited is NOT_MODIFIED:
@@ -116,10 +118,8 @@ async def render_section(
             _set_ref(user_id, section, int(chat_id), target_mid)
             return edited
         
-        # Если редактирование не удалось (удалили сообщение) — чистим труп
         await safe_remove_message(bot, chat_id, target_mid)
 
-    # 2. Отправляем новое
     try:
         sent = await bot.send_message(
             chat_id=chat_id, text=text, reply_markup=reply_markup,
@@ -131,7 +131,6 @@ async def render_section(
 
     _set_ref(user_id, section, chat_id, sent.message_id)
 
-    # 3. Чистим старый триггер (если это было нажатие на кнопку старого сообщения)
     if trigger_mid and trigger_mid != sent.message_id:
          if target_mid != trigger_mid: 
             await safe_remove_message(bot, chat_id, trigger_mid)
@@ -139,7 +138,6 @@ async def render_section(
     return sent
 
 async def delete_section_message(user_id: int, section: str, bot, force=False, preserve_message_id=None) -> bool:
-    """Атомарное удаление: сначала из памяти, потом из TG"""
     ref = _get_ref(user_id, section)
     if not ref: return False
 
@@ -147,7 +145,6 @@ async def delete_section_message(user_id: int, section: str, bot, force=False, p
         _pop_ref(user_id, section)
         return True
 
-    # Атомарный pop (чтобы избежать гонки потоков)
     popped = _pop_ref(user_id, section)
     if not popped: return False
 
