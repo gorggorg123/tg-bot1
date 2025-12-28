@@ -111,7 +111,7 @@ async def _show_question_card(
     message: Message | None = None,
     force_refresh: bool = False,
 ) -> None:
-    q = resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
+    q = await resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
     qid = getattr(q, "id", None) if q else None
 
     if force_refresh:
@@ -205,7 +205,7 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
         return
 
     if action == "prefill":
-        q = resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
+        q = await resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
         if not q:
             await send_ephemeral_message(callback, text="⚠️ Вопрос не найден.")
             return
@@ -231,7 +231,7 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
         return
 
     if action in ("clear", "clear_draft"):
-        q = resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
+        q = await resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
         if not q:
             await send_ephemeral_message(callback, text="⚠️ Вопрос не найден.")
             return
@@ -253,10 +253,17 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
         return
 
     if action in ("ai", "card_ai"):
-        q = resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
+        q = await resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
         if not q:
-            await send_ephemeral_message(callback, text="⚠️ Вопрос не найден.")
-            return
+            await refresh_questions(user_id, category="all", force=True)
+            q = await resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
+            if not q:
+                try:
+                    await callback.answer("⚠️ Вопрос не найден. Нажми «Обновить» в списке.", show_alert=True)
+                except Exception:
+                    await send_ephemeral_message(callback, text="⚠️ Вопрос не найден. Нажми «Обновить» в списке.")
+                logger.warning("Question not found for AI action", extra={"token": token, "action": action, "user_id": user_id})
+                return
 
         if not (q.question_text or "").strip():
             await send_ephemeral_message(callback, text="⚠️ Нет текста вопроса.")
@@ -265,6 +272,7 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
         saved = get_question_answer(q.id) or {}
         previous = (saved.get("answer") or "").strip() or None
 
+        logger.info("AI draft for question: user_id=%s qid=%s sku=%s", user_id, q.id, getattr(q, "sku", None))
         try:
             draft = await generate_answer_for_question(
                 q.question_text or "",
@@ -343,7 +351,7 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
         return
 
     if action == "send":
-        q = resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
+        q = await resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
         if not q:
             await send_ephemeral_message(callback, text="⚠️ Вопрос не найден.")
             return
@@ -435,7 +443,7 @@ async def question_reprompt_text(message: Message, state: FSMContext) -> None:
     category = (payload.get("category") or "all").strip()
     page = int(payload.get("page") or 0)
 
-    q = resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
+    q = await resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
     if not q:
         await send_ephemeral_message(message, text="⚠️ Вопрос не найден. Открой карточку заново.")
         return
@@ -492,7 +500,7 @@ async def question_manual_text(message: Message, state: FSMContext) -> None:
     category = (payload.get("category") or "all").strip()
     page = int(payload.get("page") or 0)
 
-    q = resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
+    q = await resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
     if not q:
         await send_ephemeral_message(message, text="⚠️ Вопрос не найден. Открой карточку заново.")
         return
