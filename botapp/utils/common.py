@@ -54,7 +54,7 @@ async def send_ephemeral_message(
         msg = await target.answer(text)
         asyncio.create_task(_delete_after(target.bot, msg.chat.id, msg.message_id, ttl))
     except Exception:
-        logger.debug("Failed to send ephemeral message", exc_info=True)
+        logger.exception("Failed to send ephemeral message")
         return
 
 

@@ -272,7 +272,7 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
         saved = get_question_answer(q.id) or {}
         previous = (saved.get("answer") or "").strip() or None
 
-        logger.info("AI draft for question: user_id=%s qid=%s sku=%s", user_id, q.id, getattr(q, "sku", None))
+        logger.info("AI start: user_id=%s qid=%s sku=%s", user_id, q.id, getattr(q, "sku", None))
         try:
             draft = await generate_answer_for_question(
                 q.question_text or "",
@@ -282,7 +282,8 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
                 user_prompt=None,
             )
         except Exception as exc:
-            await send_ephemeral_message(callback, text=f"⚠️ ИИ-ответ не получился: {exc}")
+            logger.exception("AI failed for question qid=%s token=%s", q.id if q else None, token)
+            await send_ephemeral_message(callback, text=f"⚠️ ИИ-ответ не получился: {exc}", as_alert=True)
             return
 
         draft = (draft or "").strip()
