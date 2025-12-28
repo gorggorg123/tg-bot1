@@ -171,6 +171,7 @@ async def _chat_completion(
     retries = 2
     last_err: Exception | None = None
 
+    logger.info("OpenAI request: model=%s max_tokens=%s", cfg.model, max_tokens)
     async with httpx.AsyncClient(timeout=httpx.Timeout(cfg.timeout_s)) as client:
         for attempt in range(retries + 1):
             try:
@@ -182,6 +183,7 @@ async def _chat_completion(
                     msg = choices[0].get("message") if isinstance(choices[0], dict) else None
                     content = (msg or {}).get("content") if isinstance(msg, dict) else None
                     if isinstance(content, str):
+                        logger.info("OpenAI ok: chars=%s", len(content))
                         return _normalize(content)
                 raise AIClientError(f"Некорректный ответ OpenAI: {data}")
             except Exception as exc:
@@ -190,6 +192,7 @@ async def _chat_completion(
                     break
                 await asyncio.sleep(0.6 + attempt * 0.8)
 
+    logger.warning("OpenAI failed: %r", last_err)
     raise AIClientError(f"OpenAI запрос не удался: {last_err}")
 
 
@@ -315,7 +318,7 @@ async def generate_answer_for_question(
         user.append(user_prompt)
 
     examples_block = _examples_block(
-        "question", input_text=question_text, product_id=sku
+        "question", input_text=question_text, product_id=str(sku) if sku is not None else None
     )
     if examples_block:
         sys = sys + "\n\n" + examples_block

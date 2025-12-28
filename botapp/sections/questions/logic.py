@@ -39,6 +39,8 @@ INITIAL_QUESTIONS_TARGET = QUESTIONS_PAGE_SIZE * 3
 # Время жизни кеша списка вопросов
 CACHE_TTL_SECONDS = 120
 SESSION_TTL = timedelta(seconds=CACHE_TTL_SECONDS)
+# Время жизни токенов для callback-данных карточек
+TOKEN_TTL_SECONDS = 3600
 
 # Кеш ответа по вопросу (question_id -> answer payload)
 ANSWER_CACHE_TTL = timedelta(minutes=30)
@@ -75,7 +77,7 @@ class QuestionsSession:
 
 # user_id -> QuestionsSession
 _sessions: Dict[int, QuestionsSession] = {}
-_question_tokens = TokenStore(ttl_seconds=CACHE_TTL_SECONDS)
+_question_tokens = TokenStore(ttl_seconds=TOKEN_TTL_SECONDS)
 _answer_text_cache: Dict[str, tuple[Dict[str, Optional[str]], datetime]] = {}
 
 
@@ -340,7 +342,6 @@ async def refresh_questions(user_id: int, category: str = "all", *, force: bool 
     session.unanswered = _filter_by_category(questions, "unanswered")
     session.answered = _filter_by_category(questions, "answered")
     session.loaded_at = datetime.utcnow()
-    _question_tokens.clear(user_id)
 
     for q in questions:
         existing_answer = safe_strip(getattr(q, "answer_text", None))
@@ -737,18 +738,34 @@ def register_question_token(user_id: int, category: str, index: int) -> str:
     """Регистрируем короткий токен для ссылок на вопрос из callback_data."""
 
     question = get_question_by_index(user_id, category, index)
-    key = getattr(question, "id", None) if question else None
-    return _question_tokens.generate(user_id, (category, index), key=key)
+    if not question:
+        return _question_tokens.generate(user_id, ("miss", category, index))
+
+    qid = str(getattr(question, "id", ""))
+    return _question_tokens.generate(user_id, qid, key=qid)
 
 
-def resolve_question_token(user_id: int, token: str) -> Optional[Question]:
+async def resolve_question_token(user_id: int, token: str) -> Optional[Question]:
     """Восстанавливаем объект Question по токену, если он ещё в кеше."""
 
-    category_index = _question_tokens.resolve(user_id, token)
-    if not category_index:
+    qid = _question_tokens.resolve(user_id, token)
+    if not qid:
         return None
-    category, index = category_index
-    return get_question_by_index(user_id, category, index)
+
+    session = _get_session(user_id)
+    cache_stale = not is_cache_fresh(session.loaded_at, CACHE_TTL_SECONDS)
+
+    q = find_question(user_id, qid)
+    if q and not cache_stale:
+        return q
+
+    try:
+        await refresh_questions(user_id, "all", force=True)
+    except Exception:
+        logger.debug("Failed to refresh questions on token resolve user_id=%s", user_id)
+        return None
+
+    return find_question(user_id, qid)
 
 
 __all__ = [
