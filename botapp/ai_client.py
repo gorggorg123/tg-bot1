@@ -318,7 +318,7 @@ async def generate_answer_for_question(
         user.append(user_prompt)
 
     examples_block = _examples_block(
-        "question", input_text=question_text, product_id=sku
+        "question", input_text=question_text, product_id=str(sku) if sku is not None else None
     )
     if examples_block:
         sys = sys + "\n\n" + examples_block
