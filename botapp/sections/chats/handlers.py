@@ -121,12 +121,41 @@ async def _send_bubbles(
 ) -> None:
     key = _bkey(user_id, ozon_chat_id)
     _CHAT_BUBBLES[key] = []
+    sent_ids: list[int] = []
 
+    async def _track_or_cleanup(mid: int | None) -> bool:
+        bucket = _CHAT_BUBBLES.get(key)
+        if bucket is None:
+            targets = list(sent_ids)
+            if mid is not None:
+                targets.append(mid)
+            if targets:
+                logger.info(
+                    "Chat bubbles closed early, cleaning up %d orphan messages for key=%s",
+                    len(targets),
+                    key,
+                )
+            for tid in targets:
+                await safe_delete_message(bot, chat_id, tid)
+            return False
+
+        if mid is not None:
+            bucket.append(mid)
+            sent_ids.append(mid)
+        return True
+
+    active = True
     for msg in messages:
+        if _CHAT_BUBBLES.get(key) is None:
+            await _track_or_cleanup(None)
+            break
+
         bubble_text = _bubble_text(msg)
         if bubble_text.strip():
             sent = await bot.send_message(chat_id, bubble_text, parse_mode="HTML")
-            _CHAT_BUBBLES[key].append(sent.message_id)
+            active = await _track_or_cleanup(sent.message_id)
+            if not active:
+                break
 
         if not msg.media_urls:
             continue
@@ -138,17 +167,27 @@ async def _send_bubbles(
             caption += f"\n<i>{tm}</i>"
 
         for url in msg.media_urls:
+            if _CHAT_BUBBLES.get(key) is None:
+                await _track_or_cleanup(None)
+                active = False
+                break
             try:
                 content, filename, _content_type = await download_chat_file(url)
                 fname = filename or url.rsplit("/", 1)[-1] or "photo.jpg"
                 photo = BufferedInputFile(content, filename=fname)
                 sent_photo = await bot.send_photo(chat_id, photo, caption=caption, parse_mode="HTML")
-                _CHAT_BUBBLES[key].append(sent_photo.message_id)
+                active = await _track_or_cleanup(sent_photo.message_id)
+                if not active:
+                    break
             except Exception:
                 logger.exception("Failed to send chat photo from %s", url)
                 fallback = f"{role_label}: {url}"
                 sent = await bot.send_message(chat_id, fallback)
-                _CHAT_BUBBLES[key].append(sent.message_id)
+                active = await _track_or_cleanup(sent.message_id)
+                if not active:
+                    break
+        if not active:
+            break
 
 
 def _load_ai_state(user_id: int, chat_id: str) -> ChatAIState:

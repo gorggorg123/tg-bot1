@@ -132,6 +132,12 @@ async def _safe_clear(bot, chat_id: int, message_id: int) -> bool:
         )
         return isinstance(res, Message) or res is None
     except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        msg = str(exc).lower()
+        if "message to edit not found" in msg:
+            logger.info("Message already absent while clearing %s/%s", chat_id, message_id)
+            return True
+        if "message is not modified" in msg:
+            return True
         logger.warning("Failed to clear message %s/%s via edit: %s", chat_id, message_id, exc)
         return False
     except Exception:
