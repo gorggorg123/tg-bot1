@@ -55,6 +55,25 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _coerce_positive_sku(*candidates) -> int | None:
+    for cand in candidates:
+        if cand is None:
+            continue
+        try:
+            s = str(cand).strip()
+        except Exception:
+            continue
+        if not s.isdigit():
+            continue
+        try:
+            v = int(s)
+        except Exception:
+            continue
+        if v > 0:
+            return v
+    return None
+
+
 async def _show_questions_list(
     *,
     user_id: int,
@@ -111,7 +130,7 @@ async def _show_question_card(
     message: Message | None = None,
     force_refresh: bool = False,
 ) -> None:
-    q = resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
+    q = await resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
     qid = getattr(q, "id", None) if q else None
 
     if force_refresh:
@@ -205,7 +224,7 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
         return
 
     if action == "prefill":
-        q = resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
+        q = await resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
         if not q:
             await send_ephemeral_message(callback, text="⚠️ Вопрос не найден.")
             return
@@ -231,7 +250,7 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
         return
 
     if action in ("clear", "clear_draft"):
-        q = resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
+        q = await resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
         if not q:
             await send_ephemeral_message(callback, text="⚠️ Вопрос не найден.")
             return
@@ -253,10 +272,17 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
         return
 
     if action in ("ai", "card_ai"):
-        q = resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
+        q = await resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
         if not q:
-            await send_ephemeral_message(callback, text="⚠️ Вопрос не найден.")
-            return
+            await refresh_questions(user_id, category="all", force=True)
+            q = await resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
+            if not q:
+                try:
+                    await callback.answer("⚠️ Вопрос не найден. Нажми «Обновить» в списке.", show_alert=True)
+                except Exception:
+                    await send_ephemeral_message(callback, text="⚠️ Вопрос не найден. Нажми «Обновить» в списке.")
+                logger.warning("Question not found for AI action", extra={"token": token, "action": action, "user_id": user_id})
+                return
 
         if not (q.question_text or "").strip():
             await send_ephemeral_message(callback, text="⚠️ Нет текста вопроса.")
@@ -265,6 +291,7 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
         saved = get_question_answer(q.id) or {}
         previous = (saved.get("answer") or "").strip() or None
 
+        logger.info("AI start: user_id=%s qid=%s sku=%s", user_id, q.id, getattr(q, "sku", None))
         try:
             draft = await generate_answer_for_question(
                 q.question_text or "",
@@ -274,7 +301,8 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
                 user_prompt=None,
             )
         except Exception as exc:
-            await send_ephemeral_message(callback, text=f"⚠️ ИИ-ответ не получился: {exc}")
+            logger.exception("AI failed for question qid=%s token=%s", q.id if q else None, token)
+            await send_ephemeral_message(callback, text=f"⚠️ ИИ-ответ не получился: {exc}", as_alert=True)
             return
 
         draft = (draft or "").strip()
@@ -343,7 +371,7 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
         return
 
     if action == "send":
-        q = resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
+        q = await resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
         if not q:
             await send_ephemeral_message(callback, text="⚠️ Вопрос не найден.")
             return
@@ -358,14 +386,16 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
             await send_ephemeral_message(callback, text="⚠️ Нет write-доступа к Ozon (ключи OZON_WRITE_*).")
             return
 
-        sku = None
+        sku = _coerce_positive_sku(q.sku, getattr(q, "product_id", None))
+        if sku is None:
+            logger.warning("Cannot determine SKU for question send: qid=%s raw_sku=%r raw_pid=%r", q.id, getattr(q, "sku", None), getattr(q, "product_id", None))
+            await send_ephemeral_message(callback, text="⚠️ Не удалось определить SKU для отправки ответа. Нажмите «Обновить» и попробуйте снова.", as_alert=True)
+            return
         try:
-            sku = int(q.sku) if (q.sku or "").isdigit() else None
-        except Exception:
-            sku = None
-
-        try:
-            await send_question_answer(q.id, draft, sku=sku)
+            ok = await send_question_answer(q.id, draft, sku=sku)
+            if ok is False:
+                await send_ephemeral_message(callback, text="⚠️ Не удалось отправить ответ: отсутствует SKU. Обновите список и попробуйте снова.", as_alert=True)
+                return
         except OzonAPIError as exc:
             await send_ephemeral_message(callback, text=f"⚠️ Ozon отклонил отправку: {exc}")
             return
@@ -435,7 +465,7 @@ async def question_reprompt_text(message: Message, state: FSMContext) -> None:
     category = (payload.get("category") or "all").strip()
     page = int(payload.get("page") or 0)
 
-    q = resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
+    q = await resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
     if not q:
         await send_ephemeral_message(message, text="⚠️ Вопрос не найден. Открой карточку заново.")
         return
@@ -492,7 +522,7 @@ async def question_manual_text(message: Message, state: FSMContext) -> None:
     category = (payload.get("category") or "all").strip()
     page = int(payload.get("page") or 0)
 
-    q = resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
+    q = await resolve_question_token(user_id, token) or resolve_question_id(user_id, token)
     if not q:
         await send_ephemeral_message(message, text="⚠️ Вопрос не найден. Открой карточку заново.")
         return

@@ -161,7 +161,7 @@ class ApprovedMemoryStore:
             return []
 
         tokens = self._tokenize(text)
-        pid_clean = (product_id or "").strip()
+        pid_clean = str(product_id or "").strip()
 
         with self._lock, sqlite3.connect(self.path) as conn:
             cur = conn.execute(

@@ -10,8 +10,9 @@ logger = logging.getLogger(__name__)
 
 
 def fetch_examples(
-    *, kind: str, input_text: str, product_id: str | None = None, limit: int = 5
+    *, kind: str, input_text: str, product_id: str | int | None = None, limit: int = 5
 ) -> List[ApprovedAnswer]:
+    product_id = None if product_id is None else str(product_id)
     store = get_approved_memory_store()
     examples = store.query_similar(kind=kind, input_text=input_text, product_id=product_id, limit=limit)
     if examples:

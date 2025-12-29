@@ -46,23 +46,15 @@ async def send_ephemeral_message(
     if not text:
         return
 
-    if isinstance(target, CallbackQuery):
-        try:
-            await target.answer(text, show_alert=bool(as_alert))
-            return
-        except Exception:
-            # fallback: если answer не работает — попробуем отправить сообщением
-            try:
-                msg = await target.message.answer(text)
-                asyncio.create_task(_delete_after(target.message.bot, msg.chat.id, msg.message_id, ttl))
-            except Exception:
-                return
-        return
-
     try:
+        if isinstance(target, CallbackQuery):
+            await target.answer(text=text, show_alert=bool(as_alert))
+            return
+
         msg = await target.answer(text)
         asyncio.create_task(_delete_after(target.bot, msg.chat.id, msg.message_id, ttl))
     except Exception:
+        logger.exception("Failed to send ephemeral message")
         return
 
 

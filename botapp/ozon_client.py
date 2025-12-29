@@ -2473,7 +2473,7 @@ async def get_questions_list(
     return result
 
 
-async def send_question_answer(question_id: str, text: str, *, sku: int | None = None) -> None:
+async def send_question_answer(question_id: str, text: str, *, sku: int | None = None) -> bool:
     client = get_write_client()
     if client is None:
         raise OzonAPIError("Нет прав на отправку ответов в Ozon")
@@ -2482,6 +2482,10 @@ async def send_question_answer(question_id: str, text: str, *, sku: int | None =
     if len(text_clean) < 2:
         raise OzonAPIError("Ответ пустой или слишком короткий, сначала отредактируйте текст")
 
+    if not sku or int(sku) <= 0:
+        logger.warning("question_answer_create: invalid sku=%r for question_id=%s", sku, question_id)
+        return False
+
     logger.debug(
         "Sending Ozon question answer: question_id=%s, len(text)=%d, text_preview=%r",
         question_id,
@@ -2489,10 +2493,8 @@ async def send_question_answer(question_id: str, text: str, *, sku: int | None =
         text_clean[:80],
     )
 
-    body = {"question_id": question_id, "text": text_clean}
-    sku_clean = _clean_sku(sku)
-    if sku_clean is not None:
-        body["sku"] = sku_clean
+    body = {"question_id": question_id, "text": text_clean, "sku": int(sku)}
+    logger.info("question_answer_create: qid=%s sku=%s text_len=%s", question_id, sku, len(text_clean))
     status_code, data = await client._post_with_status("/v1/question/answer/create", body)
     if status_code >= 400:
         raise OzonAPIError(
@@ -2502,6 +2504,7 @@ async def send_question_answer(question_id: str, text: str, *, sku: int | None =
         raise OzonAPIError(
             "Ошибка Ozon API: пустой ответ при отправке ответа на вопрос"
         )
+    return True
 
 
 async def list_question_answers(

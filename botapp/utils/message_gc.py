@@ -104,7 +104,14 @@ async def _safe_delete(bot, chat_id: int, message_id: int) -> bool:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
         return True
     except (TelegramBadRequest, TelegramForbiddenError) as exc:
-        # Важно: "message to delete not found" НЕ считаем успехом.
+        msg = str(exc).lower()
+        if "message to delete not found" in msg:
+            logger.info("Message already deleted %s/%s", chat_id, message_id)
+            return True
+        if "message can't be deleted" in msg:
+            logger.warning("Can't delete %s/%s (too old / not allowed). Will try clear.", chat_id, message_id)
+            return False
+
         logger.warning("Failed to delete message %s/%s: %s", chat_id, message_id, exc)
         return False
     except Exception:
