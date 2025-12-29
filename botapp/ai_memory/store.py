@@ -40,6 +40,13 @@ def _sanitize_text(text: str) -> str:
     return s[:2000]
 
 
+def _normalize_pid(value: str | int | None) -> str:
+    try:
+        return str(value).strip()
+    except Exception:
+        return ""
+
+
 class ApprovedMemoryStore:
     def __init__(self, path: str | Path | None = None, *, max_records: int = DEFAULT_MAX_RECORDS):
         self.path = Path(path or _default_path()).resolve()
@@ -77,11 +84,12 @@ class ApprovedMemoryStore:
     def _compute_hash(self, rec: ApprovedAnswer) -> str:
         norm_input = (rec.input_text or "").strip().lower()
         norm_answer = (rec.answer_text or "").strip().lower()
+        pid = _normalize_pid(rec.product_id)
         base = "|".join(
             [
                 (rec.kind or "").strip(),
                 (rec.ozon_entity_id or "").strip(),
-                (rec.product_id or "").strip(),
+                pid,
                 norm_input,
                 norm_answer,
             ]
@@ -91,6 +99,7 @@ class ApprovedMemoryStore:
     def add_approved_answer(self, rec: ApprovedAnswer) -> bool:
         rec.input_text = _sanitize_text(rec.input_text)
         rec.answer_text = _sanitize_text(rec.answer_text)
+        rec.product_id = _normalize_pid(rec.product_id) or None
         rec.hash = rec.hash or self._compute_hash(rec)
 
         payload = (

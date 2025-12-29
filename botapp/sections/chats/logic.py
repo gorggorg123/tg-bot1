@@ -864,7 +864,9 @@ def _bubble_text(msg: NormalizedMessage) -> str:
 
     label = "👤 Покупатель" if msg.role == "buyer" else ("🏪 Мы" if msg.role == "seller" else "Сервис")
     prefix = f"<b>{label}:</b> "
-    suffix = ""
+    suffix_lines: list[str] = []
+    if msg.product_title:
+        suffix_lines.append(f"Товар: {_escape(msg.product_title)}")
     if msg.context:
         bits: list[str] = []
         sku = msg.context.get("sku") or msg.context.get("product_id")
@@ -874,7 +876,11 @@ def _bubble_text(msg: NormalizedMessage) -> str:
         if posting:
             bits.append(f"Заказ {posting}")
         if bits:
-            suffix = "\n<i>" + ", ".join(bits) + "</i>"
+            suffix_lines.append("<i>" + ", ".join(bits) + "</i>")
+
+    suffix = ("\n".join(suffix_lines)) if suffix_lines else ""
+    if suffix and not suffix.startswith("\n"):
+        suffix = "\n" + suffix
 
     if tm:
         return f"{prefix}{txt}{suffix}\n<i>{tm}</i>"

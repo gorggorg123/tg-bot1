@@ -14,6 +14,8 @@ from botapp.sections.chats.logic import (
 )
 from botapp.utils import storage
 from botapp.sections.chats.logic import _bubble_text  # type: ignore
+from botapp.sections.chats import handlers as chat_handlers
+from unittest.mock import patch
 
 
 class ChatListNormalizationTest(unittest.TestCase):
@@ -125,6 +127,51 @@ class ChatAIStateStorageTest(unittest.TestCase):
         if prev is not None:
             os.environ["STORAGE_DIR"] = prev
         importlib.reload(storage)
+
+
+class ChatBubbleSendRaceTest(unittest.TestCase):
+    def test_send_bubbles_survives_pop_and_cleans_orphans(self):
+        async def run_case():
+            key = chat_handlers._bkey(10, "cid-1")
+            chat_handlers._CHAT_BUBBLES.pop(key, None)
+            deleted: list[int] = []
+
+            async def fake_delete(bot, chat_id, message_id):
+                deleted.append(message_id)
+                return True
+
+            counter = {"n": 0}
+
+            class DummyBot:
+                async def send_message(self, chat_id, text, parse_mode=None):
+                    counter["n"] += 1
+                    # Simulate section close before the second append
+                    if counter["n"] == 2:
+                        chat_handlers._CHAT_BUBBLES.pop(key, None)
+
+                    class Msg:
+                        message_id = counter["n"]
+
+                    return Msg()
+
+                async def send_photo(self, *args, **kwargs):
+                    class Msg:
+                        message_id = 999
+
+                    return Msg()
+
+            with patch.object(chat_handlers, "safe_delete_message", side_effect=fake_delete):
+                msgs = [
+                    NormalizedMessage(role="buyer", text="first"),
+                    NormalizedMessage(role="buyer", text="second"),
+                ]
+                await chat_handlers._send_bubbles(DummyBot(), 1, 10, "cid-1", msgs)
+
+            chat_handlers._CHAT_BUBBLES.pop(key, None)
+            return deleted
+
+        deleted_ids = asyncio.run(run_case())
+        self.assertIn(1, deleted_ids)
 
 
 if __name__ == "__main__":
