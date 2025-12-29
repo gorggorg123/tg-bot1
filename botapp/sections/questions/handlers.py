@@ -55,6 +55,25 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _coerce_positive_sku(*candidates) -> int | None:
+    for cand in candidates:
+        if cand is None:
+            continue
+        try:
+            s = str(cand).strip()
+        except Exception:
+            continue
+        if not s.isdigit():
+            continue
+        try:
+            v = int(s)
+        except Exception:
+            continue
+        if v > 0:
+            return v
+    return None
+
+
 async def _show_questions_list(
     *,
     user_id: int,
@@ -367,14 +386,16 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
             await send_ephemeral_message(callback, text="⚠️ Нет write-доступа к Ozon (ключи OZON_WRITE_*).")
             return
 
-        sku = None
+        sku = _coerce_positive_sku(q.sku, getattr(q, "product_id", None))
+        if sku is None:
+            logger.warning("Cannot determine SKU for question send: qid=%s raw_sku=%r raw_pid=%r", q.id, getattr(q, "sku", None), getattr(q, "product_id", None))
+            await send_ephemeral_message(callback, text="⚠️ Не удалось определить SKU для отправки ответа. Нажмите «Обновить» и попробуйте снова.", as_alert=True)
+            return
         try:
-            sku = int(q.sku) if (q.sku or "").isdigit() else None
-        except Exception:
-            sku = None
-
-        try:
-            await send_question_answer(q.id, draft, sku=sku)
+            ok = await send_question_answer(q.id, draft, sku=sku)
+            if ok is False:
+                await send_ephemeral_message(callback, text="⚠️ Не удалось отправить ответ: отсутствует SKU. Обновите список и попробуйте снова.", as_alert=True)
+                return
         except OzonAPIError as exc:
             await send_ephemeral_message(callback, text=f"⚠️ Ozon отклонил отправку: {exc}")
             return
