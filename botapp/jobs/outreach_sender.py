@@ -54,6 +54,23 @@ OUTREACH_REASON_NETWORK = "NETWORK"
 OUTREACH_REASON_UNKNOWN = "UNKNOWN"
 
 
+def _classify_failure(status: int | None, err: str | None) -> tuple[str, bool]:
+    """Return reason_code and whether it is retryable."""
+
+    err_lower = (err or "").lower()
+    if status == 429:
+        return OUTREACH_REASON_RATE_LIMIT, True
+    if status in (500, 502, 503, 504):
+        return OUTREACH_REASON_UNKNOWN, True
+    if status in (401, 403):
+        return OUTREACH_REASON_AUTH, False
+    if "48" in err_lower and ("час" in err_lower or "hour" in err_lower):
+        return OUTREACH_REASON_OUT_OF_WINDOW, False
+    if status is None:
+        return OUTREACH_REASON_NETWORK, True
+    return OUTREACH_REASON_UNKNOWN, False
+
+
 def _job_to_dict(job: OutreachJob) -> dict:
     return {
         "user_id": job.user_id,
@@ -64,7 +81,7 @@ def _job_to_dict(job: OutreachJob) -> dict:
         "reason_code": job.reason_code,
         "last_error": job.last_error,
         "last_status": job.last_status,
-        "updated_at": (job.updated_at or datetime.utcnow()).isoformat(),
+        "updated_at": (job.updated_at or datetime.now(timezone.utc)).isoformat(),
         "template_id": job.template_id,
         "template_version": job.template_version,
         "idempotency_key": job.idempotency_key,
@@ -75,7 +92,7 @@ def _job_to_dict(job: OutreachJob) -> dict:
 def _dict_to_job(payload: dict) -> OutreachJob | None:
     try:
         created_at_raw = payload.get("created_at")
-        created_at = datetime.fromisoformat(created_at_raw) if created_at_raw else datetime.utcnow()
+        created_at = datetime.fromisoformat(created_at_raw) if created_at_raw else datetime.now(timezone.utc)
         return OutreachJob(
             user_id=int(payload.get("user_id")),
             chat_id=str(payload.get("chat_id")),
@@ -98,7 +115,7 @@ def _dict_to_job(payload: dict) -> OutreachJob | None:
 
 def _compute_idempotency_key(job: OutreachJob) -> str:
     base = f"{job.user_id}:{job.chat_id}:{job.template_id or 'custom'}:{job.template_version or 'v1'}"
-    text_hash = sha256((job.text or '').strip().encode()).hexdigest()[:8]
+    text_hash = sha256((job.text or "").strip().encode()).hexdigest()[:8]
     return f"{base}:{text_hash}"
 
 
@@ -111,6 +128,8 @@ def _bootstrap_pending_jobs() -> None:
             continue
         if not job.idempotency_key:
             job.idempotency_key = _compute_idempotency_key(job)
+        if not job.created_at:
+            job.created_at = datetime.now(timezone.utc)
         try:
             _queue.put_nowait(job)
             restored += 1
@@ -133,6 +152,8 @@ def enqueue_outreach(job: OutreachJob) -> None:
         return
     if not job.idempotency_key:
         job.idempotency_key = _compute_idempotency_key(job)
+    if not job.created_at:
+        job.created_at = datetime.now(timezone.utc)
     if oqs.is_sent(job.idempotency_key):
         logger.info(
             "Skip enqueue outreach: already sent idempotency_key=%s user_id=%s chat=%s",
@@ -269,26 +290,16 @@ async def outreach_sender_loop(stop_event: asyncio.Event) -> None:
                 oqs.mark_sent(job.idempotency_key)
                 metrics["sent"] += 1
             else:
-                retryable = status in (429, 500, 502, 503, 504)
-                reason = OUTREACH_REASON_UNKNOWN
-                err_lower = (err or "").lower() if err else ""
-                if status == 429:
-                    reason = OUTREACH_REASON_RATE_LIMIT
-                elif status in (401, 403):
-                    reason = OUTREACH_REASON_AUTH
-                elif "48" in err_lower and "час" in err_lower:
-                    reason = OUTREACH_REASON_OUT_OF_WINDOW
-                elif status is None:
-                    reason = OUTREACH_REASON_NETWORK
+                reason, retryable = _classify_failure(status, err)
                 logger.warning(
-                    "Outreach failed user_id=%s chat=%s idempotency_key=%s error=%s status=%s attempts=%s reason=%s",
+                    "Outreach failed user_id=%s chat=%s idempotency_key=%s status=%s reason=%s attempts=%s error=%s",
                     job.user_id,
                     job.chat_id,
                     job.idempotency_key,
-                    err,
                     status,
-                    job.attempts,
                     reason,
+                    job.attempts,
+                    err,
                 )
                 if retryable and job.attempts < len(RETRY_BACKOFF_SECONDS):
                     job.attempts += 1
@@ -300,11 +311,12 @@ async def outreach_sender_loop(stop_event: asyncio.Event) -> None:
                     oqs.update_pending_job(_job_to_dict(job), idempotency_key=job.idempotency_key)
                     backoff = RETRY_BACKOFF_SECONDS[job.attempts - 1]
                     logger.info(
-                        "Retrying outreach user_id=%s chat=%s idempotency_key=%s backoff=%ss",
+                        "Retrying outreach user_id=%s chat=%s idempotency_key=%s backoff=%ss attempts=%s",
                         job.user_id,
                         job.chat_id,
                         job.idempotency_key,
                         backoff,
+                        job.attempts,
                     )
                     metrics["requeued"] += 1
                     try:
