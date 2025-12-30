@@ -7,6 +7,13 @@
 python scripts/smoke_syntax.py
 ```
 
+## Персистентное хранилище (Render)
+
+- Для бота есть платный диск Render. Все данные (очередь аутричей, SKU-кеш, состояния) должны лежать в каталоге, указанном в `STORAGE_DIR` (или `RENDER_DISK_PATH`).
+- Перед деплоем в Render Dashboard задайте переменную окружения, например: `STORAGE_DIR=/var/data` (mount path диска).
+- При старте приложение логирует выбранный ROOT и проверяет, что каталог доступен на запись/чтение.
+- Подробнее — в `docs/Render.md`.
+
 ## Чаты Ozon (Seller API)
 
 - Используются методы `/v3/chat/list`, `/v3/chat/history` и `/v1/chat/send/message`.

@@ -386,6 +386,9 @@ def set_outreach_interval_seconds(user_id: int, seconds: int) -> None:
 
 
 __all__ = [
+    "ROOT",
+    "_write_json_atomic",
+    "_LOCK",
     "get_review_reply",
     "upsert_review_reply",
     "get_question_answer",

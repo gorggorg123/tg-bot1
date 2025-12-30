@@ -50,6 +50,7 @@ async def _close_all_sections(
     *,
     preserve_menu: bool = False,
     preserve_message_id: int | None = None,
+    preserve_message_ids: set[int] | None = None,
 ) -> None:
     sections = [
         SECTION_REVIEWS_LIST,
@@ -69,6 +70,12 @@ async def _close_all_sections(
         SECTION_WAREHOUSE_PROMPT,
     ]
 
+    preserve_set: set[int] | None = None
+    if preserve_message_ids:
+        preserve_set = {int(mid) for mid in preserve_message_ids}
+    if preserve_message_id is not None:
+        preserve_set = (preserve_set or set()) | {int(preserve_message_id)}
+
     if not preserve_menu:
         logger.info("Deleting previous menu for user_id=%s before rendering new one", user_id)
         await delete_section_message(user_id, SECTION_MENU, bot, force=True)
@@ -80,7 +87,7 @@ async def _close_all_sections(
                 sec,
                 bot,
                 force=True,
-                preserve_message_id=preserve_message_id,
+                preserve_message_ids=preserve_set,
             )
         except Exception:
             logger.exception("Failed to delete section=%s for user=%s", sec, user_id)
@@ -120,22 +127,19 @@ async def menu_home(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
     trigger_mid = callback.message.message_id if callback.message else None
-    # Меню — якорь: НЕ удаляем меню при возврате домой.
-    # Удаляем все секции, включая trigger-сообщение секции.
+    await _show_menu(user_id=user_id, callback=callback)
+    menu_mid = get_section_message_id(user_id, SECTION_MENU)
+    preserve_set = {int(menu_mid)} if menu_mid is not None else None
+
     await _close_all_sections(
         callback.message.bot,
         user_id,
         preserve_menu=True,
-        preserve_message_id=None,
+        preserve_message_ids=preserve_set,
     )
-    await _show_menu(user_id=user_id, callback=callback)
 
-    # Best-effort: если нажатие "домой" было из секции, чистим trigger-сообщение секции,
-    # но никогда не трогаем текущее меню.
-    if trigger_mid is not None:
-        menu_mid = get_section_message_id(user_id, SECTION_MENU)
-        if menu_mid is None or int(menu_mid) != int(trigger_mid):
-            await safe_remove_message(callback.message.bot, callback.message.chat.id, int(trigger_mid))
+    if trigger_mid is not None and (menu_mid is None or int(menu_mid) != int(trigger_mid)):
+        await safe_remove_message(callback.message.bot, callback.message.chat.id, int(trigger_mid))
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "menu"))
@@ -143,18 +147,18 @@ async def menu_alias(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     await state.clear()
     trigger_mid = callback.message.message_id if callback.message else None
+    await _show_menu(user_id=user_id, callback=callback)
+    menu_mid = get_section_message_id(user_id, SECTION_MENU)
+    preserve_set = {int(menu_mid)} if menu_mid is not None else None
     await _close_all_sections(
         callback.message.bot,
         user_id,
         preserve_menu=True,
-        preserve_message_id=None,
+        preserve_message_ids=preserve_set,
     )
-    await _show_menu(user_id=user_id, callback=callback)
 
-    if trigger_mid is not None:
-        menu_mid = get_section_message_id(user_id, SECTION_MENU)
-        if menu_mid is None or int(menu_mid) != int(trigger_mid):
-            await safe_remove_message(callback.message.bot, callback.message.chat.id, int(trigger_mid))
+    if trigger_mid is not None and (menu_mid is None or int(menu_mid) != int(trigger_mid)):
+        await safe_remove_message(callback.message.bot, callback.message.chat.id, int(trigger_mid))
 
 
 @router.callback_query(MenuCallbackData.filter(F.section == "outreach"))
@@ -182,7 +186,7 @@ async def menu_fbo(callback: CallbackQuery, state: FSMContext) -> None:
         callback.message.bot,
         user_id,
         preserve_menu=True,
-        preserve_message_id=preserve_mid,
+        preserve_message_ids={preserve_mid} if preserve_mid is not None else None,
     )
     data = MenuCallbackData.unpack(callback.data)
     action = data.action
@@ -221,7 +225,7 @@ async def menu_finance(callback: CallbackQuery, state: FSMContext) -> None:
         callback.message.bot,
         user_id,
         preserve_menu=True,
-        preserve_message_id=preserve_mid,
+        preserve_message_ids={preserve_mid} if preserve_mid is not None else None,
     )
     data = MenuCallbackData.unpack(callback.data)
     action = data.action
