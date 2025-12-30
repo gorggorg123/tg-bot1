@@ -2,12 +2,19 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+
+from botapp.utils.section_refs_store import (
+    SectionRef,
+    get_ref as _store_get_ref,
+    mark_stale as _store_mark_stale,
+    pop_ref as _store_pop_ref,
+    set_ref as _store_set_ref,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,20 +47,6 @@ SECTION_WAREHOUSE_PLAN = "warehouse_plan"
 SECTION_WAREHOUSE_PROMPT = "warehouse_prompt"
 
 # -----------------------------------------------------------------------------
-# In-memory registry: user_id + section -> (chat_id, message_id)
-# -----------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class SectionRef:
-    chat_id: int
-    message_id: int
-    updated_at: datetime
-
-
-_REGISTRY: dict[tuple[int, str], SectionRef] = {}
-
-
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -63,19 +56,15 @@ def _key(user_id: int, section: str) -> tuple[int, str]:
 
 
 def _get_ref(user_id: int, section: str) -> SectionRef | None:
-    return _REGISTRY.get(_key(user_id, section))
+    return _store_get_ref(user_id, section)
 
 
 def _set_ref(user_id: int, section: str, chat_id: int, message_id: int) -> None:
-    _REGISTRY[_key(user_id, section)] = SectionRef(
-        chat_id=int(chat_id),
-        message_id=int(message_id),
-        updated_at=_now_utc(),
-    )
+    _store_set_ref(user_id, section, chat_id, message_id)
 
 
 def _pop_ref(user_id: int, section: str) -> SectionRef | None:
-    return _REGISTRY.pop(_key(user_id, section), None)
+    return _store_pop_ref(user_id, section)
 
 
 # -----------------------------------------------------------------------------
@@ -109,8 +98,11 @@ async def _safe_delete(bot, chat_id: int, message_id: int) -> bool:
             logger.info("Message already deleted %s/%s", chat_id, message_id)
             return True
         if "message can't be deleted" in msg:
-            logger.warning("Can't delete %s/%s (too old / not allowed). Will try clear.", chat_id, message_id)
-            return False
+            logger.warning("Can't delete %s/%s (too old / not allowed). Treating as removed.", chat_id, message_id)
+            return True
+        if "message identifier is not specified" in msg:
+            logger.info("Message identifier missing for %s/%s, treating as removed", chat_id, message_id)
+            return True
 
         logger.warning("Failed to delete message %s/%s: %s", chat_id, message_id, exc)
         return False
@@ -231,6 +223,11 @@ async def render_section(
     prev = _get_ref(user_id, section)
     prev_same_chat = bool(prev and prev.chat_id == int(chat_id))
 
+    # Используем флажки, чтобы понимать, пробовали ли мы превратить trigger в меню
+    # и нужно ли его чистить при падении edit.
+    menu_trigger_attempted = False
+    menu_trigger_succeeded = False
+
     # 1) Если у секции уже есть сообщение в этом чате — редактируем его.
     if prev_same_chat:
         target_mid = int(prev.message_id)
@@ -280,6 +277,7 @@ async def render_section(
     #    Для menu: если ref отсутствует, можно попробовать edit trigger, но это рискованно,
     #    поэтому сначала пытаемся edit trigger, а если не вышло — отправляем новое и (опц.) чистим trigger.
     if section == SECTION_MENU and trigger_mid is not None:
+        menu_trigger_attempted = True
         edited = await _safe_edit(
             bot,
             chat_id=int(chat_id),
@@ -289,10 +287,12 @@ async def render_section(
             parse_mode=parse_mode,
         )
         if edited is NOT_MODIFIED:
+            menu_trigger_succeeded = True
             _set_ref(user_id, section, int(chat_id), int(trigger_mid))
             logger.info("Menu ref set to mid=%s for user_id=%s", trigger_mid, user_id)
             return None
         if edited:
+            menu_trigger_succeeded = True
             _set_ref(user_id, section, int(chat_id), int(trigger_mid))
             logger.info("Menu ref set to mid=%s for user_id=%s", trigger_mid, user_id)
             return edited
@@ -323,7 +323,13 @@ async def render_section(
 
     # Если мы вынужденно отправили новое меню при callback — можно попытаться убрать trigger, чтобы не оставалось дублей.
     # Но только если trigger не равен новому menu mid.
-    if section == SECTION_MENU and trigger_mid is not None and int(trigger_mid) != int(sent.message_id):
+    if (
+        section == SECTION_MENU
+        and menu_trigger_attempted
+        and not menu_trigger_succeeded
+        and trigger_mid is not None
+        and int(trigger_mid) != int(sent.message_id)
+    ):
         # Никаких попов/реестров тут: просто best-effort очистка.
         await safe_remove_message(bot, int(chat_id), int(trigger_mid))
 
@@ -387,14 +393,20 @@ async def delete_section_message(
     *,
     force: bool = False,
     preserve_message_id: int | None = None,
+    preserve_message_ids: set[int] | None = None,
 ) -> bool:
     """Удаляет сообщение секции, если оно зарегистрировано."""
     ref = _get_ref(user_id, section)
     if not ref:
         return False
+    preserve_set: set[int] | None = None
+    if preserve_message_ids:
+        preserve_set = {int(mid) for mid in preserve_message_ids}
+    if preserve_message_id is not None:
+        preserve_set = (preserve_set or set()) | {int(preserve_message_id)}
 
-    if preserve_message_id is not None and int(preserve_message_id) == int(ref.message_id):
-        logger.info("Preserve mid=%s section=%s user_id=%s -> dropping ref", preserve_message_id, section, user_id)
+    if preserve_set and int(ref.message_id) in preserve_set:
+        logger.info("Preserve mid=%s section=%s user_id=%s -> dropping ref", ref.message_id, section, user_id)
         popped = _pop_ref(user_id, section)
         if popped:
             logger.info("Popped ref for section=%s user_id=%s", section, user_id)
@@ -407,7 +419,7 @@ async def delete_section_message(
         ref.chat_id,
         ref.message_id,
         force,
-        preserve_message_id,
+        preserve_set,
     )
 
     ok = await safe_remove_message(bot, int(ref.chat_id), int(ref.message_id))
@@ -431,6 +443,9 @@ async def delete_section_message(
         if popped:
             logger.info("Force pop ref for section=%s user_id=%s", section, user_id)
         return True
+
+    if not ok:
+        _store_mark_stale(user_id, section)
 
     return False
 

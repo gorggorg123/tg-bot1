@@ -235,38 +235,9 @@ async def _prefetch_question_product_names(questions: List[Question]) -> None:
     skus = _uniq(skus)
     pids = _uniq(pids)
 
-    title_by_sku: dict[int, str] = {}
-    title_by_pid: dict[str, str] = {}
-
-    async def _fetch(kind: str, vals: list):
-        try:
-            if kind == "sku":
-                items = await client.get_product_info_list(skus=vals)
-            else:
-                items = await client.get_product_info_list(product_ids=vals)
-        except Exception as exc:
-            logger.debug("Product info list (%s) failed: %s", kind, exc)
-            return
-        for it in items or []:
-            name = safe_strip(getattr(it, "name", None))
-            if not name:
-                continue
-            if getattr(it, "sku", None) is not None:
-                try:
-                    title_by_sku[int(it.sku)] = name
-                except Exception:
-                    pass
-            if getattr(it, "product_id", None):
-                title_by_pid[str(it.product_id)] = name
-
-    def _chunks(seq, n=80):
-        for i in range(0, len(seq), n):
-            yield seq[i:i+n]
-
-    for ch in _chunks(skus, 80):
-        await _fetch("sku", ch)
-    for ch in _chunks(pids, 80):
-        await _fetch("pid", ch)
+    title_by_pid, _title_by_offer_unused, title_by_sku = await client.get_product_titles_cached(
+        product_ids=pids, skus=skus
+    )
 
     for q in need:
         existing = safe_strip(getattr(q, "product_name", None))

@@ -7,7 +7,6 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-import time
 from typing import Any, Iterable
 
 from botapp.api.ozon_client import (
@@ -27,6 +26,7 @@ logger = logging.getLogger(__name__)
 PAGE_SIZE = 10
 CACHE_TTL_SECONDS = 60
 THREAD_TTL_SECONDS = 10
+CHAT_LIST_ACTIVATION_PROBES = 5
 MSK_TZ = timezone(timedelta(hours=3))
 
 _chat_tokens = TokenStore(ttl_seconds=CACHE_TTL_SECONDS)
@@ -563,6 +563,7 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
 
     activated = get_activated_chat_ids(user_id)
     activation_checks = 0
+    activation_history_calls = 0
 
     async with lock:
         if not force and cache.chats and is_cache_fresh(cache.fetched_at, CACHE_TTL_SECONDS):
@@ -588,60 +589,39 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
 
         chats = resp.chats or list(resp.iter_items())
 
-        time_budget_seconds = 2.0
-        max_checks = 30
-        concurrency = 4
-        t0 = time.monotonic()
-        semaphore = asyncio.Semaphore(concurrency)
-
-        candidates: list[tuple[int, ChatListItem]] = []
+        # Lazy activation: probe only a few most relevant chats (unread first, newest)
+        candidates: list[ChatListItem] = []
         for c in chats:
             cid = (c.safe_chat_id or str(c.chat_id or "").strip() or "").strip()
             if not cid or cid in activated:
                 continue
-            try:
-                last_id = int(c.last_message_id or 0)
-            except Exception:
-                last_id = 0
-            if last_id > 0:
-                candidates.append((last_id, c))
+            if int(c.unread_count or 0) <= 0:
+                continue
+            candidates.append(c)
 
-        candidates.sort(key=lambda item: -item[0])
-
-        async def _probe_and_activate(cid: str) -> None:
-            nonlocal activated
-            async with semaphore:
-                if time.monotonic() - t0 > time_budget_seconds:
-                    return
-                try:
-                    history = await ozon_chat_history(cid, limit=10)
-                    for m in history or []:
-                        if not isinstance(m, dict):
-                            continue
-                        if _detect_sender_type(m) == "buyer":
-                            mark_chat_activated(user_id, cid)
-                            activated.add(cid)
-                            break
-                except Exception:
-                    logger.debug(
-                        "Failed to auto-activate chat %s for user %s",
-                        cid,
-                        user_id,
-                        exc_info=True,
-                    )
-
-        tasks: list[asyncio.Task[None]] = []
-        for _last_id, c in candidates:
-            if activation_checks >= max_checks or (time.monotonic() - t0) > time_budget_seconds:
-                break
+        candidates.sort(key=lambda c: (-(int(c.unread_count or 0)), -(int(c.last_message_id or 0))))
+        for c in candidates[:CHAT_LIST_ACTIVATION_PROBES]:
             cid = (c.safe_chat_id or str(c.chat_id or "").strip() or "").strip()
             if not cid or cid in activated:
                 continue
             activation_checks += 1
-            tasks.append(asyncio.create_task(_probe_and_activate(cid)))
-
-        if tasks:
-            await asyncio.gather(*tasks)
+            try:
+                activation_history_calls += 1
+                history = await ozon_chat_history(cid, limit=10)
+                for m in history or []:
+                    if not isinstance(m, dict):
+                        continue
+                    if _detect_sender_type(m) == "buyer":
+                        mark_chat_activated(user_id, cid)
+                        activated.add(cid)
+                        break
+            except Exception:
+                logger.debug(
+                    "Failed to auto-activate chat %s for user %s",
+                    cid,
+                    user_id,
+                    exc_info=True,
+                )
 
         deduped: list[ChatListItem] = []
         seen: set[str] = set()
@@ -680,14 +660,13 @@ async def refresh_chats_list(user_id: int, *, force: bool = False) -> None:
 
         if not deduped:
             logger.info("Chat list returned 0 items for user %s (HTTP 200)", user_id)
-        spent = time.monotonic() - t0
         logger.info(
-            "Chats list: total_from_api=%s activated=%s shown=%s activation_checks=%s time_spent=%.2fs",
+            "Chats list: total_from_api=%s activated=%s shown=%s activation_checks=%s history_calls=%s",
             len(chats),
             len(activated),
             len(deduped),
             activation_checks,
-            spent,
+            activation_history_calls,
         )
 
 
@@ -743,7 +722,13 @@ async def get_chats_table(*, user_id: int, page: int, force_refresh: bool = Fals
                     product_title = _trim(cached, 60)
                     break
 
-        badge = f" непр.:{int(c.unread_count or 0)}" if int(c.unread_count or 0) > 0 else ""
+        badge_bits = []
+        unread = int(c.unread_count or 0)
+        if unread > 0:
+            badge_bits.append(f"непр.:{unread}")
+        if cid not in activated:
+            badge_bits.append("не активирован")
+        badge = f" {'; '.join(badge_bits)}" if badge_bits else ""
         subtitle_parts = [p for p in (last_snippet, last_time) if p]
         subtitle = " • ".join(subtitle_parts)
         short_id = cid[-8:] if len(cid) > 8 else cid
