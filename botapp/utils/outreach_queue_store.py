@@ -2,34 +2,28 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from botapp.utils.storage import ROOT, _write_json_atomic
+
 logger = logging.getLogger(__name__)
 
-DATA_DIR = (Path(__file__).resolve().parent.parent / "data").resolve()
-QUEUE_PATH = DATA_DIR / "outreach_queue.json"
-SENT_PATH = DATA_DIR / "outreach_sent.json"
-DEAD_PATH = DATA_DIR / "outreach_dead.json"
+QUEUE_PATH = ROOT / "outreach_queue.json"
+SENT_PATH = ROOT / "outreach_sent.json"
+DEAD_PATH = ROOT / "outreach_dead.json"
 
 SENT_TTL_DAYS = 30
 
 
 def _ensure_dir(path: Path) -> None:
-    os.makedirs(path.parent, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def _atomic_write(path: Path, payload: Any) -> None:
     _ensure_dir(path)
-    with tempfile.NamedTemporaryFile("w", delete=False, dir=path.parent) as tmp:
-        json.dump(payload, tmp, ensure_ascii=False, indent=2, default=str)
-        tmp.flush()
-        os.fsync(tmp.fileno())
-        tmp_path = Path(tmp.name)
-    tmp_path.replace(path)
+    _write_json_atomic(path, payload)
 
 
 def _read_json_list(path: Path) -> list:
@@ -132,6 +126,29 @@ def append_dead_letter(entry: dict) -> None:
     _atomic_write(DEAD_PATH, letters)
 
 
+def mark_status(idempotency_key: str, *, status: str, reason_code: str | None = None, error: str | None = None, status_code: int | None = None, attempts: int | None = None) -> None:
+    jobs = load_pending_jobs()
+    updated = False
+    for idx, existing in enumerate(jobs):
+        if str(existing.get("idempotency_key")) != str(idempotency_key):
+            continue
+        existing["status"] = status
+        if reason_code is not None:
+            existing["reason_code"] = reason_code
+        if error is not None:
+            existing["last_error"] = error
+        if status_code is not None:
+            existing["last_status"] = status_code
+        if attempts is not None:
+            existing["attempts"] = attempts
+        existing["updated_at"] = datetime.utcnow().isoformat()
+        jobs[idx] = existing
+        updated = True
+        break
+    if updated:
+        save_pending_jobs(jobs)
+
+
 __all__ = [
     "add_pending_job",
     "append_dead_letter",
@@ -142,4 +159,5 @@ __all__ = [
     "remove_pending_job",
     "save_pending_jobs",
     "update_pending_job",
+    "mark_status",
 ]

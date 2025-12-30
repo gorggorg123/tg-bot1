@@ -874,7 +874,7 @@ async def _resolve_product_names(
     if not unresolved:
         return
 
-    # 4) batch fallback через /v3/product/info/list
+    # 4) batch fallback через /v3/product/info/list (с кешем и дедупом)
     offer_ids: list[str] = []
     product_ids: list[str] = []
     skus: list[int] = []
@@ -885,7 +885,6 @@ async def _resolve_product_names(
         pid = safe_strip(c.product_id)
         if pid:
             if pid.isdigit():
-                # может быть sku, а может product_id — пробуем как sku (batch быстрее)
                 try:
                     skus.append(int(pid))
                 except Exception:
@@ -909,45 +908,9 @@ async def _resolve_product_names(
     product_ids = _uniq(product_ids)
     skus = _uniq(skus)
 
-    title_by_offer: dict[str, str] = {}
-    title_by_pid: dict[str, str] = {}
-    title_by_sku: dict[int, str] = {}
-
-    async def _fetch(kind: str, vals: list):
-        try:
-            if kind == "offer":
-                items = await client.get_product_info_list(offer_ids=vals)
-            elif kind == "pid":
-                items = await client.get_product_info_list(product_ids=vals)
-            else:
-                items = await client.get_product_info_list(skus=vals)
-        except Exception as exc:
-            logger.debug("Product info list (%s) failed: %s", kind, exc)
-            return
-        for it in items or []:
-            name = safe_strip(getattr(it, "name", None))
-            if not name:
-                continue
-            if getattr(it, "offer_id", None):
-                title_by_offer[str(it.offer_id)] = name
-            if getattr(it, "product_id", None):
-                title_by_pid[str(it.product_id)] = name
-            if getattr(it, "sku", None) is not None:
-                try:
-                    title_by_sku[int(it.sku)] = name
-                except Exception:
-                    pass
-
-    def _chunks(seq, n=80):
-        for i in range(0, len(seq), n):
-            yield seq[i:i+n]
-
-    for ch in _chunks(offer_ids, 80):
-        await _fetch("offer", ch)
-    for ch in _chunks(product_ids, 80):
-        await _fetch("pid", ch)
-    for ch in _chunks(skus, 80):
-        await _fetch("sku", ch)
+    title_by_pid, title_by_offer, title_by_sku = await client.get_product_titles_cached(
+        product_ids=product_ids, offer_ids=offer_ids, skus=skus
+    )
 
     for c in unresolved:
         if c.product_name:

@@ -5,9 +5,12 @@ import asyncio
 import logging
 import os
 import random
+import json
+from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date, timezone
+from threading import RLock
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 from time import monotonic
 from urllib.parse import urlparse, unquote
@@ -25,6 +28,9 @@ from pydantic import (
 
 # Разрешаем использовать поля с префиксом ``model_`` (ozonapi модели с model_id/model_info).
 BaseModel.model_config = ConfigDict(**dict(BaseModel.model_config), protected_namespaces=())
+
+from botapp.utils.storage import ROOT, _write_json_atomic
+from botapp.utils.text_utils import safe_strip
 
 try:  # ozonapi-async 0.19.x содержит seller_info, 0.1.0 — нет
     from ozonapi import SellerAPI
@@ -46,6 +52,12 @@ _analytics_forbidden: bool = False
 _analytics_forbidden_logged: bool = False
 _stock_not_found_warned: set[str] = set()
 _product_list_warned: bool = False
+
+_PRODUCT_INFO_CACHE_FILE = ROOT / "product_info_cache.json"
+_PRODUCT_INFO_TTL = timedelta(hours=12)
+_product_info_cache: dict[str, dict] = {}
+_product_info_cache_loaded = False
+_product_info_cache_lock = RLock()
 
 
 class _SimpleRateLimiter:
@@ -72,6 +84,105 @@ class _SimpleRateLimiter:
 
 
 _question_answer_rate_limiter = _SimpleRateLimiter(rate=50, per_seconds=1.0)
+_chat_history_rate_limiter = _SimpleRateLimiter(rate=5, per_seconds=1.0)
+_chat_list_rate_limiter = _SimpleRateLimiter(rate=5, per_seconds=1.0)
+_chat_send_rate_limiter = _SimpleRateLimiter(rate=3, per_seconds=1.0)
+_PATH_RATE_LIMITERS: dict[str, _SimpleRateLimiter] = {
+    "/v3/chat/history": _chat_history_rate_limiter,
+    "/v3/chat/list": _chat_list_rate_limiter,
+    "/v1/chat/send/message": _chat_send_rate_limiter,
+}
+
+
+def _pi_cache_key(kind: str, val: str | int) -> str:
+    return f"{kind}:{val}"
+
+
+def _load_product_info_cache() -> None:
+    global _product_info_cache_loaded
+    if _product_info_cache_loaded:
+        return
+    with _product_info_cache_lock:
+        if _product_info_cache_loaded:
+            return
+        if _PRODUCT_INFO_CACHE_FILE.exists():
+            try:
+                raw = json.loads(_PRODUCT_INFO_CACHE_FILE.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    _product_info_cache.update(raw)
+            except Exception:
+                logger.warning("Failed to load product info cache, starting empty", exc_info=True)
+        _product_info_cache_loaded = True
+        _prune_product_info_cache_locked()
+
+
+def _prune_product_info_cache_locked() -> None:
+    cutoff = datetime.utcnow() - _PRODUCT_INFO_TTL
+    changed = False
+    for key, payload in list(_product_info_cache.items()):
+        if not isinstance(payload, dict):
+            _product_info_cache.pop(key, None)
+            changed = True
+            continue
+        expires_raw = payload.get("expires_at")
+        try:
+            expires_at = datetime.fromisoformat(expires_raw)
+        except Exception:
+            expires_at = None
+        if expires_at is None or expires_at < cutoff:
+            _product_info_cache.pop(key, None)
+            changed = True
+    if changed:
+        _persist_product_info_cache_locked()
+
+
+def _persist_product_info_cache_locked() -> None:
+    try:
+        _PRODUCT_INFO_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(_PRODUCT_INFO_CACHE_FILE, _product_info_cache)
+    except Exception:
+        logger.debug("Failed to persist product info cache", exc_info=True)
+
+
+def _get_cached_product_title(kind: str, val: str | int) -> str | None:
+    _load_product_info_cache()
+    key = _pi_cache_key(kind, val)
+    with _product_info_cache_lock:
+        payload = _product_info_cache.get(key)
+        if not isinstance(payload, dict):
+            return None
+        expires_raw = payload.get("expires_at")
+        try:
+            expires_at = datetime.fromisoformat(expires_raw)
+        except Exception:
+            expires_at = None
+        if expires_at and expires_at > datetime.utcnow():
+            name = safe_strip(payload.get("name"))
+            return name or None
+        return None
+
+
+def _set_cached_product_info(item: dict) -> None:
+    name = safe_strip(item.get("name"))
+    if not name:
+        return
+    expires_at = datetime.utcnow() + _PRODUCT_INFO_TTL
+    entries: dict[str, dict] = {}
+    if item.get("product_id") is not None:
+        entries[_pi_cache_key("pid", str(item["product_id"]))] = {"name": name, "expires_at": expires_at.isoformat()}
+    if item.get("offer_id"):
+        entries[_pi_cache_key("offer", str(item["offer_id"]))] = {"name": name, "expires_at": expires_at.isoformat()}
+    if item.get("sku") is not None:
+        try:
+            entries[_pi_cache_key("sku", int(item["sku"]))] = {"name": name, "expires_at": expires_at.isoformat()}
+        except Exception:
+            pass
+    if not entries:
+        return
+    _load_product_info_cache()
+    with _product_info_cache_lock:
+        _product_info_cache.update(entries)
+        _persist_product_info_cache_locked()
 
 
 class QuestionItem(BaseModel):
@@ -422,9 +533,13 @@ class OzonClient:
         attempts_429 = 0
         attempts_other = 0
 
+        limiter = _PATH_RATE_LIMITERS.get(suffix)
+
         while True:
             attempts += 1
             try:
+                if limiter:
+                    await limiter.wait()
                 response = await self._http_client.post(url, json=json)
             except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as exc:
                 attempts_other += 1
@@ -1288,6 +1403,108 @@ class OzonClient:
                 logger.warning("Failed to parse product info list item: %s", exc)
                 continue
         return items
+
+    async def get_product_titles_cached(
+        self,
+        *,
+        product_ids: Sequence[int | str] | None = None,
+        offer_ids: Sequence[str] | None = None,
+        skus: Sequence[int | str] | None = None,
+        chunk_size: int = 80,
+    ) -> tuple[dict[str, str], dict[str, str], dict[int, str]]:
+        """Возвращает названия товаров по product_id/offer_id/sku с TTL-кешем и одним батчем per kind."""
+
+        pid_map: dict[str, str] = {}
+        offer_map: dict[str, str] = {}
+        sku_map: dict[int, str] = {}
+
+        def _uniq_str(seq: Sequence[int | str] | None) -> list[str]:
+            seen = set()
+            out: list[str] = []
+            for val in seq or []:
+                sval = str(val).strip()
+                if not sval or sval in seen:
+                    continue
+                seen.add(sval)
+                out.append(sval)
+            return out
+
+        def _uniq_int(seq: Sequence[int | str] | None) -> list[int]:
+            seen = set()
+            out: list[int] = []
+            for val in seq or []:
+                try:
+                    ival = int(val)
+                except Exception:
+                    continue
+                if ival in seen:
+                    continue
+                seen.add(ival)
+                out.append(ival)
+            return out
+
+        missing_pids = _uniq_str(product_ids)
+        missing_offers = _uniq_str(offer_ids)
+        missing_skus = _uniq_int(skus)
+
+        # fill from cache
+        for pid in list(missing_pids):
+            cached = _get_cached_product_title("pid", pid)
+            if cached:
+                pid_map[pid] = cached
+        missing_pids = [pid for pid in missing_pids if pid not in pid_map]
+
+        for off in list(missing_offers):
+            cached = _get_cached_product_title("offer", off)
+            if cached:
+                offer_map[off] = cached
+        missing_offers = [off for off in missing_offers if off not in offer_map]
+
+        for sku in list(missing_skus):
+            cached = _get_cached_product_title("sku", sku)
+            if cached:
+                sku_map[sku] = cached
+        missing_skus = [sku for sku in missing_skus if sku not in sku_map]
+
+        async def _fetch_and_cache(kind: str, vals: list) -> None:
+            if not vals:
+                return
+            for i in range(0, len(vals), chunk_size):
+                chunk = vals[i : i + chunk_size]
+                try:
+                    if kind == "pid":
+                        items = await self.product_info_list(product_ids=chunk)
+                    elif kind == "offer":
+                        items = await self.product_info_list(offer_ids=chunk)
+                    else:
+                        items = await self.product_info_list(skus=chunk)
+                except Exception as exc:
+                    logger.warning("product_info_list failed for kind=%s size=%s: %s", kind, len(chunk), exc)
+                    continue
+                for it in items or []:
+                    payload = it.model_dump() if hasattr(it, "model_dump") else it.__dict__
+                    if not isinstance(payload, dict):
+                        continue
+                    _set_cached_product_info(payload)
+                    name = safe_strip(payload.get("name"))
+                    if not name:
+                        continue
+                    if payload.get("product_id") is not None:
+                        pid = str(payload["product_id"])
+                        pid_map[pid] = name
+                    if payload.get("offer_id"):
+                        offer_map[str(payload["offer_id"])] = name
+                    if payload.get("sku") is not None:
+                        try:
+                            sku_map[int(payload["sku"])] = name
+                        except Exception:
+                            pass
+
+        await _fetch_and_cache("pid", missing_pids)
+        await _fetch_and_cache("offer", missing_offers)
+        await _fetch_and_cache("sku", missing_skus)
+
+        return pid_map, offer_map, sku_map
 
     async def get_product_info_list(
         self,

@@ -18,6 +18,7 @@ from botapp.config import load_ozon_config
 from botapp.jobs.outreach_sender import outreach_sender_loop
 from botapp.ozon_client import close_clients, get_client, has_write_credentials
 from botapp.router import router as root_router
+from botapp.storage import ROOT as STORAGE_ROOT
 from botapp.storage import flush_storage
 
 logger = logging.getLogger("main")
@@ -39,6 +40,26 @@ def setup_logging() -> None:
         level=getattr(logging, level, logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+
+def log_storage_state() -> None:
+    storage_dir = (os.getenv("STORAGE_DIR") or "").strip() or "<unset>"
+    render_disk = (os.getenv("RENDER_DISK_PATH") or "").strip() or "<unset>"
+    logger.info("Storage: STORAGE_DIR=%s, RENDER_DISK_PATH=%s, resolved ROOT=%s", storage_dir, render_disk, STORAGE_ROOT)
+
+    probe_path = STORAGE_ROOT / ".rw_probe"
+    try:
+        STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+        probe_path.write_text("ok", encoding="utf-8")
+        content = probe_path.read_text(encoding="utf-8").strip()
+        if content != "ok":
+            raise RuntimeError(f"Probe content mismatch: {content!r}")
+        logger.info("Storage: write/read probe succeeded at %s", probe_path)
+    except Exception as exc:
+        logger.error("Storage root is not writable/readable at %s: %s", STORAGE_ROOT, exc)
+    finally:
+        with suppress(Exception):
+            probe_path.unlink(missing_ok=True)
 
 
 def validate_env() -> None:
@@ -135,6 +156,7 @@ async def start_polling_once() -> None:
 
 @app.on_event("startup")
 async def on_startup() -> None:
+    log_storage_state()
     logger.info("Startup: init Ozon client")
     get_client()
 
