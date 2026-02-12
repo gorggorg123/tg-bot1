@@ -1,6 +1,6 @@
 services:
-  - type: worker
-    name: ozon-telegram-bot
+  - type: web
+    name: ozon-tg-bot
     runtime: python
     plan: free
     autoDeploy: true
@@ -13,8 +13,6 @@ services:
         value: "1"
       - key: LOG_LEVEL
         value: INFO
-      - key: TG_ENABLE_SSL_VERIFY
-        value: "1"
       - key: DROP_PENDING_UPDATES
         value: "1"
 
@@ -24,20 +22,13 @@ services:
         sync: false
       - key: OZON_API_KEY
         sync: false
-      - key: OZON_WRITE_CLIENT_ID
-        sync: false
-      - key: OZON_WRITE_API_KEY
-        sync: false
       - key: OPENAI_API_KEY
         sync: false
       - key: ADMIN_IDS
         sync: false
 
-      - key: CDEK_CLIENT_ID
+      # Optional, if write credentials differ from read credentials
+      - key: OZON_WRITE_CLIENT_ID
         sync: false
-      - key: CDEK_CLIENT_SECRET
-        sync: false
-      - key: CDEK_SENDER_NAME
-        sync: false
-      - key: CDEK_SENDER_PHONE
+      - key: OZON_WRITE_API_KEY
         sync: false

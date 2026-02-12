@@ -3,6 +3,7 @@ Webhook server на aiohttp
 Заменяет polling на instant delivery
 """
 
+import asyncio
 import logging
 from aiohttp import web
 from aiogram import Bot, Dispatcher

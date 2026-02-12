@@ -17,6 +17,7 @@ except ImportError:
     psutil = None
 
 from dotenv import load_dotenv
+from aiohttp import web
 
 # Загружаем переменные окружения из .env
 load_dotenv()
@@ -107,6 +108,25 @@ def _check_already_running():
         logger.error("  Или закройте окна с запущенным ботом вручную")
         logger.error("=" * 60)
         sys.exit(1)
+
+
+async def _start_health_server(port: int) -> web.AppRunner:
+    """Поднять простой HTTP health server для Render Web Service."""
+
+    app = web.Application()
+
+    async def _health(_request: web.Request) -> web.Response:
+        return web.json_response({"ok": True, "service": "ozon-tg-bot"})
+
+    app.router.add_get("/", _health)
+    app.router.add_get("/healthz", _health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(port))
+    await site.start()
+    logger.info("Health server started on 0.0.0.0:%s", port)
+    return runner
 
 
 async def main():
@@ -311,6 +331,17 @@ async def main():
     except Exception as e:
         logger.warning("Не удалось запустить систему уведомлений: %s", e)
     
+    # Render Web Service требует открытый HTTP порт.
+    # Если переменная PORT задана, поднимаем минимальный health endpoint.
+    health_runner = None
+    port_raw = _env("PORT")
+    if port_raw:
+        try:
+            health_runner = await _start_health_server(int(port_raw))
+        except Exception as e:
+            logger.error("Не удалось запустить health server на PORT=%s: %s", port_raw, e)
+            raise
+
     # На Windows Ctrl+C обрабатывается через KeyboardInterrupt
     
     try:
@@ -401,6 +432,14 @@ async def main():
         except Exception as e:
             logger.debug("Не удалось получить метрики middleware: %s", e)
         
+        # Остановка health server (если запускался)
+        if health_runner:
+            try:
+                await health_runner.cleanup()
+                logger.info("Health server остановлен")
+            except Exception as e:
+                logger.warning("Ошибка при остановке health server: %s", e)
+
         # Закрытие Ozon клиентов
         try:
             await close_clients()
