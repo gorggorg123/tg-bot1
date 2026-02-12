@@ -1,0 +1,26 @@
+# Prometheus configuration
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Telegram Bot metrics
+  - job_name: 'telegram-bot'
+    static_configs:
+      - targets: ['bot:8080']
+    
+  # Admin API metrics
+  - job_name: 'admin-api'
+    static_configs:
+      - targets: ['admin:8000']
+    
+  # PostgreSQL exporter (опционально)
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+    
+  # Redis exporter (опционально)
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']

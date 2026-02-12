@@ -1,0 +1,3487 @@
+# botapp/ozon_client.py
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import random
+import json
+from pathlib import Path
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timedelta, date, timezone
+from threading import RLock
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from time import monotonic
+from urllib.parse import urlparse, unquote
+
+import httpx
+from dotenv import load_dotenv
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+
+# Разрешаем использовать поля с префиксом ``model_`` (ozonapi модели с model_id/model_info).
+BaseModel.model_config = ConfigDict(**dict(BaseModel.model_config), protected_namespaces=())
+
+from botapp.utils.storage import ROOT, _write_json_atomic
+from botapp.utils.text_utils import safe_strip
+
+try:  # ozonapi-async 0.19.x содержит seller_info, 0.1.0 — нет
+    from ozonapi import SellerAPI
+except Exception:  # pragma: no cover - совместимость, если пакет не установлен
+    SellerAPI = None  # type: ignore
+
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+BASE_URL = "https://api-seller.ozon.ru"
+MSK_SHIFT = timedelta(hours=3)
+MSK_TZ = timezone(MSK_SHIFT)
+
+_product_name_cache: dict[str, str | None] = {}
+_product_not_found_warned: set[str] = set()
+_product_info_miss_cache: set[str] = set()
+_analytics_forbidden: bool = False
+_analytics_forbidden_logged: bool = False
+_stock_not_found_warned: set[str] = set()
+_product_list_warned: bool = False
+
+_PRODUCT_INFO_CACHE_FILE = ROOT / "product_info_cache.json"
+_PRODUCT_INFO_TTL = timedelta(hours=12)
+_product_info_cache: dict[str, dict] = {}
+_product_info_cache_loaded = False
+_product_info_cache_lock = RLock()
+
+
+class _SimpleRateLimiter:
+    def __init__(self, *, rate: int, per_seconds: float):
+        self.rate = max(1, rate)
+        self.per_seconds = max(per_seconds, 0.001)
+        self._calls: deque[float] = deque()
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = monotonic()
+            window_start = now - self.per_seconds
+            while self._calls and self._calls[0] < window_start:
+                self._calls.popleft()
+
+            if len(self._calls) < self.rate:
+                self._calls.append(now)
+                return
+
+            sleep_for = self._calls[0] + self.per_seconds - now
+            await asyncio.sleep(max(sleep_for, 0))
+            self._calls.append(monotonic())
+
+
+_question_answer_rate_limiter = _SimpleRateLimiter(rate=50, per_seconds=1.0)
+_chat_history_rate_limiter = _SimpleRateLimiter(rate=5, per_seconds=1.0)
+_chat_list_rate_limiter = _SimpleRateLimiter(rate=5, per_seconds=1.0)
+_chat_send_rate_limiter = _SimpleRateLimiter(rate=3, per_seconds=1.0)
+_PATH_RATE_LIMITERS: dict[str, _SimpleRateLimiter] = {
+    "/v3/chat/history": _chat_history_rate_limiter,
+    "/v2/chat/history": _chat_history_rate_limiter,
+    "/v1/chat/history": _chat_history_rate_limiter,
+    "/v3/chat/list": _chat_list_rate_limiter,
+    "/v2/chat/list": _chat_list_rate_limiter,
+    "/v1/chat/list": _chat_list_rate_limiter,
+    "/v1/chat/send/message": _chat_send_rate_limiter,
+}
+
+
+def _pi_cache_key(kind: str, val: str | int) -> str:
+    return f"{kind}:{val}"
+
+
+def _load_product_info_cache() -> None:
+    global _product_info_cache_loaded
+    if _product_info_cache_loaded:
+        return
+    with _product_info_cache_lock:
+        if _product_info_cache_loaded:
+            return
+        if _PRODUCT_INFO_CACHE_FILE.exists():
+            try:
+                raw = json.loads(_PRODUCT_INFO_CACHE_FILE.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    _product_info_cache.update(raw)
+            except Exception:
+                logger.warning("Failed to load product info cache, starting empty", exc_info=True)
+        _product_info_cache_loaded = True
+        _prune_product_info_cache_locked()
+
+
+def _prune_product_info_cache_locked() -> None:
+    cutoff = datetime.utcnow() - _PRODUCT_INFO_TTL
+    changed = False
+    for key, payload in list(_product_info_cache.items()):
+        if not isinstance(payload, dict):
+            _product_info_cache.pop(key, None)
+            changed = True
+            continue
+        expires_raw = payload.get("expires_at")
+        try:
+            expires_at = datetime.fromisoformat(expires_raw)
+        except Exception:
+            expires_at = None
+        if expires_at is None or expires_at < cutoff:
+            _product_info_cache.pop(key, None)
+            changed = True
+    if changed:
+        _persist_product_info_cache_locked()
+
+
+def _persist_product_info_cache_locked() -> None:
+    try:
+        _PRODUCT_INFO_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(_PRODUCT_INFO_CACHE_FILE, _product_info_cache)
+    except Exception:
+        logger.debug("Failed to persist product info cache", exc_info=True)
+
+
+def _get_cached_product_title(kind: str, val: str | int) -> str | None:
+    _load_product_info_cache()
+    key = _pi_cache_key(kind, val)
+    with _product_info_cache_lock:
+        payload = _product_info_cache.get(key)
+        if not isinstance(payload, dict):
+            return None
+        expires_raw = payload.get("expires_at")
+        try:
+            expires_at = datetime.fromisoformat(expires_raw)
+        except Exception:
+            expires_at = None
+        if expires_at and expires_at > datetime.utcnow():
+            name = safe_strip(payload.get("name"))
+            return name or None
+        return None
+
+
+def _set_cached_product_info(item: dict) -> None:
+    name = safe_strip(item.get("name"))
+    if not name:
+        return
+    expires_at = datetime.utcnow() + _PRODUCT_INFO_TTL
+    entries: dict[str, dict] = {}
+    if item.get("product_id") is not None:
+        entries[_pi_cache_key("pid", str(item["product_id"]))] = {"name": name, "expires_at": expires_at.isoformat()}
+    if item.get("offer_id"):
+        entries[_pi_cache_key("offer", str(item["offer_id"]))] = {"name": name, "expires_at": expires_at.isoformat()}
+    if item.get("sku") is not None:
+        try:
+            entries[_pi_cache_key("sku", int(item["sku"]))] = {"name": name, "expires_at": expires_at.isoformat()}
+        except Exception:
+            pass
+    if not entries:
+        return
+    _load_product_info_cache()
+    with _product_info_cache_lock:
+        _product_info_cache.update(entries)
+        _persist_product_info_cache_locked()
+
+
+class QuestionItem(BaseModel):
+    question_id: str | None = Field(default=None)
+    product_id: str | None = None
+    offer_id: str | None = None
+    sku: str | None = None
+    product_title: str | None = None
+    product_name: str | None = None
+    text: str | None = None
+    question: str | None = None
+    message: str | None = None
+    status: str | None = None
+    answer: str | None = None
+    last_answer: str | None = None
+    answer_id: str | None = None
+    created_at: Any = None
+    updated_at: Any = None
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+
+class GetQuestionListResponse(BaseModel):
+    questions: list[QuestionItem] = Field(default_factory=list)
+    result: list[QuestionItem] | None = None
+    last_id: str | None = None
+    total: int | None = None
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+    @property
+    def items(self) -> list[QuestionItem]:
+        if self.questions:
+            return self.questions
+        if isinstance(self.result, list):
+            return self.result
+        return []
+
+
+def _parse_sku_title_map(payload: Dict[str, Any] | None) -> tuple[Dict[str, str], list[Any]]:
+    """Построить мапу sku -> title из ответа /v1/analytics/data."""
+
+    if not isinstance(payload, dict):
+        return {}, []
+
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+    data_rows = result.get("data") if isinstance(result, dict) else []
+    if not isinstance(data_rows, list):
+        return {}, []
+
+    sku_title_map: Dict[str, str] = {}
+    for row in data_rows:
+        if not isinstance(row, dict):
+            continue
+        dimensions = row.get("dimensions") if isinstance(row.get("dimensions"), list) else []
+        if not dimensions:
+            continue
+
+        sku_key: str | None = None
+        title_val: Any = None
+
+        legacy_dim = next(
+            (dim for dim in dimensions if isinstance(dim, dict) and dim.get("id") == "sku"),
+            None,
+        )
+        if isinstance(legacy_dim, dict):
+            sku_raw = legacy_dim.get("value") or legacy_dim.get("id_value") or legacy_dim.get("sku")
+            title_val = legacy_dim.get("name") or legacy_dim.get("title") or legacy_dim.get("description")
+            sku_key = str(sku_raw).strip() if sku_raw not in (None, "") else None
+
+        if sku_key is None:
+            first_dim = next((dim for dim in dimensions if isinstance(dim, dict)), None)
+            if isinstance(first_dim, dict):
+                sku_raw = first_dim.get("value") or first_dim.get("id") or first_dim.get("sku")
+                title_val = first_dim.get("name") or first_dim.get("title") or title_val
+                sku_key = str(sku_raw).strip() if sku_raw not in (None, "") else None
+
+        if not sku_key:
+            continue
+
+        if title_val not in (None, ""):
+            sku_title_map[sku_key] = str(title_val).strip()
+
+    return sku_title_map, data_rows
+
+
+def _iso_z(dt: datetime) -> str:
+    """Вернуть ISO-строку в UTC с Z без миллисекунд."""
+
+    dt_utc = _ensure_utc(dt)
+    return dt_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    if dt.tzinfo:
+        return dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=timezone.utc)
+
+
+def _clean_sku(value: Any) -> int | None:
+    """Вернуть положительный SKU или None, чтобы не отправлять 0 в Ozon."""
+
+    try:
+        sku_int = int(value)
+    except Exception:
+        return None
+
+    if sku_int <= 0:
+        return None
+
+    return sku_int
+
+
+def msk_today_range() -> Tuple[str, str, str]:
+    """
+    Диапазон на сегодня в МСК, но границы в UTC.
+    Возвращает (from_iso, to_iso, pretty_text).
+    """
+    now_utc = datetime.utcnow()
+    now_msk = now_utc + MSK_SHIFT
+    d = now_msk.date()
+
+    start_utc = datetime(d.year, d.month, d.day) - MSK_SHIFT
+    end_utc = start_utc + timedelta(days=1) - timedelta(seconds=1)
+
+    pretty = (
+        f"{d.strftime('%d.%m.%Y')} 00:00 — "
+        f"{d.strftime('%d.%m.%Y')} 23:59 (МСК)"
+    )
+    return _iso_z(start_utc), _iso_z(end_utc), pretty
+
+
+def msk_current_month_range() -> Tuple[str, str, str]:
+    """
+    Диапазон с 1-го числа текущего месяца по сегодня (МСК).
+    Границы возвращаются в UTC, плюс красивый текст.
+    """
+    now_utc = datetime.utcnow()
+    now_msk = now_utc + MSK_SHIFT
+    today = now_msk.date()
+
+    first = date(today.year, today.month, 1)
+    if today.month == 12:
+        last_calendar = date(today.year, 12, 31)
+    else:
+        next_first = date(today.year, today.month + 1, 1)
+        last_calendar = next_first - timedelta(days=1)
+
+    end_date = today if today <= last_calendar else last_calendar
+
+    start_utc = datetime(first.year, first.month, first.day) - MSK_SHIFT
+    end_utc = datetime(
+        end_date.year, end_date.month, end_date.day, 23, 59, 59
+    ) - MSK_SHIFT
+
+    pretty = (
+        f"{first.strftime('%d.%m.%Y')} — "
+        f"{end_date.strftime('%d.%m.%Y')} (МСК)"
+    )
+    return _iso_z(start_utc), _iso_z(end_utc), pretty
+
+
+def msk_week_range() -> Tuple[str, str, str]:
+    """Возвращает диапазон за последние 7 дней с учётом МСК."""
+    now_utc = datetime.utcnow()
+    now_msk = now_utc + MSK_SHIFT
+    today = now_msk.date()
+    week_ago = today - timedelta(days=6)
+
+    start_utc = datetime(week_ago.year, week_ago.month, week_ago.day) - MSK_SHIFT
+    end_utc = datetime(today.year, today.month, today.day, 23, 59, 59) - MSK_SHIFT
+
+    pretty = (
+        f"{week_ago.strftime('%d.%m.%Y')} — "
+        f"{today.strftime('%d.%m.%Y')} (МСК)"
+    )
+    return _iso_z(start_utc), _iso_z(end_utc), pretty
+
+
+def msk_yesterday_range() -> Tuple[str, str, str]:
+    """Диапазон за вчера (МСК)."""
+
+    now_utc = datetime.utcnow()
+    now_msk = now_utc + MSK_SHIFT
+    yesterday = now_msk.date() - timedelta(days=1)
+
+    start_utc = datetime(yesterday.year, yesterday.month, yesterday.day) - MSK_SHIFT
+    end_utc = datetime(yesterday.year, yesterday.month, yesterday.day, 23, 59, 59) - MSK_SHIFT
+
+    pretty = (
+        f"{yesterday.strftime('%d.%m.%Y')} 00:00 — "
+        f"{yesterday.strftime('%d.%m.%Y')} 23:59 (МСК)"
+    )
+    return _iso_z(start_utc), _iso_z(end_utc), pretty
+
+
+def fmt_int(n: float | int) -> str:
+    return f"{int(round(n)):,.0f}".replace(",", " ")
+
+
+def fmt_rub0(n: float | int) -> str:
+    return f"{int(round(n)):,.0f} ₽".replace(",", " ")
+
+
+def s_num(x: Any) -> float:
+    try:
+        return float(str(x).replace(" ", "").replace(",", ".")) if x is not None else 0.0
+    except Exception:
+        return 0.0
+
+
+def _env_read_credentials() -> tuple[str, str, str | None]:
+    """Прочитать Client-Id/Api-Key (или OAuth токен) из env."""
+
+    client_id = (os.getenv("OZON_CLIENT_ID") or os.getenv("OZON_SELLER_CLIENT_ID") or "").strip()
+    api_key = (os.getenv("OZON_API_KEY") or os.getenv("OZON_SELLER_API_KEY") or "").strip()
+    oauth_token = (os.getenv("OZON_OAUTH_TOKEN") or os.getenv("OZON_SELLER_OAUTH_TOKEN") or "").strip() or None
+
+    if not client_id or not (api_key or oauth_token):
+        raise RuntimeError(
+            "Не заданы креденшалы OZON_CLIENT_ID / OZON_API_KEY (или OZON_OAUTH_TOKEN)"
+        )
+
+    return client_id, api_key, oauth_token
+
+
+class OzonAPIError(RuntimeError):
+    """Ошибка вызова Ozon API."""
+
+
+class RateLimitExceeded(OzonAPIError):
+    """429 Too Many Requests с исчерпанными ретраями."""
+
+
+class OzonProductNotFound(OzonAPIError):
+    """Товар не найден (404)."""
+
+
+@dataclass
+class OzonClientMetrics:
+    """Метрики производительности API клиента (как в a-ulianov/OzonAPI)."""
+    
+    total_requests: int = 0
+    successful_requests: int = 0
+    failed_requests: int = 0
+    total_response_time: float = 0.0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    rate_limit_hits: int = 0
+    retries_count: int = 0
+    
+    @property
+    def average_response_time(self) -> float:
+        return self.total_response_time / self.total_requests if self.total_requests > 0 else 0.0
+    
+    @property
+    def success_rate(self) -> float:
+        return (self.successful_requests / self.total_requests * 100) if self.total_requests > 0 else 0.0
+    
+    @property
+    def cache_hit_rate(self) -> float:
+        total_cache = self.cache_hits + self.cache_misses
+        return (self.cache_hits / total_cache * 100) if total_cache > 0 else 0.0
+    
+    def reset(self) -> None:
+        self.total_requests = 0
+        self.successful_requests = 0
+        self.failed_requests = 0
+        self.total_response_time = 0.0
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.rate_limit_hits = 0
+        self.retries_count = 0
+
+
+@dataclass
+class OzonClient:
+    """
+    Асинхронный клиент Ozon Seller API.
+    
+    Поддерживает конфигурацию через OzonAPIConfig (a-ulianov/OzonAPI стиль):
+    - Настраиваемые таймауты
+    - Экспоненциальный backoff при ретраях
+    - Rate limiting
+    - Метрики производительности
+    - Контекстный менеджер для корректного закрытия
+    """
+    
+    client_id: str
+    api_key: str
+    oauth_token: str | None = None
+    user_agent: str | None = None
+    extra_headers: dict[str, str] | None = None
+    total_timeout: float = 30.0
+    connect_timeout: float = 10.0
+    # Параметры ретраев из конфига (как в a-ulianov/OzonAPI)
+    max_retries: int = 5
+    retry_min_wait: float = 1.0
+    retry_max_wait: float = 10.0
+    retry_multiplier: float = 2.0
+    # Rate limiting
+    max_requests_per_second: int = 27
+    # Логирование
+    enable_request_logging: bool = True
+    # Метрики
+    enable_metrics: bool = False
+
+    def __post_init__(self) -> None:
+        # Таймауты как в a-ulianov/OzonAPI: из конфига или дефолты.
+        timeout = httpx.Timeout(
+            timeout=self.total_timeout,
+            connect=self.connect_timeout,
+        )
+        headers: dict[str, str] = {
+            "Client-Id": self.client_id,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if self.api_key:
+            headers["Api-Key"] = self.api_key
+        if self.user_agent:
+            headers["User-Agent"] = self.user_agent
+        if self.oauth_token:
+            headers["Authorization"] = f"Bearer {self.oauth_token}"
+        if self.extra_headers:
+            for key, value in self.extra_headers.items():
+                if key:
+                    headers[str(key)] = str(value)
+
+        self._http_client = httpx.AsyncClient(
+            timeout=timeout,
+            headers=headers,
+        )
+        self._seller_api: SellerAPI | None = None
+        self._metrics = OzonClientMetrics()
+        self._global_rate_limiter = _SimpleRateLimiter(
+            rate=self.max_requests_per_second,
+            per_seconds=1.0,
+        )
+        self._closed = False
+
+    @property
+    def metrics(self) -> OzonClientMetrics:
+        """Получить метрики производительности."""
+        return self._metrics
+
+    def get_metrics_summary(self) -> str:
+        """Форматированная сводка метрик (как в a-ulianov/OzonAPI)."""
+        m = self._metrics
+        return (
+            f"📊 Метрики OzonClient:\n"
+            f"  • Всего запросов: {m.total_requests}\n"
+            f"  • Успешных: {m.successful_requests} ({m.success_rate:.1f}%)\n"
+            f"  • Ошибок: {m.failed_requests}\n"
+            f"  • Среднее время: {m.average_response_time:.3f}s\n"
+            f"  • Rate limit hits: {m.rate_limit_hits}\n"
+            f"  • Retries: {m.retries_count}\n"
+            f"  • Cache hits: {m.cache_hits} ({m.cache_hit_rate:.1f}%)"
+        )
+
+    async def aclose(self) -> None:
+        """Закрыть HTTP клиент и освободить ресурсы."""
+        if self._closed:
+            return
+        self._closed = True
+        await self._http_client.aclose()
+        if self._seller_api and hasattr(self._seller_api, "close"):
+            try:
+                await self._seller_api.close()  # type: ignore[arg-type]
+            except Exception:
+                pass
+
+    async def __aenter__(self) -> "OzonClient":
+        """Контекстный менеджер для async with (как в a-ulianov/OzonAPI)."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Автоматическое закрытие при выходе из контекста."""
+        await self.aclose()
+
+    def _get_seller_api(self) -> SellerAPI | None:
+        if SellerAPI is None:
+            return None
+        if not self.client_id or not self.api_key:
+            return None
+        if self._seller_api is None:
+            self._seller_api = SellerAPI(client_id=self.client_id, api_key=self.api_key)
+        return self._seller_api
+
+
+    async def _post_with_status(
+        self, path: str, json: Dict[str, Any]
+    ) -> tuple[int, Dict[str, Any] | None]:
+        """Отправить POST-запрос и вернуть статус + JSON без raise_for_status."""
+
+        response = await self._post_with_retries(path, json)
+        status = response.status_code
+        request_id = response.headers.get("X-Request-Id") or response.headers.get("X-Ozon-Request-Id")
+        
+        # Специальное логирование для chat/send/message
+        is_chat_send = path == "/v1/chat/send/message"
+        
+        try:
+            data = response.json()
+        except Exception:
+            try:
+                raw = await response.aread()
+            except Exception:
+                raw = b""
+            logger.error(
+                "Ozon %s%s -> HTTP %s (request_id=%s) JSON decode failed: %s",
+                BASE_URL,
+                path if path.startswith("/") else f"/{path}",
+                status,
+                request_id or "-",
+                raw[:500],
+            )
+            return status, {"raw": raw.decode(errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)}
+
+        if status >= 400:
+            # Для некоторых ожидаемых ошибок логируем как DEBUG вместо WARNING
+            message = ""
+            if isinstance(data, dict):
+                message = (data.get("message") or data.get("error") or "").lower()
+            
+            is_expected_error = False
+            if path == "/v1/chat/start" and status == 403:
+                # Ожидаемая ошибка: чат недоступен для данного типа доставки
+                if "chat creation is not available" in message or "unable create chat" in message:
+                    is_expected_error = True
+            
+            if is_expected_error:
+                logger.debug(
+                    "Ozon %s%s -> HTTP %s (request_id=%s, expected): %s",
+                    BASE_URL,
+                    path if path.startswith("/") else f"/{path}",
+                    status,
+                    request_id or "-",
+                    data,
+                )
+            else:
+                log_level = logger.error if is_chat_send else logger.warning
+                log_level(
+                    "Ozon %s%s -> HTTP %s (request_id=%s): %s",
+                    BASE_URL,
+                    path if path.startswith("/") else f"/{path}",
+                    status,
+                    request_id or "-",
+                    data,
+                )
+        elif is_chat_send:
+            # Логируем успешную отправку сообщения
+            message_id = None
+            if isinstance(data, dict):
+                message_id = data.get("message_id") or data.get("id") or data.get("result")
+            logger.info(
+                "Ozon %s%s -> HTTP %s (request_id=%s) success: message_id=%s",
+                BASE_URL,
+                path,
+                status,
+                request_id or "-",
+                message_id,
+            )
+
+        return status, data if isinstance(data, dict) else None
+
+    async def post(self, path: str, json: Dict[str, Any]) -> Dict[str, Any]:
+        response = await self._post_with_retries(path, json)
+        request_id = response.headers.get("X-Request-Id") or response.headers.get("X-Ozon-Request-Id")
+        status = response.status_code
+        if status == 429:
+            raise RateLimitExceeded(
+                f"Ozon rate limit exceeded on {path}: HTTP 429 (request_id={request_id or '-'})."
+            )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            logger.warning(
+                "Ozon %s%s -> HTTP %s (request_id=%s)",
+                BASE_URL,
+                path if path.startswith("/") else f"/{path}",
+                status,
+                request_id or "-",
+            )
+            raise
+
+        try:
+            return response.json()
+        except Exception:
+            text = await response.aread()
+            logger.error(
+                "Ozon %s%s -> JSON decode failed (request_id=%s): %r",
+                BASE_URL,
+                path if path.startswith("/") else f"/{path}",
+                request_id or "-",
+                text[:500],
+            )
+            raise
+
+    def _calculate_backoff(self, attempt: int) -> float:
+        """
+        Экспоненциальный backoff как в a-ulianov/OzonAPI.
+        
+        Формула: min(retry_max_wait, retry_min_wait * (retry_multiplier ^ attempt))
+        """
+        delay = self.retry_min_wait * (self.retry_multiplier ** attempt)
+        return min(delay, self.retry_max_wait) + random.uniform(0, 0.25)
+
+    async def _post_with_retries(self, path: str, json: Dict[str, Any]) -> httpx.Response:
+        """
+        POST-запрос с экспоненциальным backoff и метриками (a-ulianov/OzonAPI стиль).
+        
+        Использует параметры из конфига:
+        - max_retries: максимальное число попыток
+        - retry_min_wait / retry_max_wait: границы задержки
+        - retry_multiplier: множитель для экспоненциального роста
+        """
+        suffix = path if path.startswith("/") else f"/{path}"
+        url = f"{BASE_URL}{suffix}"
+        attempts_429 = 0
+        attempts_other = 0
+        start_time = monotonic()
+
+        # Rate limiters: сначала глобальный, потом по пути
+        limiter = _PATH_RATE_LIMITERS.get(suffix)
+
+        while True:
+            try:
+                # Глобальный rate limiter (как в a-ulianov/OzonAPI)
+                await self._global_rate_limiter.wait()
+                # Специфичный для эндпоинта rate limiter
+                if limiter:
+                    await limiter.wait()
+                    
+                response = await self._http_client.post(url, json=json)
+                
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as exc:
+                attempts_other += 1
+                if self.enable_metrics:
+                    self._metrics.retries_count += 1
+                    
+                if attempts_other >= self.max_retries:
+                    if self.enable_metrics:
+                        self._metrics.failed_requests += 1
+                        self._metrics.total_requests += 1
+                    raise
+                    
+                delay = self._calculate_backoff(attempts_other - 1)
+                if self.enable_request_logging:
+                    logger.warning(
+                        "Ozon %s retry %s/%s after %.2fs due to %s",
+                        suffix,
+                        attempts_other,
+                        self.max_retries,
+                        delay,
+                        exc,
+                    )
+                await asyncio.sleep(delay)
+                continue
+
+            status = response.status_code
+            request_id = response.headers.get("X-Request-Id") or response.headers.get("X-Ozon-Request-Id")
+            
+            # Логирование запроса (как в a-ulianov/OzonAPI с enable_request_logging)
+            elapsed = monotonic() - start_time
+            if self.enable_request_logging and status < 400:
+                logger.debug(
+                    "Ozon %s -> HTTP %s (%.3fs, request_id=%s)",
+                    suffix,
+                    status,
+                    elapsed,
+                    request_id or "-",
+                )
+
+            if status == 429:
+                attempts_429 += 1
+                if self.enable_metrics:
+                    self._metrics.rate_limit_hits += 1
+                    self._metrics.retries_count += 1
+                    
+                retry_after_raw = response.headers.get("Retry-After")
+                retry_after: float | None = None
+                if retry_after_raw:
+                    try:
+                        retry_after = float(retry_after_raw)
+                    except Exception:
+                        retry_after = None
+                if retry_after is not None:
+                    retry_after = min(30.0, max(1.0, retry_after))
+                    
+                delay = retry_after if retry_after is not None else self._calculate_backoff(attempts_429 - 1)
+                
+                if attempts_429 >= self.max_retries:
+                    if self.enable_metrics:
+                        self._metrics.failed_requests += 1
+                        self._metrics.total_requests += 1
+                    logger.error(
+                        "Ozon %s -> HTTP 429 (request_id=%s) exceeded retries (%s)",
+                        suffix,
+                        request_id or "-",
+                        self.max_retries,
+                    )
+                    raise RateLimitExceeded(
+                        f"Ozon rate limit exceeded on {path}: HTTP 429 (request_id={request_id or '-'})."
+                    )
+                    
+                logger.warning(
+                    "Ozon %s retry %s/%s on HTTP 429 (request_id=%s) in %.2fs",
+                    suffix,
+                    attempts_429,
+                    self.max_retries,
+                    request_id or "-",
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if status in {500, 502, 503, 504}:
+                attempts_other += 1
+                if self.enable_metrics:
+                    self._metrics.retries_count += 1
+                    
+                if attempts_other < self.max_retries:
+                    delay = self._calculate_backoff(attempts_other - 1)
+                    logger.warning(
+                        "Ozon %s retry %s/%s on HTTP %s (request_id=%s) in %.2fs",
+                        suffix,
+                        attempts_other,
+                        self.max_retries,
+                        status,
+                        request_id or "-",
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+            # Обновляем метрики
+            if self.enable_metrics:
+                self._metrics.total_requests += 1
+                self._metrics.total_response_time += elapsed
+                if status < 400:
+                    self._metrics.successful_requests += 1
+                else:
+                    self._metrics.failed_requests += 1
+
+            return response
+
+    async def get(self, path: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        suffix = path if path.startswith("/") else f"/{path}"
+        url = f"{BASE_URL}{suffix}"
+        r = await self._http_client.get(url, params=params)
+        try:
+            data = r.json()
+        except Exception:
+            text = await r.aread()
+            logger.error("Ozon GET %s -> HTTP %s: %r", url, r.status_code, text[:500])
+            r.raise_for_status()
+            return {}
+        if r.status_code >= 400:
+            logger.error("Ozon GET %s -> HTTP %s: %r", url, r.status_code, data)
+            r.raise_for_status()
+        return data
+
+    # ---------- Финансы ----------
+
+    async def get_finance_totals(
+        self, date_from_iso: str, date_to_iso: str
+    ) -> Dict[str, Any]:
+        body = {
+            "date": {"from": date_from_iso, "to": date_to_iso},
+            "transaction_type": "all",
+        }
+        data = await self.post("/v3/finance/transaction/totals", body)
+        res = data.get("result") if isinstance(data, dict) else {}
+        return res or {}
+
+    # ---------- FBO заказы ----------
+
+    async def get_fbo_postings(
+        self, date_from_iso: str, date_to_iso: str
+    ) -> List[Dict[str, Any]]:
+        """Полная выборка FBO-заказов за период через прямой REST с пагинацией."""
+        postings: List[Dict[str, Any]] = []
+        limit = 1000
+        offset = 0
+
+        for _ in range(60):
+            body = {
+                "dir": "DESC",
+                "limit": limit,
+                "offset": offset,
+                "filter": {"since": date_from_iso, "to": date_to_iso},
+                "with": {"analytics_data": True, "financial_data": True, "legal_info": False},
+            }
+            page = await self.post("/v2/posting/fbo/list", body)
+            if not isinstance(page, dict):
+                logger.error("Unexpected FBO response: %r", page)
+                break
+
+            result = page.get("result")
+            if isinstance(result, list):
+                # Некоторые ответы приходят списком — явно приводим к словарю
+                items = result
+            elif isinstance(result, dict):
+                items = result.get("postings") or result.get("items") or []
+            else:
+                items = []
+
+            if not items:
+                break
+            # Помечаем тип отправки
+            for item in items:
+                if isinstance(item, dict):
+                    item["_fulfillment_type"] = "fbo"
+            postings.extend(i for i in items if isinstance(i, dict))
+            if len(items) < limit:
+                break
+            offset += limit
+
+        return postings
+
+    # ---------- FBS заказы ----------
+
+    async def get_fbs_postings(
+        self, date_from_iso: str, date_to_iso: str, *, status: str | None = None
+    ) -> List[Dict[str, Any]]:
+        """Полная выборка FBS-заказов за период через /v3/posting/fbs/list с пагинацией.
+        
+        Args:
+            date_from_iso: Начало периода в ISO формате
+            date_to_iso: Конец периода в ISO формате
+            status: Фильтр по статусу (опционально):
+                    awaiting_registration, acceptance_in_progress, awaiting_approve,
+                    awaiting_packaging, awaiting_deliver, arbitration, 
+                    client_arbitration, delivering, driver_pickup, delivered, cancelled
+        
+        Returns:
+            Список FBS отправок
+        """
+        postings: List[Dict[str, Any]] = []
+        limit = 1000
+        offset = 0
+
+        for _ in range(60):
+            filter_body: Dict[str, Any] = {
+                "since": date_from_iso,
+                "to": date_to_iso,
+            }
+            if status:
+                filter_body["status"] = status
+
+            body = {
+                "dir": "DESC",
+                "limit": limit,
+                "offset": offset,
+                "filter": filter_body,
+                "with": {
+                    "analytics_data": True,
+                    "financial_data": True,
+                    "barcodes": False,
+                    "translit": False,
+                },
+            }
+            
+            page = await self.post("/v3/posting/fbs/list", body)
+            if not isinstance(page, dict):
+                logger.error("Unexpected FBS response: %r", page)
+                break
+
+            result = page.get("result")
+            if isinstance(result, list):
+                items = result
+            elif isinstance(result, dict):
+                items = result.get("postings") or result.get("items") or []
+            else:
+                items = []
+
+            if not items:
+                break
+            # Помечаем тип отправки
+            for item in items:
+                if isinstance(item, dict):
+                    item["_fulfillment_type"] = "fbs"
+            postings.extend(i for i in items if isinstance(i, dict))
+            if len(items) < limit:
+                break
+            offset += limit
+
+        logger.info("FBS postings fetched: count=%d period=%s..%s", len(postings), date_from_iso[:10], date_to_iso[:10])
+        return postings
+
+    async def get_all_postings(
+        self, date_from_iso: str, date_to_iso: str, *, include_fbo: bool = True, include_fbs: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Получить объединённый список FBO и FBS отправок за период.
+        
+        Args:
+            date_from_iso: Начало периода в ISO формате
+            date_to_iso: Конец периода в ISO формате
+            include_fbo: Включить FBO отправки
+            include_fbs: Включить FBS отправки
+        
+        Returns:
+            Объединённый список отправок с полем _fulfillment_type ("fbo" или "fbs")
+        """
+        all_postings: List[Dict[str, Any]] = []
+        
+        if include_fbo:
+            try:
+                fbo = await self.get_fbo_postings(date_from_iso, date_to_iso)
+                all_postings.extend(fbo)
+                logger.info("FBO postings: %d", len(fbo))
+            except Exception as exc:
+                logger.warning("Failed to fetch FBO postings: %s", exc)
+        
+        if include_fbs:
+            try:
+                fbs = await self.get_fbs_postings(date_from_iso, date_to_iso)
+                all_postings.extend(fbs)
+                logger.info("FBS postings: %d", len(fbs))
+            except Exception as exc:
+                logger.warning("Failed to fetch FBS postings: %s", exc)
+        
+        # Сортируем по дате создания (новые первые)
+        all_postings.sort(
+            key=lambda p: p.get("created_at") or p.get("in_process_at") or "",
+            reverse=True
+        )
+        
+        logger.info("Total postings (FBO+FBS): %d", len(all_postings))
+        return all_postings
+
+    # ---------- Аккаунт ----------
+
+    async def get_seller_info(self) -> Dict[str, Any]:
+        """Получить информацию о продавце через SellerAPI /v1/seller/info."""
+
+        api = self._get_seller_api()
+        if api and hasattr(api, "seller_info"):
+            try:
+                if hasattr(api, "initialize"):
+                    await api.initialize()  # type: ignore[func-returns-value]
+                res = await api.seller_info()  # type: ignore[call-arg]
+                if hasattr(res, "model_dump"):
+                    return res.model_dump()
+                if isinstance(res, dict):
+                    return res
+            except Exception:
+                logger.exception("SellerAPI.seller_info failed, fallback to REST")
+
+        data = await self.post("/v1/seller/info", {})
+        if not isinstance(data, dict):
+            logger.error("Unexpected seller info response: %r", data)
+            raise OzonAPIError("Некорректный ответ seller/info")
+
+        # Новые ответы SellerAPI могут не содержать поля result, сразу отдаём payload
+        if "result" in data and isinstance(data.get("result"), dict):
+            payload = data["result"]
+        else:
+            payload = data
+
+        if isinstance(payload, dict):
+            logger.info(
+                "Seller info fetched: company=%s subscription=%s",
+                payload.get("company", {}).get("name") if isinstance(payload.get("company"), dict) else payload.get("company"),
+                payload.get("subscription"),
+            )
+            return payload
+
+        raise OzonAPIError("Не удалось получить информацию о продавце")
+
+    # ---------- Отзывы ----------
+
+    async def get_reviews(
+        self,
+        date_from: datetime,
+        date_to: datetime,
+        *,
+        limit_per_page: int = 80,
+        max_count: int | None = 200,
+    ) -> List[Dict[str, Any]]:
+        """
+        Загрузить отзывы через /v1/review/list с корректной пагинацией по last_id.
+
+        ВАЖНО:
+        - Ozon ожидает поля `date_from` и `date_to` в корне тела запроса, а не
+          `filter.date.{from,to}`.
+        - Пагинация делается по `last_id` + `has_next`. Offset используем не будем,
+          чтобы не застревать на старых отзывах.
+        """
+
+        safe_limit = max(20, min(limit_per_page, 100))
+        max_reviews = max_count if max_count is not None else 10_000
+
+        date_from_utc = _ensure_utc(date_from)
+        date_to_utc = _ensure_utc(date_to)
+
+        reviews: List[Dict[str, Any]] = []
+        last_id: str | None = None
+        pages = 0
+
+        while len(reviews) < max_reviews:
+            body: Dict[str, Any] = {
+                "date_from": _iso_z(date_from_utc),
+                "date_to": _iso_z(date_to_utc),
+                "limit": safe_limit,
+            }
+
+            # Ozon поддерживает пагинацию через last_id + has_next.
+            # Если last_id уже получен, продолжаем с него.
+            if last_id:
+                body["last_id"] = last_id
+
+            data = await self.post("/v1/review/list", body)
+            if not isinstance(data, dict):
+                logger.error("Unexpected reviews response: %r", data)
+                break
+
+            res = data.get("result") or data
+            if isinstance(res, dict):
+                arr = res.get("reviews") or res.get("feedbacks") or res.get("items") or []
+                has_next = bool(res.get("has_next") or res.get("hasNext"))
+                next_last_id = res.get("last_id") or res.get("lastId")
+            elif isinstance(res, list):
+                arr = res
+                has_next = False
+                next_last_id = None
+            else:
+                logger.error("Unexpected reviews result payload: %r", res)
+                break
+
+            if not isinstance(arr, list):
+                logger.error("Unexpected reviews array type: %r", arr)
+                break
+
+            page_items = [x for x in arr if isinstance(x, dict)]
+            if not page_items:
+                # Пустая страница — выходим
+                break
+
+            reviews.extend(page_items)
+            pages += 1
+
+            if len(reviews) >= max_reviews:
+                break
+
+            if has_next and next_last_id:
+                # Нормальная пагинация по last_id
+                last_id = str(next_last_id)
+                continue
+
+            # has_next == False или нет last_id — дальше страниц нет
+            break
+
+        logger.info(
+            "Reviews fetched: %s items for %s..%s limit=%s pages=%s max=%s",
+            len(reviews),
+            _iso_z(date_from_utc),
+            _iso_z(date_to_utc),
+            safe_limit,
+            pages,
+            max_count,
+        )
+        return reviews[:max_reviews]
+
+    async def get_reviews_page(
+        self, date_start_iso: str, date_end_iso: str, *, limit: int = 100, page: int = 1
+    ) -> tuple[int, Dict[str, Any] | None]:
+        """
+        Получить страницу отзывов через /v1/review/list без исключений.
+
+        Возвращает (HTTP статус, JSON или None).
+        """
+
+        body = {
+            "page": max(1, page),
+            "limit": max(1, min(limit, 100)),
+            "date_start": date_start_iso,
+            "date_end": date_end_iso,
+        }
+        return await self._post_with_status("/v1/review/list", body)
+
+    async def review_list(
+        self,
+        *,
+        limit: int = 100,
+        last_id: str | None = None,
+        sort_dir: str = "DESC",
+        status: str = "ALL",
+    ) -> dict | None:
+        """Обёртка над /v1/review/list для новых бета-методов отзывов."""
+
+        body: Dict[str, Any] = {
+            "limit": max(1, min(limit, 100)),
+            "sort_dir": sort_dir or "DESC",
+            "status": status or "ALL",
+        }
+        if last_id:
+            body["last_id"] = last_id
+
+        data = await self.post("/v1/review/list", body)
+        if not isinstance(data, dict):
+            logger.warning("Unexpected /v1/review/list response: %r", data)
+            return None
+        return data.get("result") if isinstance(data.get("result"), dict) else data
+
+    async def review_info(self, review_id: str) -> dict | None:
+        """Получить детали конкретного отзыва через /v1/review/info."""
+
+        payload = {"review_id": review_id}
+        data = await self.post("/v1/review/info", payload)
+        if not isinstance(data, dict):
+            logger.warning("Unexpected /v1/review/info response: %r", data)
+            return None
+        return data.get("result") if isinstance(data.get("result"), dict) else data
+
+    async def review_comment_list(self, review_id: str, *, limit: int = 50) -> dict | None:
+        """Получить комментарии/ответы продавца через /v1/review/comment/list."""
+
+        body = {"review_id": review_id, "limit": max(1, min(limit, 50))}
+        data = await self.post("/v1/review/comment/list", body)
+        if not isinstance(data, dict):
+            logger.warning("Unexpected /v1/review/comment/list response: %r", data)
+            return None
+        return data.get("result") if isinstance(data.get("result"), dict) else data
+
+    async def review_comment_create(
+        self, review_id: str, text: str, *, mark_as_processed: bool = True
+    ) -> dict | None:
+        """Отправить комментарий продавца к отзыву через /v1/review/comment/create."""
+
+        text_clean = (text or "").strip()
+        if len(text_clean) < 2:
+            raise OzonAPIError("Ответ пустой или слишком короткий для отправки в Ozon")
+
+        body: Dict[str, Any] = {
+            "review_id": review_id,
+            "text": text_clean,
+        }
+        if mark_as_processed:
+            body["mark_review_as_processed"] = True
+
+        logger.info(
+            "review_comment_create POST /v1/review/comment/create review_id=%s len=%s",
+            review_id,
+            len(text_clean),
+        )
+
+        data = await self.post("/v1/review/comment/create", body)
+        if not isinstance(data, dict):
+            logger.warning("Unexpected /v1/review/comment/create response: %r", data)
+            return None
+
+        result = data.get("result") if isinstance(data.get("result"), dict) else data
+        logger.info("review_comment_create %s ok", review_id)
+        return result
+
+    async def question_list(self, *, limit: int = 50, page: int | None = None) -> GetQuestionListResponse | dict | None:
+        """Обёртка над /v1/question/list с валидацией схемы."""
+
+        body: Dict[str, Any] = {"limit": max(1, min(limit, 100))}
+        if page is not None:
+            body["page"] = max(1, page)
+
+        raw = await self.post("/v1/question/list", body)
+        if not isinstance(raw, dict):
+            logger.warning("Unexpected /v1/question/list response: %r", raw)
+            return None
+
+        payload = raw.get("result") if isinstance(raw.get("result"), dict) else raw
+        try:
+            parsed = GetQuestionListResponse.model_validate(payload)
+            return parsed
+        except ValidationError as exc:
+            logger.warning("Failed to parse questions response: %s", exc)
+            return payload
+
+    async def question_answer(
+        self, question_id: str, text: str, *, sku: int | None = None
+    ) -> dict | None:
+        """Отправить ответ на вопрос через /v1/question/answer/create."""
+
+        text_clean = (text or "").strip()
+        if len(text_clean) < 2:
+            raise OzonAPIError("Ответ пустой или слишком короткий для отправки в Ozon")
+
+        logger.debug(
+            "Sending Ozon question answer: question_id=%s, len(text)=%d, text_preview=%r",
+            question_id,
+            len(text_clean),
+            text_clean[:80],
+        )
+
+        body = {"question_id": question_id, "text": text_clean}
+
+        sku_clean = _clean_sku(sku)
+        if sku_clean is not None:
+            body["sku"] = sku_clean
+        data = await self.post("/v1/question/answer/create", body)
+        if not isinstance(data, dict):
+            logger.warning("Unexpected /v1/question/answer/create response: %r", data)
+            return None
+        return data.get("result") if isinstance(data.get("result"), dict) else data
+
+    async def question_answer_list(
+        self, question_id: str, *, limit: int = 20, sku: int | None = None, seller_only: bool = True
+    ) -> list[QuestionAnswer]:
+        """Получить ответы на вопрос.
+        
+        Args:
+            question_id: ID вопроса
+            limit: Максимум ответов
+            sku: SKU товара
+            seller_only: Если True, возвращает только ответы продавца (по умолчанию True)
+        
+        Returns:
+            Список ответов (только от продавца, если seller_only=True)
+        """
+        body = {"question_id": question_id, "limit": max(1, min(limit, 50))}
+
+        sku_clean = _clean_sku(sku)
+        if sku_clean is not None:
+            body["sku"] = sku_clean
+
+        await _question_answer_rate_limiter.wait()
+        status_code, payload = await self._post_with_status(
+            "/v1/question/answer/list", body
+        )
+        if status_code >= 400:
+            raise OzonAPIError(
+                f"Ошибка Ozon API: HTTP {status_code} {payload.get('message') if isinstance(payload, dict) else payload}"
+            )
+        if not isinstance(payload, dict):
+            logger.warning("Unexpected /v1/question/answer/list response: %r", payload)
+            return []
+
+        result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+        raw_answers = result.get("answers") if isinstance(result, dict) else []
+        if not isinstance(raw_answers, list):
+            raw_answers = result.get("items") if isinstance(result, dict) else []
+        
+        # Логируем сырой ответ для отладки (первые 2 элемента)
+        if raw_answers:
+            logger.info(
+                "Question answers raw data for %s: count=%d, sample=%r",
+                question_id, len(raw_answers), raw_answers[:2]
+            )
+        
+        answers: list[QuestionAnswer] = []
+        for item in raw_answers if isinstance(raw_answers, list) else []:
+            if not isinstance(item, dict):
+                continue
+            
+            # Определяем тип автора ответа
+            # Ozon может возвращать разные поля: author_type, user_type, author.type и т.д.
+            author_type = (
+                item.get("author_type") 
+                or item.get("authorType")
+                or item.get("user_type")
+                or item.get("userType")
+                or (item.get("author", {}) or {}).get("type")
+                or (item.get("author", {}) or {}).get("role")
+                or ""
+            )
+            if isinstance(author_type, str):
+                author_type = author_type.lower().strip()
+            else:
+                author_type = ""
+            
+            # Проверяем, является ли автор продавцом
+            # Возможные значения: "seller", "shop", "store", "merchant", "company"
+            is_seller = author_type in ("seller", "shop", "store", "merchant", "company", "itom")
+            
+            # Также проверяем явное поле is_seller
+            if not is_seller and item.get("is_seller") is True:
+                is_seller = True
+            if not is_seller and item.get("isSeller") is True:
+                is_seller = True
+            
+            # Если author_type пустой, но есть author.name == имя магазина, считаем это ответом продавца
+            # Типичные имена: "ITOM", название магазина
+            author_name = (
+                (item.get("author", {}) or {}).get("name", "")
+                or item.get("author_name", "")
+                or item.get("authorName", "")
+                or ""
+            ).strip().upper()
+            
+            # Если author_type не определён, но имя автора похоже на название магазина
+            if not is_seller and not author_type:
+                # Если имя автора — ITOM или похоже на название магазина (не человеческое имя)
+                # Человеческие имена обычно не полностью в верхнем регистре или содержат имя/фамилию
+                if author_name == "ITOM" or author_name == "ITEM":
+                    is_seller = True
+            
+            # Логируем для отладки
+            if not is_seller and author_type:
+                logger.debug(
+                    "Non-seller answer found: question=%s, author_type=%s, author_name=%s",
+                    question_id, author_type, author_name
+                )
+            
+            answer = QuestionAnswer(
+                id=str(item.get("id") or item.get("answer_id") or item.get("answerId") or "") or None,
+                text=str(item.get("text") or item.get("answer") or "") or None,
+                created_at=str(item.get("created_at") or item.get("createdAt") or "") or None,
+                updated_at=str(item.get("updated_at") or item.get("updatedAt") or "") or None,
+                author_type=author_type or None,
+                is_seller=is_seller,
+            )
+            
+            # Фильтруем: если seller_only=True, добавляем только ответы продавца
+            if seller_only:
+                if is_seller:
+                    answers.append(answer)
+                else:
+                    logger.info(
+                        "Skipping non-seller answer: question=%s, author_type=%s, author_name=%s, text=%s",
+                        question_id, author_type, author_name, (answer.text or "")[:50]
+                    )
+            else:
+                answers.append(answer)
+        
+        return answers
+
+    async def question_answer_delete(self, answer_id: str) -> dict | None:
+        """Удалить ответ продавца на вопрос через /v1/question/answer/delete."""
+
+        body = {"answer_id": answer_id}
+        status_code, payload = await self._post_with_status(
+            "/v1/question/answer/delete", body
+        )
+        if status_code >= 400:
+            raise OzonAPIError(
+                f"Ошибка Ozon API: HTTP {status_code} {payload.get('message') if isinstance(payload, dict) else payload}"
+            )
+        if payload is None:
+            logger.warning("Empty response for /v1/question/answer/delete %s", answer_id)
+        return payload
+
+    async def create_review_comment(
+        self,
+        review_id: str,
+        text: str,
+        mark_as_processed: bool = True,
+        parent_comment_id: str | None = None,
+    ) -> dict:
+        body: dict[str, Any] = {
+            "review_id": review_id,
+            "text": text,
+            "mark_review_as_processed": mark_as_processed,
+        }
+        if parent_comment_id:
+            body["parent_comment_id"] = parent_comment_id
+
+        try:
+            res = await self.post("/v1/review/comment/create", body)
+        except httpx.HTTPStatusError as exc:
+            logger.warning(
+                "Failed to create review comment %s HTTP %s: %s",
+                review_id,
+                exc.response.status_code,
+                exc,
+            )
+            raise
+        except Exception as exc:
+            logger.warning("Failed to create review comment %s: %s", review_id, exc)
+            raise
+
+        logger.info(
+            "Review %s comment created via /v1/review/comment/create: %s",
+            review_id,
+            res,
+        )
+        return res
+
+    async def get_analytics_by_sku(
+        self, date_from: str, date_to: str, *, limit: int = 1000, offset: int = 0
+    ) -> tuple[int, Dict[str, Any] | None]:
+        """Вызов /v1/analytics/data для получения метаданных по SKU."""
+
+        if _analytics_forbidden:
+            return 403, None
+
+        body = {
+            "date_from": date_from,
+            "date_to": date_to,
+            "dimension": ["sku"],
+            "metrics": ["revenue"],
+            "filters": [],
+            "sort": [{"key": "revenue", "order": "DESC"}],
+            "limit": max(1, min(limit, 1000)),
+            "offset": max(0, offset),
+        }
+        return await self._post_with_status("/v1/analytics/data", body)
+
+    async def get_sku_title_map(
+        self, date_from: str, date_to: str, *, limit: int = 1000, offset: int = 0
+    ) -> tuple[int, Dict[str, str], list[Any]]:
+        """Получить мапу SKU -> название через /v1/analytics/data."""
+
+        status, payload = await self.get_analytics_by_sku(
+            date_from, date_to, limit=limit, offset=offset
+        )
+        if status == 403 and isinstance(payload, dict):
+            code = payload.get("code")
+            message = str(payload.get("message") or "").lower()
+            if code == 7 or "required role" in message:
+                global _analytics_forbidden, _analytics_forbidden_logged
+                _analytics_forbidden = True
+                if not _analytics_forbidden_logged:
+                    logger.warning(
+                        "Analytics /v1/analytics/data is forbidden for the current key: %s",
+                        payload,
+                    )
+                    _analytics_forbidden_logged = True
+                return status, {}, []
+        if status >= 400 and not _analytics_forbidden:
+            logger.warning(
+                "Analytics /v1/analytics/data HTTP %s for %s..%s",
+                status,
+                date_from,
+                date_to,
+            )
+        if not isinstance(payload, dict):
+            return status, {}, []
+
+        sku_title_map, sample_rows = _parse_sku_title_map(payload)
+        return status, sku_title_map, sample_rows
+
+    async def get_product_name(self, product_id: str) -> str | None:
+        """Получить название товара по product_id с кэшем и мягкими фолбэками."""
+
+        if not product_id:
+            return None
+
+        if product_id in _product_name_cache:
+            return _product_name_cache[product_id]
+        if product_id in _product_info_miss_cache:
+            return None
+
+        normalized_id = str(product_id).strip()
+        payload_id: int | str = normalized_id
+        if normalized_id.isdigit():
+            try:
+                payload_id = int(normalized_id)
+            except Exception:
+                payload_id = normalized_id
+
+        payload: dict[str, int | str] = {"product_id": payload_id}
+
+        def _extract_name(res: dict[str, Any] | None) -> str | None:
+            if not isinstance(res, dict):
+                return None
+            return str(
+                next(
+                    (
+                        v
+                        for v in (
+                            res.get("name"),
+                            res.get("title"),
+                            res.get("product_name"),
+                            res.get("offer_id"),
+                        )
+                        if v not in (None, "")
+                    ),
+                    "",
+                )
+            ).strip() or None
+
+        api = self._get_seller_api()
+        if api and hasattr(api, "product_info"):
+            try:
+                res = await api.product_info(product_id=payload["product_id"])  # type: ignore[arg-type]
+                if hasattr(res, "model_dump"):
+                    res = res.model_dump()
+                name = _extract_name(res if isinstance(res, dict) else None)
+                if name:
+                    _product_name_cache[product_id] = name
+                    return name
+            except Exception as exc:
+                logger.warning("SellerAPI product_info failed for %s: %s", product_id, exc)
+
+        paths = ("/v1/product/info", "/v2/product/info")
+        last_status: int | None = None
+        for path in paths:
+            try:
+                data = await self.post(path, payload)
+                last_status = 200
+            except httpx.HTTPStatusError as exc:
+                last_status = exc.response.status_code
+                if last_status == 404:
+                    continue
+                logger.warning(
+                    "Product info HTTP %s for %s at %s",
+                    last_status,
+                    product_id,
+                    path,
+                )
+                continue
+            except Exception as exc:
+                logger.warning("Product info failed for %s on %s: %s", product_id, path, exc)
+                continue
+
+            if not isinstance(data, dict):
+                logger.warning("Unexpected product info response for %s at %s: %r", product_id, path, data)
+                continue
+
+            res = data.get("result") if isinstance(data.get("result"), dict) else data
+            name = _extract_name(res if isinstance(res, dict) else None)
+            if name:
+                _product_name_cache[product_id] = name
+                return name
+
+        if last_status == 404 or product_id not in _product_not_found_warned:
+            logger.warning("Product %s not found in Ozon catalog (cached miss)", product_id)
+            _product_not_found_warned.add(product_id)
+        _product_name_cache[product_id] = None
+        _product_info_miss_cache.add(product_id)
+        return None
+
+    # back-compat
+    get_account_info = get_seller_info
+
+    async def get_product_stocks(
+        self,
+        *,
+        offer_id: str | None = None,
+        sku: int | None = None,
+        product_id: str | None = None,
+    ) -> ProductStockInfo | None:
+        """Fetch stock info for a single product via /v4/product/info/stocks."""
+
+        body: Dict[str, Any] = {"filter": {}, "limit": 1}
+        if offer_id:
+            body["offer_id"] = [offer_id]
+            body["filter"]["offer_id"] = [offer_id]
+        if sku:
+            body["sku"] = [sku]
+            body["filter"]["sku"] = [sku]
+        if product_id:
+            body["product_id"] = [product_id]
+            body["filter"]["product_id"] = [product_id]
+
+        status_code, data = await self._post_with_status("/v4/product/info/stocks", body)
+        if status_code >= 400 or not isinstance(data, dict):
+            message = None
+            if isinstance(data, dict):
+                message = data.get("message") or data.get("error")
+            raise OzonAPIError(
+                f"Ошибка Ozon API при получении остатков: HTTP {status_code} {message or data}"
+            )
+
+        payload = data.get("result") if isinstance(data.get("result"), list) else data.get("result") or data
+        items = payload if isinstance(payload, list) else payload.get("items") if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            items = []
+
+        parsed: list[ProductStockInfo] = []
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                parsed.append(ProductStockInfo.model_validate(raw))
+            except ValidationError as exc:
+                logger.warning("Failed to parse product stock payload: %s", exc)
+                continue
+
+        if not parsed:
+            lookup_key = offer_id or str(sku or product_id)
+            if lookup_key and lookup_key not in _stock_not_found_warned:
+                logger.warning("No stock info returned for %s", lookup_key)
+                _stock_not_found_warned.add(lookup_key)
+            return None
+
+        return parsed[0]
+
+    async def get_product_stocks_by_warehouse_fbs(
+        self, *, offer_id: str | None = None, sku: int | None = None
+    ) -> list[StockItem]:
+        """Fetch FBS stocks by warehouse via /v1/product/info/stocks-by-warehouse/fbs."""
+
+        body: Dict[str, Any] = {"limit": 100, "offset": 0}
+        if offer_id:
+            body["offer_id"] = [offer_id]
+        if sku:
+            body["sku"] = [sku]
+
+        status_code, data = await self._post_with_status(
+            "/v1/product/info/stocks-by-warehouse/fbs", body
+        )
+        if status_code >= 400 or not isinstance(data, dict):
+            message = None
+            if isinstance(data, dict):
+                message = data.get("message") or data.get("error")
+            raise OzonAPIError(
+                f"Ошибка Ozon API при получении остатков по складам: HTTP {status_code} {message or data}"
+            )
+
+        payload = data.get("result") if isinstance(data.get("result"), dict) else data
+        items = payload.get("items") if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            items = []
+
+        stocks: list[StockItem] = []
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                stocks.append(StockItem.model_validate(raw))
+            except ValidationError as exc:
+                logger.warning("Failed to parse warehouse stock payload: %s", exc)
+                continue
+        return stocks
+
+    async def list_products(
+        self,
+        *,
+        limit: int = 100,
+        last_id: str | None = None,
+        visibility: str = "ALL",
+        offer_ids: Iterable[str] | None = None,
+        product_ids: Iterable[int] | None = None,
+    ) -> ProductListPage:
+        filter_: dict[str, Any] = {"visibility": visibility}
+        if offer_ids:
+            filter_["offer_id"] = list(offer_ids)
+        if product_ids:
+            filter_["product_id"] = list(product_ids)
+
+        body: Dict[str, Any] = {
+            "filter": filter_,
+            "limit": limit,
+            "last_id": last_id or "",
+        }
+
+        status_code, data = await self._post_with_status("/v3/product/list", body)
+        if status_code >= 400:
+            raise OzonAPIError(f"Product list failed with HTTP {status_code}: {data}")
+
+        items_raw = []
+        result = data.get("result") if isinstance(data, dict) else None
+        if isinstance(result, dict):
+            items_raw = result.get("items") if isinstance(result.get("items"), list) else []
+            last_id_val = result.get("last_id") if isinstance(result.get("last_id"), str) else None
+        elif isinstance(data, dict):
+            items_raw = data.get("items") if isinstance(data.get("items"), list) else []
+            last_id_val = data.get("last_id") if isinstance(data.get("last_id"), str) else None
+        else:
+            last_id_val = None
+
+        items: list[ProductListItem] = []
+        for raw in items_raw:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                items.append(ProductListItem.model_validate(raw))
+            except ValidationError as exc:
+                logger.warning("Failed to parse product list item: %s", exc)
+                continue
+
+        if not items and not _product_list_warned:
+            logger.warning("Product list returned no items")
+            globals()["_product_list_warned"] = True
+
+        return ProductListPage(items=items, last_id=last_id_val)
+
+    async def product_info_list(
+        self,
+        *,
+        product_ids: Sequence[int | str] | None = None,
+        offer_ids: Sequence[str] | None = None,
+        skus: Sequence[int | str] | None = None,
+    ) -> list[ProductInfoItem]:
+        """Wrapper for /v3/product/info/list.
+
+        Exactly one identifier group must be provided.
+        """
+
+        has_product_ids = bool(product_ids)
+        has_offer_ids = bool(offer_ids)
+        has_skus = bool(skus)
+
+        if (has_product_ids + has_offer_ids + has_skus) != 1:
+            raise ValueError("Provide exactly one of product_ids, offer_ids or skus")
+
+        if has_product_ids:
+            body: Dict[str, Any] = {
+                "product_id": [str(pid) for pid in product_ids]
+            }
+        elif has_offer_ids:
+            body = {"offer_id": list(offer_ids)}
+        else:
+            body = {"sku": [str(s) for s in skus]}
+
+        logger.debug(
+            "Ozon /v3/product/info/list request: %s", body,
+        )
+        status_code, data = await self._post_with_status("/v3/product/info/list", body)
+        logger.info(
+            "Ozon /v3/product/info/list HTTP %s, payload keys=%s",
+            status_code,
+            list(data.keys()) if isinstance(data, dict) else None,
+        )
+        if status_code >= 400:
+            raise OzonAPIError(
+                f"Product info list failed with HTTP {status_code}: {data}"
+            )
+
+        payload_candidates: list[Any] = []
+        if isinstance(data, dict):
+            payload_candidates.append(data.get("result"))
+            payload_candidates.append(data)
+
+        items_raw: list[Any] = []
+        for payload in payload_candidates:
+            if isinstance(payload, list):
+                items_raw = payload
+                break
+            if isinstance(payload, dict):
+                maybe_items = payload.get("items")
+                if isinstance(maybe_items, list):
+                    items_raw = maybe_items
+                    break
+
+        items: list[ProductInfoItem] = []
+        for raw in items_raw:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                items.append(ProductInfoItem.model_validate(raw))
+            except ValidationError as exc:
+                logger.warning("Failed to parse product info list item: %s", exc)
+                continue
+        return items
+
+    async def get_product_titles_cached(
+        self,
+        *,
+        product_ids: Sequence[int | str] | None = None,
+        offer_ids: Sequence[str] | None = None,
+        skus: Sequence[int | str] | None = None,
+        chunk_size: int = 80,
+    ) -> tuple[dict[str, str], dict[str, str], dict[int, str]]:
+        """Возвращает названия товаров по product_id/offer_id/sku с TTL-кешем и одним батчем per kind."""
+
+        pid_map: dict[str, str] = {}
+        offer_map: dict[str, str] = {}
+        sku_map: dict[int, str] = {}
+
+        def _uniq_str(seq: Sequence[int | str] | None) -> list[str]:
+            seen = set()
+            out: list[str] = []
+            for val in seq or []:
+                sval = str(val).strip()
+                if not sval or sval in seen:
+                    continue
+                seen.add(sval)
+                out.append(sval)
+            return out
+
+        def _uniq_int(seq: Sequence[int | str] | None) -> list[int]:
+            seen = set()
+            out: list[int] = []
+            for val in seq or []:
+                try:
+                    ival = int(val)
+                except Exception:
+                    continue
+                if ival in seen:
+                    continue
+                seen.add(ival)
+                out.append(ival)
+            return out
+
+        missing_pids = _uniq_str(product_ids)
+        missing_offers = _uniq_str(offer_ids)
+        missing_skus = _uniq_int(skus)
+
+        # fill from cache
+        for pid in list(missing_pids):
+            cached = _get_cached_product_title("pid", pid)
+            if cached:
+                pid_map[pid] = cached
+        missing_pids = [pid for pid in missing_pids if pid not in pid_map]
+
+        for off in list(missing_offers):
+            cached = _get_cached_product_title("offer", off)
+            if cached:
+                offer_map[off] = cached
+        missing_offers = [off for off in missing_offers if off not in offer_map]
+
+        for sku in list(missing_skus):
+            cached = _get_cached_product_title("sku", sku)
+            if cached:
+                sku_map[sku] = cached
+        missing_skus = [sku for sku in missing_skus if sku not in sku_map]
+
+        async def _fetch_and_cache(kind: str, vals: list) -> None:
+            if not vals:
+                return
+            for i in range(0, len(vals), chunk_size):
+                chunk = vals[i : i + chunk_size]
+                try:
+                    if kind == "pid":
+                        items = await self.product_info_list(product_ids=chunk)
+                    elif kind == "offer":
+                        items = await self.product_info_list(offer_ids=chunk)
+                    else:
+                        items = await self.product_info_list(skus=chunk)
+                except Exception as exc:
+                    logger.warning("product_info_list failed for kind=%s size=%s: %s", kind, len(chunk), exc)
+                    continue
+                for it in items or []:
+                    payload = it.model_dump() if hasattr(it, "model_dump") else it.__dict__
+                    if not isinstance(payload, dict):
+                        continue
+                    _set_cached_product_info(payload)
+                    name = safe_strip(payload.get("name"))
+                    if not name:
+                        continue
+                    if payload.get("product_id") is not None:
+                        pid = str(payload["product_id"])
+                        pid_map[pid] = name
+                    if payload.get("offer_id"):
+                        offer_map[str(payload["offer_id"])] = name
+                    if payload.get("sku") is not None:
+                        try:
+                            sku_map[int(payload["sku"])] = name
+                        except Exception:
+                            pass
+
+        await _fetch_and_cache("pid", missing_pids)
+        await _fetch_and_cache("offer", missing_offers)
+        await _fetch_and_cache("sku", missing_skus)
+
+        return pid_map, offer_map, sku_map
+
+    async def get_product_info_list(
+        self,
+        *,
+        product_ids: Sequence[int | str] | None = None,
+        offer_ids: Sequence[str] | None = None,
+        skus: Sequence[int | str] | None = None,
+    ) -> list[ProductInfoItem]:
+        return await self.product_info_list(
+            product_ids=product_ids, offer_ids=offer_ids, skus=skus
+        )
+
+    async def generate_barcodes(self, product_ids: list[int]) -> list[str]:
+        if not product_ids:
+            raise ValueError("generate_barcodes: product_ids must not be empty")
+
+        body: Dict[str, Any] = {"product_ids": product_ids}
+        logger.debug("Ozon /v1/barcode/generate request: %s", body)
+        status_code, data = await self._post_with_status("/v1/barcode/generate", body)
+        logger.info(
+            "Ozon /v1/barcode/generate HTTP %s, payload keys=%s",
+            status_code,
+            list(data.keys()) if isinstance(data, dict) else None,
+        )
+        if status_code >= 400:
+            raise OzonAPIError(
+                f"Barcode generation failed with HTTP {status_code}: {data}"
+            )
+
+        result = data.get("result") if isinstance(data, dict) else None
+
+        parsed: list[str] = []
+
+        def _collect(entry: Any) -> None:
+            if isinstance(entry, str):
+                parsed.append(entry)
+            elif isinstance(entry, dict):
+                if entry.get("barcode"):
+                    parsed.append(str(entry["barcode"]))
+                nested = entry.get("barcodes")
+                if isinstance(nested, list):
+                    for val in nested:
+                        if val:
+                            parsed.append(str(val))
+
+        if isinstance(result, dict):
+            barcodes = result.get("barcodes")
+            if isinstance(barcodes, list):
+                for entry in barcodes:
+                    _collect(entry)
+
+            if not parsed:
+                fallback = result.get("barcodes_to_link")
+                if isinstance(fallback, list):
+                    for entry in fallback:
+                        _collect(entry)
+
+        elif isinstance(result, list):
+            for item in result:
+                _collect(item)
+
+        return parsed
+
+    async def add_barcode(self, offer_id: str, barcode: str) -> bool:
+        body: Dict[str, Any] = {"offer_id": offer_id, "barcodes": [barcode]}
+        status_code, data = await self._post_with_status("/v1/barcode/add", body)
+        if status_code >= 400:
+            logger.warning("Failed to attach barcode %s to %s: %s", barcode, offer_id, data)
+            return False
+        return True
+
+
+class StockItem(BaseModel):
+    """Normalized stock info for a product on a warehouse or by type."""
+
+    type: str | None = None
+    warehouse_id: str | None = None
+    present: int = 0
+    reserved: int = 0
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+
+class ProductStockInfo(BaseModel):
+    product_id: str | None = None
+    offer_id: str | None = None
+    sku: int | None = None
+    stocks: list[StockItem] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+
+class ProductListItem(BaseModel):
+    product_id: int | None = None
+    offer_id: str | None = None
+    name: str | None = None
+    sku: int | None = None
+    visibility: str | None = None
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+    @field_validator("product_id", mode="before")
+    @classmethod
+    def _coerce_product_id(cls, value: Any) -> Any:
+        """Allow product_id to come as string without dropping the item."""
+        if value is None:
+            return value
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
+
+
+class ProductListPage(BaseModel):
+    items: list[ProductListItem] = Field(default_factory=list)
+    last_id: str | None = None
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+
+class ProductInfoItem(BaseModel):
+    product_id: str | None = Field(default=None, alias="id")
+    offer_id: str | None = None
+    sku: int | None = None
+    name: str | None = None
+    barcode: str | None = None
+    barcodes: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(
+        extra="ignore", protected_namespaces=(), populate_by_name=True
+    )
+
+    @field_validator("product_id", mode="before")
+    @classmethod
+    def _coerce_product_id(cls, value: Any) -> Any:
+        """Allow integer IDs while keeping the field as string internally."""
+        if value is None:
+            return value
+        try:
+            return str(value)
+        except Exception:
+            return value
+
+
+
+_client_read: OzonClient | None = None
+
+
+def has_write_credentials() -> bool:
+    """
+    Проверить, можно ли отправлять ответы на отзывы.
+
+    Теперь используется тот же самый ключ OZON_API_KEY, что и для чтения.
+    Главное — чтобы в личном кабинете Ozon у этого ключа были права
+    на работу с отзывами (просмотр и ответы продавца).
+    """
+    client_id = (
+        os.getenv("OZON_WRITE_CLIENT_ID")
+        or os.getenv("OZON_CLIENT_ID")
+        or os.getenv("OZON_SELLER_WRITE_CLIENT_ID")
+        or os.getenv("OZON_SELLER_CLIENT_ID")
+        or ""
+    ).strip()
+    api_key = (
+        os.getenv("OZON_WRITE_API_KEY")
+        or os.getenv("OZON_API_KEY")
+        or os.getenv("OZON_SELLER_WRITE_API_KEY")
+        or os.getenv("OZON_SELLER_API_KEY")
+        or ""
+    ).strip()
+    oauth_token = (
+        os.getenv("OZON_OAUTH_TOKEN")
+        or os.getenv("OZON_SELLER_OAUTH_TOKEN")
+        or ""
+    ).strip()
+    return bool(client_id and (api_key or oauth_token))
+
+
+# ---------- Chats ----------
+
+
+class ChatSummary(BaseModel):
+    chat_id: str | None = None
+    id: str | None = None
+    posting_number: str | None = None
+    order_id: str | None = None
+    raw: dict = Field(default_factory=dict, alias="_raw")
+    buyer_name: str | None = None
+    client_name: str | None = None
+    customer_name: str | None = None
+    last_message: dict | str | None = None
+    last_message_text: str | None = None
+    last_message_time: str | None = None
+    updated_at: str | None = None
+    unread_count: int | None = None
+    is_unread: bool | None = None
+    has_unread: bool | None = None
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=(), populate_by_name=True)
+
+    def to_dict(self) -> dict:
+        data = self.model_dump(exclude_none=True, by_alias=True)
+        if not data.get("chat_id") and self.id:
+            data["chat_id"] = str(self.id)
+        if self.last_message is not None:
+            data["last_message"] = self.last_message
+        return data
+
+
+class ChatListItem(BaseModel):
+    chat_id: str | None = None
+    id: str | None = None
+    title: str | None = None
+    chat_type: str | None = None
+    chat_status: str | None = None
+    created_at: str | None = None
+    unread_count: int | None = None
+    last_message_id: int | None = None
+    first_unread_message_id: int | None = None
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=(), populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_nested_chat(cls, values: object) -> object:
+        if not isinstance(values, dict):
+            return values
+
+        nested = values.get("chat")
+        if isinstance(nested, dict):
+            merged = {**values, **nested}
+            merged.pop("chat", None)
+            return merged
+        return values
+
+    @property
+    def safe_chat_id(self) -> str | None:
+        return str(self.chat_id or self.id).strip() if (self.chat_id or self.id) else None
+
+
+class ChatListResponse(BaseModel):
+    chats: list[ChatListItem] = Field(default_factory=list)
+    items: list[dict] | None = None
+    result: list[dict] | dict | None = None
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+    def iter_items(self):
+        candidates: list[list[dict]] = []
+        if self.chats:
+            candidates.append([c.model_dump(mode="python") for c in self.chats])
+        if isinstance(self.items, list):
+            candidates.append(self.items)
+        if isinstance(self.result, list):
+            candidates.append(self.result)
+        elif isinstance(self.result, dict):
+            for key in ("chats", "items", "result"):
+                maybe_items = self.result.get(key)
+                if isinstance(maybe_items, list):
+                    candidates.append(maybe_items)
+
+        for bucket in candidates:
+            for item in bucket:
+                try:
+                    yield ChatListItem.model_validate(item)
+                except ValidationError:
+                    continue
+
+
+class ChatHistoryResponse(BaseModel):
+    messages: list[dict] = Field(default_factory=list)
+    items: list[dict] | None = None
+    result: list[dict] | dict | None = None
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+    def iter_items(self):
+        candidates: list[list[dict]] = []
+        if self.messages:
+            candidates.append(self.messages)
+        if isinstance(self.items, list):
+            candidates.append(self.items)
+        if isinstance(self.result, list):
+            candidates.append(self.result)
+        elif isinstance(self.result, dict):
+            for key in ("messages", "items", "result"):
+                maybe_items = self.result.get(key)
+                if isinstance(maybe_items, list):
+                    candidates.append(maybe_items)
+
+        for bucket in candidates:
+            for item in bucket:
+                yield item
+
+
+class ChatMessage(BaseModel):
+    message_id: int | str | None = None
+    created_at: str | None = None
+    is_read: bool | None = None
+    is_image: bool | None = None
+    moderate_image_status: str | None = None
+    data: list[str] = Field(default_factory=list)
+    context: dict | None = None
+    user: dict | None = None
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+    @field_validator("data", mode="before")
+    @classmethod
+    def _ensure_data_list(cls, v: object) -> list[str]:
+        if isinstance(v, list):
+            return [str(item) for item in v if item not in (None, "")]
+        if v in (None, ""):
+            return []
+        return [str(v)]
+
+    @field_validator("message_id", mode="before")
+    @classmethod
+    def _coerce_id(cls, v: object) -> int | str | None:
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except Exception:
+            try:
+                return str(v)
+            except Exception:
+                return None
+
+    @property
+    def text(self) -> str:
+        return "\n".join([item for item in self.data if (item or "").strip()])
+
+    def to_dict(self) -> dict:
+        return {
+            "message_id": self.message_id,
+            "created_at": self.created_at,
+            "is_read": bool(self.is_read) if self.is_read is not None else None,
+            "is_image": bool(self.is_image) if self.is_image is not None else None,
+            "moderate_image_status": self.moderate_image_status,
+            "data": list(self.data),
+            "text": self.text,
+            "context": self.context or {},
+            "user": self.user or {},
+        }
+
+
+def _merge_nested_block(item: dict, key: str) -> dict:
+    if not isinstance(item, dict):
+        return {}
+    nested = item.get(key)
+    if isinstance(nested, dict):
+        merged = {**item, **nested}
+        merged.pop(key, None)
+        return merged
+    return item
+
+
+def _normalize_chat_history_payload(data: object) -> tuple[dict | None, bool]:
+    """Coerce chat history responses into a dict payload and flag anomalies."""
+
+    payload: object = data
+    payload_was_weird = False
+
+    if isinstance(data, dict):
+        result_block = data.get("result")
+        if isinstance(result_block, dict):
+            payload = result_block
+        elif isinstance(result_block, list):
+            payload = {"result": result_block}
+            payload_was_weird = True
+        else:
+            payload = data
+    else:
+        payload_was_weird = True
+
+    if not isinstance(payload, dict):
+        if isinstance(payload, list):
+            payload = {"items": payload}
+            payload_was_weird = True
+        else:
+            return None, True
+
+    return payload, payload_was_weird
+
+
+def _normalize_chat_list_payload(data: object) -> dict | None:
+    """Coerce chat list responses into a dict payload or return None."""
+
+    payload: object = data
+    if isinstance(data, dict):
+        result_block = data.get("result")
+        if isinstance(result_block, dict):
+            payload = result_block
+        elif isinstance(result_block, list):
+            payload = {"result": result_block}
+        else:
+            payload = data
+
+    if isinstance(payload, list):
+        payload = {"items": payload}
+
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _should_try_chat_fallback(status_code: int, data: object) -> bool:
+    """Определить, стоит ли пробовать другой API-путь для чатов."""
+    if status_code in (404, 405, 410):
+        return True
+    if isinstance(data, dict):
+        code = data.get("code")
+        message = str(data.get("message") or data.get("error") or "").lower()
+        if code == 9:  # Ozon сигнализирует об устаревшем методе
+            return True
+        if any(token in message for token in ("obsolete", "deprecated", "method not found", "not found")):
+            return True
+    return False
+
+
+async def chat_list(
+    limit: int = 100,
+    offset: int = 0,
+    chat_status: str = "ALL",
+    unread_only: bool = False,
+    include_service: bool = False,
+    refresh: bool | None = None,  # backward-compatible no-op
+    chat_type_whitelist: tuple[str, ...] = ("buyer_seller", "buyer-seller", "buyer_seller_chat"),
+) -> ChatListResponse:
+    """List chats via the current v3 endpoint with fallback to older versions.
+
+    Новая версия API не принимает refresh и может меняться по версии.
+    Порядок fallback: v3 -> v1 -> v2. Сохраняем мягкий парсинг для разных
+    форматов ответа (chats/items/result).
+    """
+    client = get_client()
+
+    safe_limit = max(1, min(int(limit or 0), 500))
+    offset_cur = max(0, int(offset or 0))
+
+    safe_status = (chat_status or "ALL").upper()
+    whitelist = tuple(str(x).lower() for x in chat_type_whitelist)
+
+    body_filter: dict[str, object] = {
+        "chat_status": safe_status,
+        "unread_only": bool(unread_only),
+    }
+
+    collected: list[ChatListItem] = []
+    seen_ids: set[str] = set()
+    max_pages = 50  # защита от бесконечного цикла при странных пагинациях
+    for _ in range(max_pages):
+        if len(collected) >= safe_limit:
+            break
+
+        page_limit = min(100, safe_limit - len(collected))
+        body = {
+            "limit": int(page_limit),
+            "offset": int(offset_cur),
+            "filter": body_filter,
+        }
+
+        payload: dict | None = None
+        last_error: tuple[str, int, object] | None = None
+        for path in ("/v3/chat/list", "/v1/chat/list", "/v2/chat/list"):
+            status_code, data = await client._post_with_status(path, body)
+            if status_code < 400:
+                payload = _normalize_chat_list_payload(data)
+                if payload is None:
+                    logger.warning("Chat list payload is not a dict: %r", data)
+                break
+            last_error = (path, status_code, data)
+            if not _should_try_chat_fallback(status_code, data):
+                raise OzonAPIError(f"Ozon API error {status_code} on {path}: {data}")
+            logger.warning(
+                "Chat list endpoint %s failed (HTTP %s), trying fallback",
+                path,
+                status_code,
+            )
+
+        if payload is None:
+            if last_error:
+                path, status_code, data = last_error
+                raise OzonAPIError(f"Ozon API error {status_code} on {path}: {data}")
+            return ChatListResponse(chats=[])
+        parsed_items: list[ChatListItem] = []
+        try:
+            parsed = ChatListResponse.model_validate(payload)
+            parsed_items = list(parsed.iter_items())
+        except ValidationError as exc:
+            logger.warning("Failed to parse chat list payload: %s", exc)
+            if isinstance(payload, dict):
+                maybe_items = payload.get("chats") or payload.get("items")
+                if isinstance(maybe_items, list):
+                    for raw in maybe_items:
+                        if isinstance(raw, dict):
+                            if isinstance(raw.get("chat"), dict):
+                                merged = _merge_nested_block(raw, "chat")
+                            else:
+                                merged = raw
+                            try:
+                                parsed_items.append(ChatListItem.model_validate(merged))
+                            except ValidationError:
+                                continue
+
+        if not parsed_items:
+            break
+
+        new_items = 0
+        for item in parsed_items:
+            if not include_service:
+                ctype = str(item.chat_type or "").lower()
+                if ctype and whitelist and ctype not in whitelist:
+                    continue
+            cid = (item.safe_chat_id or str(item.chat_id or "").strip() or "").strip()
+            if cid and cid in seen_ids:
+                continue
+            if cid:
+                seen_ids.add(cid)
+            collected.append(item)
+            new_items += 1
+
+        if len(parsed_items) < page_limit:
+            break
+
+        if new_items == 0:
+            break
+
+        offset_cur += len(parsed_items)
+
+    return ChatListResponse(chats=collected)
+
+
+async def chat_history(chat_id: str, *, limit: int = 30) -> list[dict]:
+    """Получить историю чата с fallback по версиям API (v3 -> v2 -> v1)."""
+    client = get_client()
+    body = {
+        "chat_id": chat_id,
+        "limit": max(1, min(limit, 50)),
+        "direction": "Backward",  # запрашиваем свежие сообщения, но отсортируем ниже
+    }
+    payload_data: dict | None = None
+    last_error: tuple[str, int, object] | None = None
+    for path in ("/v3/chat/history", "/v2/chat/history", "/v1/chat/history"):
+        status_code, data = await client._post_with_status(path, body)
+        if status_code < 400 and isinstance(data, dict):
+            payload_data = data
+            break
+        last_error = (path, status_code, data)
+        if not _should_try_chat_fallback(status_code, data):
+            message = None
+            if isinstance(data, dict):
+                message = data.get("message") or data.get("error")
+            raise OzonAPIError(
+                f"Ошибка Ozon API при получении истории чата: HTTP {status_code} {message or data}"
+            )
+        logger.warning(
+            "Chat history endpoint %s failed (HTTP %s), trying fallback",
+            path,
+            status_code,
+        )
+
+    if payload_data is None:
+        if last_error:
+            path, status_code, data = last_error
+            message = None
+            if isinstance(data, dict):
+                message = data.get("message") or data.get("error")
+                if data.get("code") == 9:
+                    logger.warning("Ozon chat history method is obsolete; check API version update")
+            raise OzonAPIError(
+                f"Ошибка Ozon API при получении истории чата: HTTP {status_code} {message or data}"
+            )
+        raise OzonAPIError("Ошибка Ozon API при получении истории чата: пустой ответ")
+
+    payload, payload_was_weird = _normalize_chat_history_payload(payload_data)
+    if payload is None:
+        logger.warning("Chat history payload is not a dict: %r", data)
+        return [
+            {"text": "История пуста / не удалось разобрать ответ API", "_raw": data}
+        ]
+
+    raw_items: list[dict] = []
+    try:
+        parsed = ChatHistoryResponse.model_validate(payload)
+        raw_items = list(parsed.iter_items())
+    except ValidationError as exc:
+        payload_was_weird = True
+        logger.warning("Failed to parse chat history payload: %s", exc)
+        if isinstance(payload, dict):
+            for key in ("messages", "items", "result"):
+                maybe = payload.get(key)
+                if isinstance(maybe, list):
+                    raw_items = maybe
+                    break
+                if isinstance(maybe, dict):
+                    for inner_key in ("messages", "items", "result"):
+                        inner = maybe.get(inner_key)
+                        if isinstance(inner, list):
+                            raw_items = inner
+                            break
+                    if raw_items:
+                        break
+        if not raw_items:
+            logger.warning("Chat history payload is empty or invalid: %r", payload)
+            return [
+                {
+                    "text": "История пуста / не удалось разобрать ответ API",
+                    "_raw": payload,
+                }
+            ]
+
+    if not raw_items:
+        if payload_was_weird:
+            logger.warning("Chat history payload has no messages: %r", payload)
+            return [
+                {
+                    "text": "История пуста / не удалось разобрать ответ API",
+                    "_raw": payload,
+                }
+            ]
+        return []
+
+    messages: list[dict] = []
+    for raw in raw_items:
+        merged = _merge_nested_block(raw, "message")
+        if not isinstance(merged, dict):
+            continue
+        try:
+            normalized = ChatMessage.model_validate(merged).to_dict()
+        except ValidationError as exc:
+            logger.warning("Failed to normalize chat message: %s; using raw item", exc)
+            normalized = dict(merged)
+
+        normalized.setdefault("_raw", merged)
+        messages.append(normalized)
+    return messages
+
+
+async def download_with_auth(url: str) -> bytes:
+    """Скачать файл с Ozon API с учётом авторизационных заголовков."""
+
+    client = get_client()
+    response = await client._http_client.get(url)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:  # pragma: no cover - сеть/HTTP
+        logger.warning("Ozon %s -> HTTP %s", url, response.status_code)
+        raise OzonAPIError(f"Не удалось скачать вложение: {exc}") from exc
+
+    return await response.aread()
+
+
+def _filename_from_disposition(disposition: str) -> str:
+    raw = (disposition or "").strip()
+    if not raw:
+        return ""
+
+    for part in [p.strip() for p in raw.split(";") if p.strip()]:
+        lower = part.lower()
+        if lower.startswith("filename*="):
+            value = part.split("=", 1)[-1].strip().strip('"')
+            if "''" in value:
+                value = value.split("''", 1)[-1]
+            decoded = unquote(value).strip().strip('"')
+            if decoded:
+                return decoded.rsplit("/", 1)[-1]
+
+    for part in [p.strip() for p in raw.split(";") if p.strip()]:
+        lower = part.lower()
+        if lower.startswith("filename="):
+            value = part.split("=", 1)[-1].strip().strip('"')
+            if value:
+                return value.rsplit("/", 1)[-1]
+
+    return ""
+
+
+async def download_chat_file(url: str) -> tuple[bytes, str, str | None]:
+    """Скачать файл чата с учётом авторизации и вернуть содержимое + имя."""
+
+    client = get_client()
+    timeout = max(float(getattr(client, "total_timeout", 30.0)), 60.0)
+    response = await client._http_client.get(
+        url,
+        headers={"Accept": "*/*"},
+        follow_redirects=True,
+        timeout=timeout,
+    )
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:  # pragma: no cover - сеть/HTTP
+        logger.warning("Ozon %s -> HTTP %s", url, response.status_code)
+        raise OzonAPIError(f"Не удалось скачать вложение: {exc}") from exc
+
+    content = await response.aread()
+    content_type = response.headers.get("Content-Type")
+    disposition = response.headers.get("Content-Disposition") or ""
+
+    filename = _filename_from_disposition(disposition)
+    if not filename:
+        final_url = str(response.url) if response.url else url
+        filename = Path(urlparse(final_url).path).name
+    if not filename:
+        filename = Path(urlparse(url).path).name or "attachment.bin"
+
+    return content, filename, content_type
+
+
+async def chat_read(chat_id: str, messages: Sequence[dict] | None = None) -> None:
+    """Mark chat messages as read up to the latest known message."""
+
+    if messages:
+        last_message_id: str | None = None
+        for raw in reversed(messages):
+            if not isinstance(raw, dict):
+                continue
+            message_id = raw.get("message_id") or raw.get("id")
+            if message_id:
+                last_message_id = str(message_id)
+                break
+        if not last_message_id:
+            logger.warning("Chat %s has messages without message_id, skip chat/read", chat_id)
+            return
+    else:
+        logger.info("No messages in chat %s, skip chat/read", chat_id)
+        return
+
+    client = get_client()
+    body = {"chat_id": chat_id, "from_message_id": last_message_id}
+    status_code, data = await client._post_with_status("/v2/chat/read", body)
+    if status_code >= 400:
+        logger.warning("Failed to mark chat %s as read: %s", chat_id, data)
+
+
+async def chat_send_message(chat_id: str, text: str) -> None:
+    """Отправить сообщение в чат Ozon.
+    
+    Args:
+        chat_id: ID чата Ozon
+        text: Текст сообщения
+        
+    Raises:
+        OzonAPIError: При ошибке отправки
+    """
+    client = get_write_client()
+    if client is None:
+        raise OzonAPIError("Нет прав на отправку сообщений в чаты Ozon")
+
+    text_clean = (text or "").strip()
+    if len(text_clean) < 2:
+        raise OzonAPIError("Текст сообщения пустой или слишком короткий")
+
+    endpoint = "/v1/chat/send/message"
+    body = {"chat_id": chat_id, "text": text_clean}
+    logger.info(
+        "Sending chat message endpoint=%s payload_keys=%s chat_id=%s text_length=%d",
+        endpoint,
+        sorted(body.keys()),
+        chat_id,
+        len(text_clean),
+    )
+    
+    try:
+        status_code, data = await client._post_with_status(endpoint, body)
+        
+        logger.debug(
+            "Chat send message response: status=%d data_keys=%s",
+            status_code,
+            list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+        )
+        
+        if status_code >= 400:
+            message = None
+            if isinstance(data, dict):
+                message = data.get("message") or data.get("error") or data.get("error_description")
+            error_msg = f"Ошибка Ozon API при отправке сообщения: HTTP {status_code} {message or data}"
+            logger.error("Failed to send chat message: %s", error_msg)
+            raise OzonAPIError(error_msg)
+        
+        # Проверяем результат
+        if isinstance(data, dict):
+            result = data.get("result")
+            # Ozon API может вернуть result как True, None, или строку "success"
+            if result is False:
+                error_msg = "Ozon отклонил отправку сообщения в чат"
+                logger.error("Chat message rejected by Ozon: %s", data)
+                raise OzonAPIError(error_msg)
+            elif result is True or result is None or result == "success":
+                # Успешная отправка
+                message_id = data.get("message_id") or data.get("id")
+                logger.info(
+                    "Chat message sent successfully: chat_id=%s message_id=%s",
+                    chat_id,
+                    message_id or "N/A",
+                )
+            else:
+                # Неожиданный формат ответа, но не критично если статус 200
+                logger.debug("Unexpected chat send response format (non-critical): %s", data)
+                # Все равно считаем успешным, если статус 200
+                if status_code == 200:
+                    logger.info("Chat message sent (status 200): chat_id=%s", chat_id)
+            
+    except OzonAPIError:
+        raise
+    except Exception as e:
+        logger.exception("Unexpected error sending chat message: %s", e)
+        raise OzonAPIError(f"Неожиданная ошибка при отправке сообщения: {e}") from e
+
+
+async def get_posting_products(posting_number: str) -> list[str]:
+    """Fetch product titles for a posting number using Ozon API.
+
+    The helper is resilient to schema changes and returns an empty list on errors.
+    """
+
+    posting = (posting_number or "").strip()
+    if not posting:
+        return []
+
+    client = get_client()
+    body = {"posting_number": posting}
+    try:
+        status_code, data = await client._post_with_status("/v3/posting/fbs/get", body)
+    except Exception as exc:  # pragma: no cover - network/safety
+        logger.warning("Failed to load posting %s products: %s", posting, exc)
+        return []
+
+    if status_code >= 400 or not isinstance(data, (dict, list)):
+        logger.warning("Unexpected response for posting %s: %s", posting, data)
+        return []
+
+    payload = data.get("result") if isinstance(data, dict) else data
+
+    def _extract_products(container: dict | list | None) -> list[dict]:
+        if isinstance(container, list):
+            return [item for item in container if isinstance(item, dict)]
+        if isinstance(container, dict):
+            for key in ("products", "items"):
+                maybe = container.get(key)
+                if isinstance(maybe, list):
+                    return [item for item in maybe if isinstance(item, dict)]
+        return []
+
+    buckets: list[list[dict]] = []
+    if isinstance(payload, dict):
+        buckets.append(_extract_products(payload.get("posting") if isinstance(payload.get("posting"), dict) else payload))
+        buckets.append(_extract_products(payload.get("result") if isinstance(payload.get("result"), dict) else None))
+        buckets.append(_extract_products(payload))
+    elif isinstance(payload, list):
+        buckets.append(_extract_products(payload[0] if payload else None))
+
+    names: list[str] = []
+    for bucket in buckets:
+        for item in bucket:
+            name = item.get("name") or item.get("product_name") or item.get("offer_name")
+            if name:
+                names.append(str(name))
+
+    return names
+
+
+async def get_posting_details(posting_number: str) -> tuple[dict | None, str | None]:
+    """Fetch posting details trying FBS first then FBO.
+
+    Returns a tuple of (payload, schema) where schema is ``"fbs"`` or ``"fbo"``
+    depending on which endpoint returned data.
+    """
+
+    posting = (posting_number or "").strip()
+    if not posting:
+        return None, None
+
+    client = get_client()
+    for path, schema in (("/v3/posting/fbs/get", "fbs"), ("/v2/posting/fbo/get", "fbo")):
+        try:
+            status_code, data = await client._post_with_status(path, {"posting_number": posting})
+        except Exception as exc:  # pragma: no cover - network/safety
+            logger.warning("Failed to load posting %s via %s: %s", posting, path, exc)
+            continue
+
+        if status_code >= 400 or not isinstance(data, (dict, list)):
+            continue
+
+        payload = data.get("result") if isinstance(data, dict) else data
+        if isinstance(payload, dict):
+            return payload, schema
+        if isinstance(payload, list) and payload:
+            maybe = payload[0]
+            if isinstance(maybe, dict):
+                return maybe, schema
+
+    logger.warning("Posting %s not found via FBS/FBO endpoints", posting)
+    return None, None
+
+
+async def chat_start(posting_number: str) -> dict | None:
+    client = get_write_client()
+    if client is None:
+        raise OzonAPIError("Нет прав на создание чатов в Ozon")
+
+    body = {"posting_number": posting_number}
+    status_code, data = await client._post_with_status("/v1/chat/start", body)
+    if status_code >= 400:
+        message = None
+        if isinstance(data, dict):
+            message = data.get("message") or data.get("error")
+        raise OzonAPIError(
+            f"Ошибка Ozon API при создании чата: HTTP {status_code} {message or data}"
+        )
+    if isinstance(data, dict):
+        return data.get("result") or data
+    return None
+
+
+def get_client(profile_name: str = "default") -> OzonClient:
+    """
+    Фабрика клиентов Ozon с поддержкой профилей (как в a-ulianov/OzonAPI).
+    
+    Полностью использует OzonAPIConfig для настройки:
+    - client_id / api_key из профиля
+    - Таймауты (total_timeout, connect_timeout)
+    - Параметры ретраев (max_retries, retry_min_wait, retry_max_wait, retry_multiplier)
+    - Rate limiting (max_requests_per_second)
+    - Логирование (enable_request_logging)
+    - Метрики (enable_metrics)
+    
+    Args:
+        profile_name: Имя профиля ("default" или "write")
+        
+    Returns:
+        Настроенный OzonClient
+    """
+    global _client_read
+    
+    # Для default профиля используем глобальный синглтон
+    if profile_name == "default" and _client_read is not None:
+        return _client_read
+    
+    # Загружаем конфигурацию
+    try:
+        from botapp.ozon_api_config import get_ozon_config
+        config = get_ozon_config()
+        profile = config.get_profile(profile_name)
+        
+        # Берём креды из профиля, если они заданы
+        client_id = profile.client_id or ""
+        api_key = profile.api_key or ""
+        oauth_token = profile.oauth_token or None
+        
+        # Если креды пустые, пробуем из env (обратная совместимость)
+        if not client_id or not (api_key or oauth_token):
+            client_id, api_key, oauth_token = _env_read_credentials()
+        
+        client = OzonClient(
+            client_id=client_id,
+            api_key=api_key,
+            oauth_token=oauth_token,
+            user_agent=profile.user_agent,
+            extra_headers=profile.extra_headers,
+            total_timeout=float(profile.total_timeout) if profile.total_timeout > 0 else 30.0,
+            connect_timeout=float(profile.connect_timeout) if profile.connect_timeout > 0 else 10.0,
+            max_retries=int(profile.max_retries) if profile.max_retries >= 0 else 5,
+            retry_min_wait=float(profile.retry_min_wait) if profile.retry_min_wait > 0 else 1.0,
+            retry_max_wait=float(profile.retry_max_wait) if profile.retry_max_wait > 0 else 10.0,
+            retry_multiplier=float(profile.retry_multiplier) if profile.retry_multiplier > 0 else 2.0,
+            max_requests_per_second=int(profile.max_requests_per_second) if profile.max_requests_per_second > 0 else 27,
+            enable_request_logging=bool(profile.enable_request_logging),
+            enable_metrics=bool(config.enable_metrics),
+        )
+        
+        logger.info(
+            "OzonClient created: profile=%s, timeout=%.1fs, max_retries=%s, rps_limit=%s, metrics=%s",
+            profile_name,
+            profile.total_timeout,
+            profile.max_retries,
+            profile.max_requests_per_second,
+            config.enable_metrics,
+        )
+        
+    except Exception as exc:
+        # Fallback на минимальную конфигурацию
+        logger.warning("Failed to load OzonAPIConfig, using defaults: %s", exc)
+        client_id, api_key, oauth_token = _env_read_credentials()
+        client = OzonClient(
+            client_id=client_id,
+            api_key=api_key,
+            oauth_token=oauth_token,
+            total_timeout=30.0,
+            connect_timeout=10.0,
+        )
+    
+    # Сохраняем default профиль как синглтон
+    if profile_name == "default":
+        _client_read = client
+        
+    return client
+
+
+def get_write_client() -> OzonClient | None:
+    """
+    Получить клиент для операций записи (ответы на отзывы, чаты и т.д.).
+    
+    Использует профиль "write" из OzonAPIConfig, если он настроен.
+    Иначе возвращает default клиент.
+    
+    Returns:
+        OzonClient или None, если нет прав на запись.
+    """
+    if not has_write_credentials():
+        return None
+    
+    # Проверяем, есть ли отдельный write профиль
+    try:
+        from botapp.ozon_api_config import get_ozon_config
+        config = get_ozon_config()
+        if "write" in config.profiles:
+            return get_client(profile_name="write")
+    except Exception:
+        pass
+    
+    # Fallback на default клиент
+    return get_client()
+
+
+async def close_clients() -> None:
+    """Закрыть общий http‑клиент и сбросить кеш."""
+
+    global _client_read
+    if _client_read is not None:
+        try:
+            await _client_read.aclose()
+        except Exception:  # pragma: no cover - best effort
+            logger.warning("Failed to close Ozon client HTTP session", exc_info=True)
+        _client_read = None
+
+
+async def health_check(client: OzonClient | None = None) -> dict:
+    """
+    Health check Ozon API (как рекомендовано в a-ulianov/OzonAPI).
+    
+    Выполняет легкий запрос /v1/seller/info для проверки:
+    - Доступности API
+    - Валидности креденшалов
+    - Времени отклика
+    
+    Returns:
+        dict с результатами проверки:
+        - status: "ok" | "error"
+        - latency_ms: время отклика
+        - seller_name: название продавца (если доступно)
+        - error: сообщение об ошибке (если есть)
+    """
+    client = client or get_client()
+    start_time = monotonic()
+    
+    try:
+        seller_info = await client.get_seller_info()
+        latency = (monotonic() - start_time) * 1000
+        
+        # Извлекаем имя продавца
+        company = seller_info.get("company") or {}
+        seller_name = company.get("name") if isinstance(company, dict) else str(company or "")
+        
+        result = {
+            "status": "ok",
+            "latency_ms": round(latency, 1),
+            "seller_name": seller_name or "Unknown",
+            "client_id": client.client_id[:4] + "..." if client.client_id else None,
+        }
+        
+        # Добавляем метрики если включены
+        if client.enable_metrics:
+            result["metrics"] = {
+                "total_requests": client.metrics.total_requests,
+                "success_rate": round(client.metrics.success_rate, 1),
+                "avg_response_time": round(client.metrics.average_response_time, 3),
+            }
+        
+        logger.info(
+            "Ozon API health check OK: seller=%s, latency=%.1fms",
+            seller_name,
+            latency,
+        )
+        return result
+        
+    except Exception as exc:
+        latency = (monotonic() - start_time) * 1000
+        error_msg = str(exc)
+        
+        logger.error(
+            "Ozon API health check FAILED: %s (latency=%.1fms)",
+            error_msg,
+            latency,
+        )
+        return {
+            "status": "error",
+            "latency_ms": round(latency, 1),
+            "error": error_msg,
+        }
+
+
+async def startup_health_check() -> bool:
+    """
+    Выполнить health check при старте бота.
+    
+    Логирует результат и возвращает True если API доступен.
+    Рекомендуется вызывать при инициализации бота.
+    """
+    logger.info("Running Ozon API startup health check...")
+    result = await health_check()
+    
+    if result["status"] == "ok":
+        logger.info(
+            "✅ Ozon API connected: %s (%.1fms)",
+            result.get("seller_name", "Unknown"),
+            result.get("latency_ms", 0),
+        )
+        return True
+    else:
+        logger.error(
+            "❌ Ozon API unavailable: %s",
+            result.get("error", "Unknown error"),
+        )
+        return False
+
+
+# ---------- Questions helpers ----------
+
+
+QUESTION_STATUS_MAP: Dict[str, str] = {
+    "all": "ALL",
+    "unanswered": "UNPROCESSED",
+    "answered": "PROCESSED",
+}
+
+
+class QuestionListFilter(BaseModel):
+    status: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow", protected_namespaces=())
+
+
+class GetQuestionListRequest(BaseModel):
+    limit: int = Field(..., ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+    filter: QuestionListFilter | None = None
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow", protected_namespaces=())
+
+
+class QuestionListItem(BaseModel):
+    """Гибкая модель элемента из /v1/question/list.
+
+    Ozon иногда меняет схему, поэтому:
+    * все поля опциональные,
+    * extra-поля разрешены,
+    * id можно получить и из ``id``, и из ``question_id``.
+    """
+
+    id: str | None = None
+    question_id: str | None = None
+    created_at: Any | None = None
+    updated_at: Any | None = None
+    sku: Any | None = None
+    product_id: Any | None = None
+    product_name: str | None = None
+    product_title: str | None = None
+    item_name: str | None = None
+    title: str | None = None
+    product_url: str | None = None
+    published_at: Any | None = None
+    text: str | None = None
+    question_text: str | None = None
+    question: str | None = None
+    answer_text: str | None = None
+    answer: str | None = None
+    message: str | None = None
+    status: str | None = None
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+
+class GetQuestionListResult(BaseModel):
+    questions: list[QuestionListItem] = Field(default_factory=list)
+    items: list[QuestionListItem] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+    def collect(self) -> list[QuestionListItem]:
+        if self.questions:
+            return self.questions
+        if self.items:
+            return self.items
+        return []
+
+
+class GetQuestionListResponse(BaseModel):
+    """Нормализованный ответ /v1/question/list.
+
+    Возможные варианты структуры:
+      * {"result": {"questions": [...]}}
+      * {"result": {"items": [...]}}
+      * {"questions": [...]}
+      * {"items": [...]}
+    """
+
+    result: GetQuestionListResult | None = None
+    questions: list[QuestionListItem] = Field(default_factory=list)
+    items: list[QuestionListItem] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+    def collect(self) -> list[QuestionListItem]:
+        if self.result:
+            collected = self.result.collect()
+            if collected:
+                return collected
+        if self.questions:
+            return self.questions
+        if self.items:
+            return self.items
+        return []
+
+
+@dataclass
+class QuestionAnswer:
+    id: str | None
+    text: str | None
+    created_at: str | None = None
+    updated_at: str | None = None
+    author_type: str | None = None  # "seller" или "customer"
+    is_seller: bool = False  # True если ответ от продавца
+
+
+@dataclass
+class Question:
+    id: str
+    question_text: str
+    created_at: str | None = None
+    sku: int | None = None
+    product_id: str | None = None
+    product_name: str | None = None
+    answer_text: str | None = None
+    status: str | None = None
+    answer_created_at: str | None = None
+    has_answer: bool = False
+    answer_id: str | None = None
+    answers_count: int | None = None
+
+
+def _name_from_product_url(url: str) -> str | None:
+    try:
+        path = urlparse(url).path
+    except Exception:
+        return None
+
+    parts = [p for p in path.split("/") if p]
+    if "product" not in parts:
+        return None
+
+    try:
+        slug = parts[parts.index("product") + 1]
+    except Exception:
+        return None
+
+    slug = unquote(slug)
+    tokens = slug.split("-")
+    if tokens and tokens[-1].isdigit():
+        tokens = tokens[:-1]
+    name = " ".join(tokens).strip()
+    return name or None
+
+
+def _parse_question_item(item: Dict[str, Any]) -> Question | None:
+    """Приводим "сырой" элемент ответа к dataclass Question.
+
+    Принимает либо dict, либо QuestionListItem.
+    """
+
+    try:
+        answers_count = 0
+        if isinstance(item, QuestionListItem):
+            question_id_raw = item.id or item.question_id
+            created = item.published_at or item.created_at
+            extras = getattr(item, "model_extra", {}) or {}
+            product_name = (
+                item.product_name
+                or item.product_title
+                or item.item_name
+                or item.title
+                or extras.get("product_name")
+                or extras.get("product_title")
+                or extras.get("item_name")
+                or extras.get("title")
+            )
+            question_text = (
+                item.question_text
+                or item.text
+                or item.question
+                or extras.get("question_text")
+                or extras.get("question")
+                or extras.get("text")
+            )
+            answer_text = (
+                item.answer_text
+                or item.answer
+                or extras.get("answer_text")
+                or extras.get("answer")
+                or extras.get("message")
+            )
+            answer_id = getattr(item, "answer_id", None) or extras.get("answer_id")
+            sku_val = item.sku or item.product_id
+            status = item.status or extras.get("status")
+            product_url = item.product_url or extras.get("product_url")
+            answers_count = (
+                getattr(item, "answers_count", None)
+                or extras.get("answers_count")
+                or 0
+            )
+        else:
+            question_id_raw = item.get("question_id") or item.get("id")
+            created = (
+                item.get("created_at")
+                or item.get("createdAt")
+                or item.get("date")
+                or item.get("published_at")
+                or item.get("publishedAt")
+            )
+            product_name = (
+                item.get("product_name")
+                or item.get("item_name")
+                or item.get("product_title")
+                or item.get("title")
+            )
+            question_text = (
+                item.get("question_text")
+                or item.get("question")
+                or item.get("text")
+                or item.get("message")
+            )
+            answer_text = (
+                item.get("answer_text")
+                or item.get("answer")
+                or item.get("message")
+            )
+            answer_id = item.get("answer_id")
+            sku_val = (
+                item.get("sku")
+                or item.get("product_id")
+                or item.get("productId")
+            )
+            status = item.get("status")
+            product_url = item.get("product_url")
+            answers_count = item.get("answers_count") or item.get("answersCount") or 0
+
+        question_id = str(question_id_raw or "").strip()
+        if not question_id:
+            return None
+
+        try:
+            sku_int = int(sku_val) if sku_val is not None else None
+        except Exception:
+            sku_int = None
+
+        if (product_name in (None, "")) and product_url:
+            product_name = _name_from_product_url(str(product_url)) or product_name
+
+        answer_text_clean = str(answer_text) if answer_text not in (None, "") else None
+        try:
+            answers_count_int = int(answers_count) if answers_count is not None else 0
+        except Exception:
+            answers_count_int = 0
+        has_answer = (
+            bool(answer_text_clean)
+            or answers_count_int > 0
+            or str(status or "").upper() == "PROCESSED"
+        )
+        return Question(
+            id=question_id,
+            created_at=str(created) if created is not None else None,
+            sku=sku_int,
+            product_id=str(sku_val) if sku_val is not None else None,
+            product_name=str(product_name) if product_name not in (None, "") else None,
+            question_text=str(question_text) if question_text not in (None, "") else "",
+            answer_text=answer_text_clean,
+            status=str(status or "").strip() or None,
+            has_answer=has_answer,
+            answer_id=str(answer_id) if answer_id not in (None, "") else None,
+            answers_count=answers_count_int,
+        )
+    except Exception as exc:  # pragma: no cover - защита от неожиданных данных
+        logger.warning("Failed to parse question item %s: %s", item, exc)
+        return None
+
+
+def _map_question_status(category: str | None) -> str:
+    if not category:
+        return ""
+    mapped = QUESTION_STATUS_MAP.get(category)
+    if not mapped:
+        logger.warning("Unknown question category %s, fallback to ALL", category)
+        return ""
+    return mapped
+
+
+# ---------- Questions ----------
+
+
+async def get_questions_list(
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[Question]:
+    """Получить список вопросов покупателей через Seller API.
+
+    Устойчиво к неожиданным форматам ответа:
+    при ошибке валидации возвращает список (может быть пустой),
+    а не падает с исключением.
+    """
+
+    client = get_client()
+    ozon_status = _map_question_status(status)
+
+    request = GetQuestionListRequest(
+        limit=max(1, min(limit, 200)),
+        offset=max(0, offset),
+        filter=QuestionListFilter(status=ozon_status) if ozon_status else None,
+    )
+
+    body = request.model_dump(mode="json", by_alias=True, exclude_none=True)
+    status_code, data = await client._post_with_status("/v1/question/list", body)
+    if status_code >= 400 or not isinstance(data, dict):
+        message = None
+        if isinstance(data, dict):
+            message = data.get("message") or data.get("error")
+        logger.warning("Failed to fetch questions: HTTP %s %s", status_code, data)
+        raise OzonAPIError(f"Ошибка Ozon API: HTTP {status_code} {message or data}")
+
+    # Аккуратно парсим ответ
+    try:
+        resp = GetQuestionListResponse.model_validate(
+            data.get("result") if isinstance(data.get("result"), dict) else data
+        )
+        raw_items: list[QuestionListItem | Dict[str, Any]] = resp.collect()
+    except ValidationError as exc:
+        # Если схема изменилась — логируем и пробуем работать как с "сырым" dict
+        logger.warning("Failed to parse questions response: %s", exc)
+        payload = data.get("result") if isinstance(data.get("result"), dict) else data
+        arr = payload.get("questions") if isinstance(payload, dict) else []
+        if not isinstance(arr, list):
+            arr = payload.get("items") if isinstance(payload, dict) else []
+        if not isinstance(arr, list):
+            logger.warning("Unexpected questions payload: %r", data)
+            return []
+        raw_items = arr  # type: ignore[assignment]
+
+    result: list[Question] = []
+    for raw in raw_items:
+        parsed = _parse_question_item(raw)
+        if parsed:
+            result.append(parsed)
+    return result
+
+
+async def send_question_answer(question_id: str, text: str, *, sku: int | None = None) -> bool:
+    client = get_write_client()
+    if client is None:
+        raise OzonAPIError("Нет прав на отправку ответов в Ozon")
+
+    text_clean = (text or "").strip()
+    if len(text_clean) < 2:
+        raise OzonAPIError("Ответ пустой или слишком короткий, сначала отредактируйте текст")
+
+    if not sku or int(sku) <= 0:
+        logger.warning("question_answer_create: invalid sku=%r for question_id=%s", sku, question_id)
+        return False
+
+    logger.debug(
+        "Sending Ozon question answer: question_id=%s, len(text)=%d, text_preview=%r",
+        question_id,
+        len(text_clean),
+        text_clean[:80],
+    )
+
+    body = {"question_id": question_id, "text": text_clean, "sku": int(sku)}
+    logger.info("question_answer_create: qid=%s sku=%s text_len=%s", question_id, sku, len(text_clean))
+    status_code, data = await client._post_with_status("/v1/question/answer/create", body)
+    if status_code >= 400:
+        raise OzonAPIError(
+            f"Ошибка Ozon API: HTTP {status_code} {data.get('message') if isinstance(data, dict) else data}"
+        )
+    if data is None:
+        raise OzonAPIError(
+            "Ошибка Ozon API: пустой ответ при отправке ответа на вопрос"
+        )
+    return True
+
+
+async def list_question_answers(
+    question_id: str, *, limit: int = 20, sku: int | None = None
+) -> list[QuestionAnswer]:
+    sku_clean = _clean_sku(sku)
+    if sku is not None and sku_clean is None:
+        logger.warning(
+            "Skip question_answer_list for %s: invalid sku=%r", question_id, sku
+        )
+        return []
+
+    if sku_clean is None:
+        logger.warning(
+            "Skip question_answer_list for %s: missing SKU to avoid 400 from Ozon",
+            question_id,
+        )
+        return []
+
+    client = get_client()
+    answers = await client.question_answer_list(
+        question_id, limit=limit, sku=sku_clean
+    )
+    return answers
+
+
+async def get_question_answers(
+    question_id: str, *, limit: int = 20, sku: int | None = None
+) -> list[QuestionAnswer]:
+    """Совместимый алиас для получения ответов на вопрос."""
+
+    return await list_question_answers(question_id, limit=limit, sku=sku)
+
+
+async def delete_question_answer(
+    question_id: str, *, answer_id: str | None = None, sku: int | None = None
+) -> None:
+    client = get_write_client()
+    if client is None:
+        raise OzonAPIError("Нет прав на удаление ответов в Ozon")
+
+    target_answer_id = answer_id
+    if not target_answer_id:
+        try:
+            existing = await client.question_answer_list(
+                question_id, limit=1, sku=sku
+            )
+        except Exception as exc:
+            raise OzonAPIError(f"Не удалось получить список ответов: {exc}")
+        target_answer_id = existing[0].id if existing else None
+
+    if not target_answer_id:
+        raise OzonAPIError("Ответ не найден, удалять нечего")
+
+    await client.question_answer_delete(target_answer_id)
+
+
+async def get_question_by_id(question_id: str) -> Question | None:
+    questions = await get_questions_list(status=None, limit=200, offset=0)
+    for q in questions:
+        if q.id == question_id:
+            return q
+    return None

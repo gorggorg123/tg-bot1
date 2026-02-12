@@ -1,0 +1,43 @@
+services:
+  - type: worker
+    name: ozon-telegram-bot
+    runtime: python
+    plan: free
+    autoDeploy: true
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python run_local.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.12
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: TG_ENABLE_SSL_VERIFY
+        value: "1"
+      - key: DROP_PENDING_UPDATES
+        value: "1"
+
+      - key: TG_BOT_TOKEN
+        sync: false
+      - key: OZON_CLIENT_ID
+        sync: false
+      - key: OZON_API_KEY
+        sync: false
+      - key: OZON_WRITE_CLIENT_ID
+        sync: false
+      - key: OZON_WRITE_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+
+      - key: CDEK_CLIENT_ID
+        sync: false
+      - key: CDEK_CLIENT_SECRET
+        sync: false
+      - key: CDEK_SENDER_NAME
+        sync: false
+      - key: CDEK_SENDER_PHONE
+        sync: false

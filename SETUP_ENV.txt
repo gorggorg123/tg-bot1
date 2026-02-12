@@ -1,0 +1,35 @@
+# ========================================
+# ГОТОВЫЙ .env ФАЙЛ ДЛЯ ВАШЕГО БОТА
+# ========================================
+# 
+# ИНСТРУКЦИЯ:
+# 1. Скопируйте содержимое этого файла
+# 2. Создайте файл .env в корне проекта
+# 3. Вставьте туда это содержимое
+# 4. Замените YOUR_BOT_TOKEN, YOUR_CLIENT_ID, YOUR_API_KEY
+# 5. Перезапустите бота
+#
+# ========================================
+
+# Telegram Bot Configuration
+TG_TOKEN=YOUR_BOT_TOKEN_HERE
+
+# ✅ Admin User IDs (УЖЕ НАСТРОЕНО ДЛЯ ВАС!)
+# Ваш Telegram ID: 411767534 (из логов: gorggorg)
+ADMIN_IDS=411767534
+
+# Ozon API Configuration
+OZON_CLIENT_ID=YOUR_CLIENT_ID
+OZON_API_KEY=YOUR_API_KEY
+
+# OpenAI Configuration (опционально, если используете AI функции)
+# OPENAI_API_KEY=YOUR_OPENAI_KEY
+
+# SSL Configuration (для разработки за прокси)
+# Раскомментируйте следующую строку если нужно
+# TG_DISABLE_SSL_VERIFY=true
+
+# Advanced Settings (опционально)
+# LOG_LEVEL=INFO
+# RATE_LIMIT_REQUESTS=20
+# RATE_LIMIT_PERIOD=60

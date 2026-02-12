@@ -1,0 +1,25 @@
+# Telegram Bot Configuration
+TG_BOT_TOKEN=your_telegram_bot_token_here
+
+# Admin Configuration (ОБЯЗАТЕЛЬНО для /metrics и /health)
+ADMIN_IDS=411767534
+# Можно указать несколько через запятую:
+# ADMIN_IDS=411767534,987654321
+
+# Ozon API Configuration
+OZON_CLIENT_ID=your_ozon_client_id
+OZON_API_KEY=your_ozon_api_key
+
+# Ozon Write Access (optional)
+OZON_WRITE_CLIENT_ID=your_write_client_id
+OZON_WRITE_API_KEY=your_write_api_key
+
+# OpenAI (optional)
+OPENAI_API_KEY=your_openai_api_key
+
+# Logging
+LOG_LEVEL=INFO
+LOG_FILE=logs/bot_local.log
+
+# Bot Settings
+DROP_PENDING_UPDATES=1
