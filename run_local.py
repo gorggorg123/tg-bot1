@@ -335,12 +335,16 @@ async def main():
     # Если переменная PORT задана, поднимаем минимальный health endpoint.
     health_runner = None
     port_raw = _env("PORT")
-    if port_raw:
+    run_under_uvicorn = _env("RUN_UNDER_UVICORN", default="0") == "1"
+    if port_raw and not run_under_uvicorn:
         try:
             health_runner = await _start_health_server(int(port_raw))
         except Exception as e:
             logger.error("Не удалось запустить health server на PORT=%s: %s", port_raw, e)
             raise
+
+    elif port_raw and run_under_uvicorn:
+        logger.info("Skipping internal health server because RUN_UNDER_UVICORN=1")
 
     # На Windows Ctrl+C обрабатывается через KeyboardInterrupt
     

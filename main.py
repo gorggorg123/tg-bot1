@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from fastapi import FastAPI
 
@@ -17,6 +18,8 @@ async def _startup() -> None:
     global _bot_task
     if _bot_task and not _bot_task.done():
         return
+    # run_local.py should not start its own HTTP listener when uvicorn is serving PORT.
+    os.environ.setdefault("RUN_UNDER_UVICORN", "1")
     # Run Telegram polling loop in background while uvicorn serves health endpoints.
     _bot_task = asyncio.create_task(bot_main(), name="telegram-bot-main")
     logger.info("Bot task started")
