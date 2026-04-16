@@ -3,7 +3,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from botapp import ozon_client
+from botapp.api import ozon_client
 
 
 class OzonCredentialCompatibilityTest(unittest.TestCase):
