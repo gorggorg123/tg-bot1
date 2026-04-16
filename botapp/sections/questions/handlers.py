@@ -376,6 +376,21 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
             await send_ephemeral_message(callback, text="⚠️ Вопрос не найден.")
             return
 
+        question_id = str(getattr(q, "id", "") or "").strip()
+        if not question_id:
+            logger.warning(
+                "Question send blocked: missing question_id user_id=%s token=%s sku=%r",
+                user_id,
+                token,
+                getattr(q, "sku", None),
+            )
+            await send_ephemeral_message(
+                callback,
+                text="⚠️ Не удалось определить ID вопроса. Нажмите «Обновить» и попробуйте снова.",
+                as_alert=True,
+            )
+            return
+
         saved = get_question_answer(q.id) or {}
         draft = (saved.get("answer") or "").strip()
         if len(draft) < 2:
@@ -383,7 +398,11 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
             return
 
         if not has_write_credentials():
-            await send_ephemeral_message(callback, text="⚠️ Нет write-доступа к Ozon (ключи OZON_WRITE_*).")
+            await send_ephemeral_message(
+                callback,
+                text="⚠️ Нет write-доступа к Ozon. Проверьте ключи OZON_WRITE_*/OZON_SELLER_WRITE_* или базовые OZON_*.",
+                as_alert=True,
+            )
             return
 
         sku = _coerce_positive_sku(q.sku, getattr(q, "product_id", None))
@@ -392,12 +411,28 @@ async def questions_callbacks(callback: CallbackQuery, state: FSMContext) -> Non
             await send_ephemeral_message(callback, text="⚠️ Не удалось определить SKU для отправки ответа. Нажмите «Обновить» и попробуйте снова.", as_alert=True)
             return
         try:
-            ok = await send_question_answer(q.id, draft, sku=sku)
+            ok = await send_question_answer(question_id, draft, sku=sku)
             if ok is False:
                 await send_ephemeral_message(callback, text="⚠️ Не удалось отправить ответ: отсутствует SKU. Обновите список и попробуйте снова.", as_alert=True)
                 return
         except OzonAPIError as exc:
-            await send_ephemeral_message(callback, text=f"⚠️ Ozon отклонил отправку: {exc}")
+            msg = str(exc).strip()
+            if msg.startswith("Нет прав"):
+                await send_ephemeral_message(
+                    callback,
+                    text="⚠️ Нет write-доступа к Ozon. Проверьте настройки API-ключей.",
+                    as_alert=True,
+                )
+                return
+            if msg.startswith("Не найден question_id"):
+                await send_ephemeral_message(
+                    callback,
+                    text="⚠️ Не удалось определить ID вопроса. Обновите список и попробуйте снова.",
+                    as_alert=True,
+                )
+                return
+            logger.warning("Question send rejected by Ozon: qid=%s sku=%s error=%s", question_id, sku, msg)
+            await send_ephemeral_message(callback, text=f"⚠️ Ozon отклонил отправку: {msg}", as_alert=True)
             return
         except Exception:
             logger.exception("send_question_answer failed")
