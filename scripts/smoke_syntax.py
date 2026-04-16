@@ -25,6 +25,7 @@ def _run(cmd: list[str], *, cwd: Path) -> None:
 def _smoke_imports() -> None:
     """Ensure critical modules import without side effects or network calls."""
 
+    import botapp.api.client  # noqa: F401
     import botapp.sections.reviews.logic  # noqa: F401
     import botapp.sections.questions.logic  # noqa: F401
     import botapp.sections.chats.logic  # noqa: F401
